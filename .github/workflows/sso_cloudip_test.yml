@@ -1,0 +1,64 @@
+# クラウドIP SSO疎通検証 (WBS 1.11.9)
+# 目的: GitHub runner(=データセンターIP)から媒体(AW/HR)へ Playwright ログインが
+#       通るかを検証する。求人連携システムのクラウド実行可否を判断する最重要リスク検証。
+# コスト: GitHub Actions 無料枠内 = ¥0。手動trigger のみ。
+#
+# 事前準備(GitHub UI → Settings → Secrets and variables → Actions):
+#   AW_LOGIN_ID, AW_PW          (AW検証用の1社。確実にログインできる社)
+#   HRHACKER_USER, HRHACKER_PASS (HR検証用)
+# ※ シート/HubSpotは不要 (ssotest_direct.py がシート読取を行わない)
+
+name: SSO CloudIP Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      media:
+        description: "検証する媒体 (aw / hr / both)"
+        required: true
+        default: "both"
+        type: choice
+        options: ["aw", "hr", "both"]
+
+jobs:
+  ssotest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps + Playwright Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.50.0 requests python-dotenv
+          python -m playwright install --with-deps chromium chromium-headless-shell
+
+      - name: Show runner public IP
+        run: |
+          echo "Runner egress IP:"
+          curl -s https://api.ipify.org || true
+          echo ""
+
+      - name: SSO test (AW)
+        if: ${{ inputs.media == 'aw' || inputs.media == 'both' }}
+        env:
+          MEDIA: aw
+          AW_LOGIN_ID: ${{ secrets.AW_LOGIN_ID }}
+          AW_PW: ${{ secrets.AW_PW }}
+          PYTHONIOENCODING: utf-8
+        run: python .github/scripts/sso_cloudip_test.py
+
+      - name: SSO test (HR)
+        if: ${{ inputs.media == 'hr' || inputs.media == 'both' }}
+        env:
+          MEDIA: hr
+          HRHACKER_USER: ${{ secrets.HRHACKER_USER }}
+          HRHACKER_PASS: ${{ secrets.HRHACKER_PASS }}
+          PYTHONIOENCODING: utf-8
+        run: python .github/scripts/sso_cloudip_test.py
