@@ -40,6 +40,16 @@ URL_LOGIN = "https://ats.rct.airwork.net/airplf/login"
 URL_DASHBOARDS = "https://ats.rct.airwork.net/dashboards"
 URL_BULK_DOWNLOAD = "https://ats.rct.airwork.net/job_offers/bulk_download"
 
+# 採用サイトURL(slug)抽出用セレクタ (2026-07-08 geo-3070 で実証)
+#  ナビ→設定→採用ページ設定 と辿ると 採用サイトURL(https://arwrk.net/recruit/{slug})
+#  が <a> として公開されている。CSSモジュールのハッシュクラスは壊れうるので
+#  fallback(a[href*='arwrk.net/recruit'])も併用する。
+AW_RECRUIT_NAV_SEL = "#__next > header > div > nav > ul > li:nth-child(6) > a"
+AW_RECRUIT_ASIDE_SEL = ("#__next > div.styles_container__BxkYX > "
+                        "aside.styles_module___F_Ud > div > div > a:nth-child(10)")
+AW_RECRUIT_URL_SEL = ("#scroll-container > main > section.styles_module__Q5xzW > "
+                      "div:nth-child(2) > div.styles_columnContent__u8kIn > a")
+
 # ボタン text (完全一致 / Phase 0b 実測)
 BTN_CREATE = "データを作成する"
 BTN_REFRESH = "更新する"
@@ -227,6 +237,82 @@ async def establish_aw_session(
     return ctx, page
 
 
+async def extract_aw_recruit_site_url(page) -> Optional[str]:
+    """AW採用サイトURL (https://arwrk.net/recruit/{slug}) を抽出.
+
+    認証済 page から ナビ→採用ページ設定 と辿り、公開されている採用サイトURLを返す。
+    セレクタ(ハッシュCSS)が壊れた場合は a[href*='arwrk.net/recruit'] で回収。
+    取得できなければ None。求人URLは この戻り値 + '{求人ID}/' で組み立てる。
+    """
+    # 1) 実証済セレクタ経路
+    try:
+        await page.click(AW_RECRUIT_NAV_SEL, timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        await page.click(AW_RECRUIT_ASIDE_SEL, timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        el = await page.wait_for_selector(AW_RECRUIT_URL_SEL, timeout=15000)
+        href = await el.get_attribute("href")
+        if href and "arwrk.net/recruit" in href:
+            return href.rstrip("/")
+    except Exception:  # noqa: BLE001
+        pass
+    # 2) fallback: ページ内の採用サイトリンクを拾う
+    try:
+        links = await page.eval_on_selector_all(
+            "a[href*='arwrk.net/recruit']", "els=>els.map(e=>e.href)")
+        for h in links:
+            # 求人個別(/{id}/)でなく 採用サイトトップ(slugまで)を優先
+            if h and "arwrk.net/recruit" in h:
+                return h.rstrip("/")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def build_aw_job_url(recruit_site_url: str, media_job_id: str) -> str:
+    """採用サイトURL + 求人ID → 個別求人URL (末尾スラッシュ付き)."""
+    if not recruit_site_url or not media_job_id:
+        return ""
+    return f"{recruit_site_url.rstrip('/')}/{media_job_id}/"
+
+
+# login_id → 採用サイトURL のキャッシュ (アカウント単位で1回抽出すれば十分)。
+# 求人作成フローがこれを読んで url_airwork を補完する。
+RECRUIT_URL_CACHE = "aw_recruit_urls.json"
+
+
+def load_recruit_url_cache(state_dir: Path) -> dict:
+    import json
+    f = Path(state_dir) / RECRUIT_URL_CACHE
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+async def _cache_recruit_url_if_missing(page, login_id: str, state_dir: Path) -> None:
+    """未キャッシュなら採用サイトURLを抽出して保存 (遅延・BAN対策)。
+
+    本体の求人取得を絶対に妨げないよう、失敗は握りつぶす(bonus処理)。
+    """
+    import json
+    try:
+        cache = load_recruit_url_cache(state_dir)
+        if cache.get(login_id):
+            return                              # 既に取得済 → 何もしない(無駄なナビ回避)
+        url = await extract_aw_recruit_site_url(page)
+        if url:
+            cache[login_id] = url
+            f = Path(state_dir) / RECRUIT_URL_CACHE
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(cache, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass                                    # 補完は best-effort、本体を止めない
+
+
 async def fetch_aw_xlsx(
     login_id: str,
     password: str,
@@ -274,6 +360,8 @@ async def fetch_aw_xlsx(
         )
         try:
             # 1) ログインは establish_aw_session で完了済 (セッション再利用/再ログイン)
+            # 1b) 採用サイトURL(slug)を未取得なら1回だけ抽出・キャッシュ (url_airwork補完用)
+            await _cache_recruit_url_if_missing(page, login_id, output_dir)
             # 2) 一括DL画面
             await page.goto(URL_BULK_DOWNLOAD, wait_until="networkidle")
 

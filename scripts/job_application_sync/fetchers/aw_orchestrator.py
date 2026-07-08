@@ -50,6 +50,7 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
     iter_aw_accounts,
     resolve_accounts_for_mails,
 )
+from scripts.job_application_sync.fetchers import aw_csv_fetcher as _awf  # type: ignore  # noqa: E402
 from scripts.job_application_sync.fetchers.aw_csv_fetcher import (  # type: ignore  # noqa: E402
     fetch_aw_xlsx,
     AWNoDataError,
@@ -139,10 +140,20 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
             )
             xlsx_path = _extract_xlsx_from_zip(zip_or_xlsx)
             client_code = _extract_client_code(xlsx_path)
+            # fetch_aw_xlsx がセッション中に抽出・キャッシュした採用サイトURLを取得。
+            # url_airwork 空欄の求人を slug+求人IDで補完する。
+            # (テストで aw_csv_fetcher がスタブの場合は関数が無いので防御的に取得)
+            recruit_url = ""
+            _loader = getattr(_awf, "load_recruit_url_cache", None)
+            if _loader:
+                recruit_url = _loader(out_dir).get(login_id, "")
+            # 採用サイトURLがある時だけ渡す (空なら従来シグネチャで呼ぶ)
+            xkw = {"recruit_site_url": recruit_url} if recruit_url else {}
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: awi.run_xlsx(xlsx_path, client_code, dry_run=dry_run),
+                lambda: awi.run_xlsx(xlsx_path, client_code, dry_run=dry_run,
+                                     **xkw),
             )
             t1 = datetime.now()
             return {

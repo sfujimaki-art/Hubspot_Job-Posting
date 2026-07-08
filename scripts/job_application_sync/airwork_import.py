@@ -460,7 +460,8 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
 # プロパティビルダ
 # ============================================================================
 def build_update_props(row: dict, existing_props: dict, today_iso: str,
-                       now_iso: str, source_filename: str) -> dict:
+                       now_iso: str, source_filename: str,
+                       recruit_site_url: str = "") -> dict:
     """既存LISTING更新用プロパティ. 既存値保護を適用.
 
     更新対象 (常に更新):
@@ -505,15 +506,27 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
         if src_val and not existing_val:
             p[hs_prop] = src_val
 
+    # URL空欄検知 → 採用サイトURL+求人IDで補完 (既存url_airworkが空のときのみ)
+    if recruit_site_url and not p.get("url_airwork"):
+        existing_url = existing_props.get("url_airwork")
+        existing_url = existing_url.strip() if isinstance(existing_url, str) else ""
+        jid = row.get("media_job_id", "")
+        if not existing_url and jid:
+            p["url_airwork"] = f"{recruit_site_url.rstrip('/')}/{jid}/"
+
     return p
 
 
 def build_create_props(row: dict, today_iso: str, now_iso: str,
-                       source_filename: str, login_id: str) -> dict:
+                       source_filename: str, login_id: str,
+                       recruit_site_url: str = "") -> dict:
     """新規LISTING作成用プロパティ.
 
     ★ 呼出側で original_status == "02" のみを許可している前提 (§14, §23.2)。
     01 の新規は本関数を呼ばないこと。
+
+    recruit_site_url: AW採用サイトURL(https://arwrk.net/recruit/{slug})。
+      入力CSVにURLが無い時、これ+求人IDで個別求人URLを生成する(補完)。
 
     管理区分判定 (§24-4 中核 + Phase 0b RL未運用):
       【RL】検出 → 弊社管理 (Phase 0b 確定で現状は到達しない経路)
@@ -528,9 +541,11 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
     p["id_airwork"] = jid
     p[PROP_AW_LOGIN_ID] = login_id
 
-    # URL (入力にあれば採用、なければ空)
+    # URL (入力にあれば採用 / 無ければ採用サイトURL+求人IDで生成 / それも無ければ空)
     if row.get("url"):
         p["url_airwork"] = row["url"]
+    elif recruit_site_url:
+        p["url_airwork"] = f"{recruit_site_url.rstrip('/')}/{jid}/"
 
     # 求人名 = LISTING 必須プロパティ (Phase 0b HR編で判明)
     p["hs_name"] = row.get("job_name") or f"Air Work求人 {jid}"
@@ -625,7 +640,7 @@ def batch_create(creates: list[dict]) -> tuple[int, int, list[str], dict]:
 # ============================================================================
 def run(input_path: str, login_id: str, dry_run: bool = True,
         limit: Optional[int] = None, sheet: str = AW_XLSX_DEFAULT_SHEET,
-        strict_client_code: bool = True) -> dict:
+        strict_client_code: bool = True, recruit_site_url: str = "") -> dict:
     """A-2 メインオーケストレーション. 結果サマリ辞書を返す.
 
     Args:
@@ -684,7 +699,8 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         if jid in existing:
             # 既存: 更新 (ステータス問わず値で上書き)
             props = build_update_props(row, existing[jid]["properties"],
-                                       today_iso, now_iso, source_filename)
+                                       today_iso, now_iso, source_filename,
+                                       recruit_site_url=recruit_site_url)
             updates.append({"id": existing[jid]["id"], "properties": props})
             update_preview.append({"id_airwork": jid,
                                    "hubspot_id": existing[jid]["id"],
@@ -698,7 +714,8 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
                                        "reason": "01_or_unknown_new"})
                 continue
             props = build_create_props(row, today_iso, now_iso,
-                                       source_filename, login_id)
+                                       source_filename, login_id,
+                                       recruit_site_url=recruit_site_url)
             creates.append({"properties": props})
             create_preview.append({"id_airwork": jid, "properties": props})
 
@@ -761,7 +778,8 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
 def run_xlsx(xlsx_path: str | Path, login_id: str, dry_run: bool = True,
              limit: Optional[int] = None,
              sheet: str = AW_XLSX_DEFAULT_SHEET,
-             strict_client_code: bool = True) -> dict:
+             strict_client_code: bool = True,
+             recruit_site_url: str = "") -> dict:
     """orchestrator から呼ばれる入口 (XLSX 専用ラッパ).
 
     既存 run() を XLSX 固定で呼ぶシンプルな委譲関数。
@@ -786,6 +804,7 @@ def run_xlsx(xlsx_path: str | Path, login_id: str, dry_run: bool = True,
     return run(
         str(xlsx_path), login_id=login_id, dry_run=dry_run,
         limit=limit, sheet=sheet, strict_client_code=strict_client_code,
+        recruit_site_url=recruit_site_url,
     )
 
 
