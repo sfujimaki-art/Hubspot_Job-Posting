@@ -255,10 +255,11 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
     # 必須: 媒体ID
     p["id_hrhakkaa"] = jid
 
-    # URL: 個別求人URL(.../job-offers/show/{id})を求人IDから常に生成。
-    # CSVのurl列は共通ページ(.../job)止まりで個別URLでないため採用しない
-    # (2026-07-08 HTTP検証: show/{id_hrhakkaa}が公開中求人で200・id一致を確認)。
-    p["url_hrhakkaa"] = URL_TMPL.format(jid)
+    # URL (CSVに無ければ URL テンプレートから生成)
+    # ※ 2026-07-08 HTTP検証: URL_TMPL(.../job-offers/show/{id_hrhakkaa})は
+    #   公開中求人で200・id一致=正しい個別URL。既存LISTINGも全て正しく保持済。
+    url = row.get("url") or URL_TMPL.format(jid)
+    p["url_hrhakkaa"] = url
 
     # 求人名 = LISTING 必須プロパティ (Phase 0b 実測 2026-06-26 で判明)
     # CSV にあればそれを使い、空ならフォールバックで「HRハッカー求人 <id>」を仮タイトル化
