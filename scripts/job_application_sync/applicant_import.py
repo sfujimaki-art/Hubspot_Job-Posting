@@ -534,6 +534,9 @@ def build_appointment_properties(row: ApplicantRow, *, linked: bool) -> dict:
         "meeruadoresu": row.email,
         "yingmuri": row.apply_date,
         "oubobaitaimei": row.media,
+        # 媒体求人ID を応募求人メモに保持 (全応募)。求人が後から出来た時の
+        # 再紐付けスイープ(applicant_sync --relink)がこの値でLISTINGを引く。
+        "oubokyuujinmemo": row.media_job_id,
     }
     if not linked:
         # v0.2 §24 ガード: タイトル類似で勝手紐付けせず人間レビューへ

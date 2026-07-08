@@ -438,6 +438,98 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     return summary
 
 
+def relink(dry_run: bool = False, limit: int = 1000) -> dict:
+    """再紐付けスイープ (順序問題の恒久解決).
+
+    「求人が登録される前に来た応募」は対象外で記録される(dedupで残る)。
+    その後 求人巡回が LISTING を作れば、本スイープが oubokyuujinmemo(媒体求人ID)で
+    LISTINGを引いて Association(typeId=5) を張り、対象外→未転記 に解除する。
+    → 求人と応募の到着順序に依存せず、必ず後から紐付く。求人巡回の後に定期実行。
+    """
+    import re as _re
+    token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+    H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    cli = ai.RealHubSpotClient(token)
+
+    # 1) 対象外APPOINTMENTを全走査して (appt_id, jid, is_hr) を収集 (検索はまだしない)
+    targets = []  # [(appt_id, jid, is_hr)]
+    checked = 0
+    after = None
+    while checked < limit:
+        body = {"filterGroups": [{"filters": [
+            {"propertyName": "kokyakushiitotenkijoukyou",
+             "operator": "EQ", "value": "対象外"}]}],
+            "properties": ["oubokyuujinmemo", "oubobaitaimei",
+                           "bikou_hiaringu"], "limit": 100}
+        if after:
+            body["after"] = after
+        r = requests.post(
+            "https://api.hubapi.com/crm/v3/objects/0-421/search",
+            headers=H, json=body, timeout=30).json()
+        for o in r.get("results", []):
+            checked += 1
+            p = o.get("properties") or {}
+            jid = (p.get("oubokyuujinmemo") or "").strip()
+            if not jid:  # 旧backlogは bikou_hiaringu から抽出
+                m = _re.search(r"媒体求人ID=(\S+)", p.get("bikou_hiaringu") or "")
+                jid = m.group(1) if m else ""
+            if not jid:
+                continue
+            media = p.get("oubobaitaimei") or ""
+            targets.append((o["id"], jid, ("HR" in media or "ハッカー" in media)))
+        after = r.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            break
+
+    # 2) 求人IDを媒体別に集約し、LISTINGをバッチ IN検索 (100件/req) して map化
+    def _listing_map(job_ids, prop):
+        """id_hrhakkaa/id_airwork → listing_id。複数一致(曖昧)は None を入れる。"""
+        m = {}
+        ids = sorted(set(job_ids))
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            r = requests.post(
+                "https://api.hubapi.com/crm/v3/objects/0-420/search",
+                headers=H, json={"filterGroups": [{"filters": [
+                    {"propertyName": prop, "operator": "IN", "values": chunk}]}],
+                    "properties": [prop], "limit": 200}, timeout=30).json()
+            for o in r.get("results", []):
+                v = (o.get("properties") or {}).get(prop)
+                if not v:
+                    continue
+                m[v] = None if v in m else o["id"]   # 2件目以降=曖昧
+            time.sleep(0.1)
+        return m
+    hr_map = _listing_map([j for _, j, ish in targets if ish], "id_hrhakkaa")
+    aw_map = _listing_map([j for _, j, ish in targets if not ish], "id_airwork")
+
+    # 3) 突合できた対象外だけ Association + 対象外解除
+    relinked = still = ambiguous = 0
+    for appt_id, jid, is_hr in targets:
+        lid = (hr_map if is_hr else aw_map).get(jid, "__miss__")
+        if lid == "__miss__":
+            still += 1
+            continue
+        if lid is None:            # 曖昧(複数LISTING)は§24で紐付けない
+            ambiguous += 1
+            continue
+        if not dry_run:
+            cli.associate_appointment_to_listing(appt_id, lid)
+            requests.patch(
+                f"https://api.hubapi.com/crm/v3/objects/0-421/{appt_id}",
+                headers=H,
+                json={"properties": {"kokyakushiitotenkijoukyou": "未転記"}},
+                timeout=20)
+        relinked += 1
+    summary = {"checked": checked, "relinked": relinked,
+               "still_unlinked": still, "ambiguous": ambiguous}
+    if relinked and not dry_run:
+        slack_notify(f"🔗 再紐付けスイープ: {relinked}件の対象外応募を求人に紐付け "
+                     f"(確認{checked}件/未紐付け{still}/曖昧{ambiguous})")
+    print(f"[relink] {summary}", flush=True)
+    return summary
+
+
 def reconcile(dry_run: bool = False) -> dict:
     """照合スイープ (放置ゼロの最後の砦, 日次想定).
 
@@ -477,11 +569,16 @@ def _parse_args(argv=None):
     p.add_argument("--hr-date-to", default="")
     p.add_argument("--reconcile", action="store_true",
                    help="照合スイープ(日次): 詰まった項目を検出しSlack報告")
+    p.add_argument("--relink", action="store_true",
+                   help="再紐付けスイープ: 対象外応募を後から出来た求人に紐付け")
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
     a = _parse_args()
+    if a.relink:
+        relink(dry_run=a.dry_run)
+        sys.exit(0)
     if a.reconcile:
         reconcile(dry_run=a.dry_run)
         sys.exit(0)
