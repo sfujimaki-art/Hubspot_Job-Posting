@@ -223,20 +223,24 @@ def process_aw_account(
             result.update(ok=True, login_id=bid, linked=0, unlinked=len(rows),
                           csv=csv_path.name, total=len(rows))
             return result
-        # 案2b: 応募の求人LISTINGが欠落していれば、その社の求人を先にfetch→upsert
+        # 案2b (inline求人fetch) は既定OFF。理由(2026-07-08 本番実測):
+        #   fetch_aw_xlsx の求人生成待ち(最大20分/社)がバッチを破綻させる
+        #   (12社×20分=数時間 → 5分バッチ/30分timeoutに収まらず)。
+        # → 求人LISTINGの作成は独立の求人デイリー(hr_watcher/aw巡回)に委ね、
+        #   応募syncは既存LISTINGへ紐付けるだけにする(高速)。求人未作成の応募は
+        #   対象外で登録される(求人が先=ユーザー設計に沿う)。
+        # JAS_ENABLE_INLINE_JOB_FETCH=1 で従来の同期fetchを有効化可(生成待ち許容時)。
         job_ids = list({r.media_job_id for r in rows if r.media_job_id})
         jobs_fetched = 0
-        try:
-            missing = _missing_aw_listings(job_ids, token)
-            if missing:
-                jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir)
-                # ★index反映待ち: 作成直後のLISTINGは検索に載らない(6-8s要)。
-                # 待たずに応募importすると対象外で作られdedupで永久に紐付かない。
-                time.sleep(15)
-        except Exception as e:  # noqa: BLE001
-            # 求人fetch失敗しても応募登録は続行 (未特定=対象外で残る)
-            print(f"  [案2b] 求人fetch失敗(応募は続行): "
-                  f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+        if os.environ.get("JAS_ENABLE_INLINE_JOB_FETCH", "0") == "1":
+            try:
+                missing = _missing_aw_listings(job_ids, token)
+                if missing:
+                    jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir)
+                    time.sleep(15)  # index反映待ち
+            except Exception as e:  # noqa: BLE001
+                print(f"  [案2b] 求人fetch失敗(応募は続行): "
+                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
         # 応募import (求人が揃った状態で紐付け)
         cli = ai.RealHubSpotClient(token)
         results = ai.run_import(rows, cli, default_login_id=bid)
