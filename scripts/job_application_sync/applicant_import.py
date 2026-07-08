@@ -183,6 +183,7 @@ class HubSpotClient(Protocol):
     ) -> Optional[str]: ...
     def create_appointment(self, properties: dict) -> str: ...
     def associate_appointment_to_listing(self, appointment_id: str, listing_id: str) -> None: ...
+    def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]: ...
 
 
 # ============================================================================
@@ -265,6 +266,9 @@ class DryRunClient:
             "listing_id": listing_id,
             "type_id": ASSOC_TYPE_ID_APPT_TO_LISTING,
         })
+
+    def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]:
+        return None  # ドライランでは求人フラグ取得なし
 
 
 # ============================================================================
@@ -404,6 +408,17 @@ class RealHubSpotClient:
         r = self._requests.put(url, headers=self.headers, json=body, timeout=60)
         r.raise_for_status()
 
+    def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]:
+        """紐付く求人(LISTING)の一次対応フラグ(必要/不要)を取得。取得失敗はNone。"""
+        try:
+            url = (f"{self.BASE}/crm/v3/objects/0-420/{listing_id}"
+                   f"?properties=ichijitaiounoumu_deforuto")
+            r = self._requests.get(url, headers=self.headers, timeout=30)
+            r.raise_for_status()
+            return (r.json().get("properties") or {}).get("ichijitaiounoumu_deforuto")
+        except Exception:  # noqa: BLE001
+            return None
+
 
 # ============================================================================
 # 正規化ヘルパ
@@ -518,11 +533,15 @@ def load_applicants_csv(path: Path) -> list[ApplicantRow]:
 # ============================================================================
 # APPOINTMENT プロパティ構築
 # ============================================================================
-def build_appointment_properties(row: ApplicantRow, *, linked: bool) -> dict:
+def build_appointment_properties(
+    row: ApplicantRow, *, linked: bool, ichijitaiou: Optional[str] = None
+) -> dict:
     """ApplicantRow から APPOINTMENT 書込用プロパティを構築。
 
     linked=False (求人未特定) の場合:
       kokyakushiitotenkijoukyou="対象外" + bikou_hiaringu に「求人未特定」記録
+    ichijitaiou: 紐付いた求人(LISTING)の ichijitaiounoumu_deforuto を引き継ぐ
+      (必要/不要)。取引→求人で連動済のフラグを応募者に持たせる。
     """
     phone_fmt = format_jp_phone(row.phone)
     props = {
@@ -538,6 +557,9 @@ def build_appointment_properties(row: ApplicantRow, *, linked: bool) -> dict:
         # 再紐付けスイープ(applicant_sync --relink)がこの値でLISTINGを引く。
         "oubokyuujinmemo": row.media_job_id,
     }
+    # 求人側の一次対応フラグ(必要/不要)を応募者に引き継ぐ。unset/None は入れない。
+    if ichijitaiou in ("必要", "不要"):
+        props["ichijitaiounoumu"] = ichijitaiou
     if not linked:
         # v0.2 §24 ガード: タイトル類似で勝手紐付けせず人間レビューへ
         props["kokyakushiitotenkijoukyou"] = "対象外"
@@ -603,8 +625,10 @@ def process_applicant(
             message=f"既存APPOINTMENT {existing} と (media, media_job_id, 電話, メール) 一致",
         )
 
-    # 3. APPOINTMENT 作成
-    props = build_appointment_properties(row, linked=listing_id is not None)
+    # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグを引き継ぐ)
+    ichijitaiou = client.get_listing_ichijitaiou(listing_id) if listing_id else None
+    props = build_appointment_properties(
+        row, linked=listing_id is not None, ichijitaiou=ichijitaiou)
     appt_id = client.create_appointment(props)
 
     # 4. Association (求人特定時のみ)

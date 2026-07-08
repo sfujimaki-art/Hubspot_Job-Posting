@@ -482,8 +482,8 @@ def relink(dry_run: bool = False, limit: int = 1000) -> dict:
             break
 
     # 2) 求人IDを媒体別に集約し、LISTINGをバッチ IN検索 (100件/req) して map化
+    #    値=(listing_id, 一次対応フラグ)。曖昧(複数一致)は None。
     def _listing_map(job_ids, prop):
-        """id_hrhakkaa/id_airwork → listing_id。複数一致(曖昧)は None を入れる。"""
         m = {}
         ids = sorted(set(job_ids))
         for i in range(0, len(ids), 100):
@@ -492,34 +492,39 @@ def relink(dry_run: bool = False, limit: int = 1000) -> dict:
                 "https://api.hubapi.com/crm/v3/objects/0-420/search",
                 headers=H, json={"filterGroups": [{"filters": [
                     {"propertyName": prop, "operator": "IN", "values": chunk}]}],
-                    "properties": [prop], "limit": 200}, timeout=30).json()
+                    "properties": [prop, "ichijitaiounoumu_deforuto"],
+                    "limit": 200}, timeout=30).json()
             for o in r.get("results", []):
-                v = (o.get("properties") or {}).get(prop)
+                p = o.get("properties") or {}
+                v = p.get(prop)
                 if not v:
                     continue
-                m[v] = None if v in m else o["id"]   # 2件目以降=曖昧
+                m[v] = None if v in m else (
+                    o["id"], p.get("ichijitaiounoumu_deforuto"))  # 2件目=曖昧
             time.sleep(0.1)
         return m
     hr_map = _listing_map([j for _, j, ish in targets if ish], "id_hrhakkaa")
     aw_map = _listing_map([j for _, j, ish in targets if not ish], "id_airwork")
 
-    # 3) 突合できた対象外だけ Association + 対象外解除
+    # 3) 突合できた対象外だけ Association + 対象外解除 + 一次対応引き継ぎ
     relinked = still = ambiguous = 0
     for appt_id, jid, is_hr in targets:
-        lid = (hr_map if is_hr else aw_map).get(jid, "__miss__")
-        if lid == "__miss__":
+        hit = (hr_map if is_hr else aw_map).get(jid, "__miss__")
+        if hit == "__miss__":
             still += 1
             continue
-        if lid is None:            # 曖昧(複数LISTING)は§24で紐付けない
+        if hit is None:            # 曖昧(複数LISTING)は§24で紐付けない
             ambiguous += 1
             continue
+        lid, ichijitaiou = hit
         if not dry_run:
             cli.associate_appointment_to_listing(appt_id, lid)
+            props = {"kokyakushiitotenkijoukyou": "未転記"}
+            if ichijitaiou in ("必要", "不要"):
+                props["ichijitaiounoumu"] = ichijitaiou   # 求人→応募 引き継ぎ
             requests.patch(
                 f"https://api.hubapi.com/crm/v3/objects/0-421/{appt_id}",
-                headers=H,
-                json={"properties": {"kokyakushiitotenkijoukyou": "未転記"}},
-                timeout=20)
+                headers=H, json={"properties": props}, timeout=20)
         relinked += 1
     summary = {"checked": checked, "relinked": relinked,
                "still_unlinked": still, "ambiguous": ambiguous}
