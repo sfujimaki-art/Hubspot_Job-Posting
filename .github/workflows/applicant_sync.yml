@@ -1,0 +1,78 @@
+# 応募連携 定期バッチ (WBS 1.11.9 スコープ③)
+# 5分ごとに集約シート(queue)を検知 → アカウント集約 → セッション再利用fetch →
+# HubSpot APPOINTMENT登録。放置ゼロ(失敗はリトライ3回→Slack報告)。
+#
+# 単一インスタンス: concurrency group で多重起動を防止(GitHub runnerは毎回ephemeralなので
+#   ファイルロックでなく concurrency が実効的な単一インスタンス機構)。
+# 状態永続化: state_sync で GCS から台帳/セッションを pull → 実行 → push。
+#
+# 必要 Secrets (会社publicリポに登録):
+#   HUBSPOT_ACCESS_TOKEN / HRHACKER_USER / HRHACKER_PASS
+#   GOOGLE_SA_JSON (シート読取用SA) / JAS_APPLICANT_QUEUE_SHEET_ID / JAS_SHEET_ID
+#   JAS_GCS_BUCKET (状態永続化先) / SLACK_APPLICANT_ALERT_WEBHOOK
+#
+# ※ 媒体URL/シートID/トークンは直書きせず Secret 注入 (publicリポ方針)。
+
+name: Applicant Sync
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # おおむね5分ごと (GitHub cronは遅延あり=厳密でない)
+  workflow_dispatch:
+    inputs:
+      media:
+        description: "処理媒体 (AW/HR/BOTH)"
+        default: "BOTH"
+        type: choice
+        options: ["BOTH", "AW", "HR"]
+      dry_run:
+        description: "ドライラン (書込なし)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: applicant-sync          # 単一インスタンス (重複runを直列化)
+  cancel-in-progress: false      # 実行中は待つ (キャンセルしない)
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      # 状態永続化: GCS(請求先問題)の代わりに Actions cache で
+      # 台帳(ledger)+AWセッション(storage_state)を run 間で保持。
+      - name: Restore state (ledger + sessions)
+        uses: actions/cache@v4
+        with:
+          path: data/job_application_sync
+          key: jas-applicant-state-${{ github.run_id }}
+          restore-keys: |
+            jas-applicant-state-
+      - name: Install deps + Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.50.0 requests python-dotenv gspread google-auth google-auth-oauthlib openpyxl google-cloud-storage
+          python -m playwright install --with-deps chromium chromium-headless-shell
+      - name: Write SA json
+        run: printf '%s' "${{ secrets.GOOGLE_SA_JSON }}" > /tmp/sa.json
+      - name: Applicant sync
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+          HRHACKER_USER: ${{ secrets.HRHACKER_USER }}
+          HRHACKER_PASS: ${{ secrets.HRHACKER_PASS }}
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
+          JAS_APPLICANT_QUEUE_SHEET_ID: ${{ secrets.JAS_APPLICANT_QUEUE_SHEET_ID }}
+          JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
+          JAS_GCS_BUCKET: ${{ secrets.JAS_GCS_BUCKET }}
+          SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+          PYTHONIOENCODING: utf-8
+          MEDIA: ${{ inputs.media || 'BOTH' }}
+        run: |
+          # 状態(台帳/セッション)は actions/cache で保持 (GCS請求先問題の代替)。
+          # 手動dispatchでdry_run=true時は --dry-run、cron(未指定)は --actual。
+          FLAG=$([ "${{ inputs.dry_run }}" = "true" ] && echo "--dry-run" || echo "--actual")
+          python scripts/job_application_sync/applicant_sync.py $FLAG --media "$MEDIA"

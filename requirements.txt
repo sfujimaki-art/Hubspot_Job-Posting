@@ -1,0 +1,10 @@
+# 求人連携システム クラウド実行 依存 (WBS 1.11.9)
+# バージョンはローカル実績に合わせて固定 (2026-07-06)
+playwright==1.50.0
+requests>=2.31
+python-dotenv>=1.0
+gspread>=6.2
+google-auth>=2.30
+google-auth-oauthlib>=1.2
+openpyxl>=3.1
+google-cloud-storage>=2.16

@@ -1,0 +1,484 @@
+"""応募連携 本線 runner: queue検知→集約→(セッション再利用)fetch→applicant_import→APPOINTMENT.
+
+WBS 1.11.9 スコープ③。設計正本: docs/wbs_outputs/1.11.9_媒体CSV同期実装/
+応募連携_トリガーとBAN対策_設計_2026-07-07.md
+
+放置ゼロ原則:
+  - 成功が検証できた応募だけ台帳を DONE にする
+  - 失敗は最大3回リトライ(バックオフ)→駄目なら Slack 報告して手放す(黙って捨てない)
+  - 未突合(アカウント特定不可)も Slack 報告
+
+BAN対策:
+  - アカウント集約(1社1ログイン/バッチ)
+  - AWセッション再利用(storage_state)
+  - 単一インスタンスロック(多重起動防止)
+
+env:
+  JAS_APPLICANT_QUEUE_SHEET_ID   : 集約シート(queue)
+  JAS_SESSION_DIR                : storage_state 保存先 (既定 data/job_application_sync/aw_sessions)
+  JAS_LEDGER_PATH                : 処理台帳 (既定 data/job_application_sync/applicant_ledger.json)
+  SLACK_APPLICANT_ALERT_WEBHOOK  : 失敗通知先
+  HUBSPOT_ACCESS_TOKEN           : HubSpot 書込
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+_ENV = _REPO / ".env"
+if _ENV.exists():
+    load_dotenv(_ENV)
+
+from scripts.job_application_sync import applicant_queue as aq  # noqa: E402
+from scripts.job_application_sync import applicant_import as ai  # noqa: E402
+from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af  # noqa: E402
+
+MAX_ATTEMPTS = 3
+LOCK_STALE_SEC = 15 * 60
+# BAN対策: 1run あたり新規ログインするAWアカウント数の上限。
+# 5分バッチで少しずつ捌く(全106社なら ~9run/~45分に分散)。session再利用で2回目以降は再ログインなし。
+MAX_AW_ACCOUNTS_PER_RUN = int(os.environ.get("JAS_MAX_AW_PER_RUN", "12"))
+_DATA = _REPO / "data" / "job_application_sync"
+SESSION_DIR = Path(os.environ.get("JAS_SESSION_DIR", _DATA / "aw_sessions"))
+LEDGER_PATH = Path(os.environ.get("JAS_LEDGER_PATH", _DATA / "applicant_ledger.json"))
+LOCK_PATH = _DATA / "applicant_sync.lock"
+
+
+# ============================================================================
+# 単一インスタンスロック (ステイル回収付き)
+# ============================================================================
+class Lock:
+    def __init__(self, path: Path = LOCK_PATH) -> None:
+        self.path = path
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                age = time.time() - self.path.stat().st_mtime
+                if age < LOCK_STALE_SEC:
+                    return False       # 実行中 (ステイルでない)
+            except OSError:
+                pass
+            # ステイル → 奪う
+        self.path.write_text(str(int(time.time())), encoding="utf-8")
+        return True
+
+    def release(self) -> None:
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+# ============================================================================
+# 処理台帳 (放置ゼロ: DONE は成功時のみ / FAILED は試行回数を記録)
+# ============================================================================
+class Ledger:
+    def __init__(self, path: Path = LEDGER_PATH) -> None:
+        self.path = path
+        self.data: dict = {}
+        if path.exists():
+            try:
+                self.data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self.data = {}
+
+    def status(self, row_id: str) -> str:
+        return (self.data.get(row_id) or {}).get("status", "NEW")
+
+    def attempts(self, row_id: str) -> int:
+        return (self.data.get(row_id) or {}).get("attempts", 0)
+
+    def mark(self, row_id: str, status: str, error: str = "") -> None:
+        e = self.data.setdefault(row_id, {"attempts": 0})
+        e["status"] = status
+        e["updated"] = datetime.now().isoformat()
+        if error:
+            e["last_error"] = error[:300]
+
+    def bump(self, row_id: str, error: str) -> int:
+        e = self.data.setdefault(row_id, {"attempts": 0})
+        e["attempts"] = e.get("attempts", 0) + 1
+        e["status"] = "FAILED"
+        e["last_error"] = error[:300]
+        e["updated"] = datetime.now().isoformat()
+        return e["attempts"]
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ============================================================================
+# Slack 通知 (放置ゼロ: 失敗を必ず報告)
+# ============================================================================
+def slack_notify(message: str, dry_run: bool = False) -> bool:
+    # dry-run 時は実送信せず表示のみ (テストのSlackノイズ防止)
+    if dry_run:
+        print(f"[slack(dry-run,未送信)] {message}", flush=True)
+        return False
+    url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
+    if not url:
+        print(f"[slack未設定] {message}", flush=True)
+        return False
+    try:
+        r = requests.post(url, json={"text": message}, timeout=15)
+        return r.status_code == 200
+    except requests.RequestException as e:
+        print(f"[slack送信失敗] {e}: {message}", flush=True)
+        return False
+
+
+# ============================================================================
+# AW 1アカウント処理 (セッション再利用fetch → applicant_import)
+# ============================================================================
+def _sanitize(s: str) -> str:
+    import re
+    return re.sub(r"[^0-9A-Za-z_.-]", "_", s)[:60]
+
+
+def _session_path(login_id: str) -> Path:
+    return SESSION_DIR / f"{_sanitize(login_id)}.json"
+
+
+async def _fetch_aw_csv(login_id: str, password: str, out_dir: Path) -> Path:
+    return await af.fetch_aw_applicants(
+        login_id, password, out_dir, headless=True,
+        storage_state_path=_session_path(login_id))
+
+
+def _missing_aw_listings(job_ids: list[str], token: str) -> list[str]:
+    """id_airwork の LISTING が存在しない求人IDを返す (100件チャンク search)."""
+    H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    exist: set = set()
+    ids = [j for j in job_ids if j]
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        body = {"filterGroups": [{"filters": [
+            {"propertyName": "id_airwork", "operator": "IN", "values": chunk}]}],
+            "properties": ["id_airwork"], "limit": 200}
+        r = requests.post(
+            "https://api.hubapi.com/crm/v3/objects/0-420/search",
+            headers=H, json=body, timeout=30)
+        for o in r.json().get("results", []):
+            v = (o.get("properties") or {}).get("id_airwork")
+            if v:
+                exist.add(v)
+        time.sleep(0.1)
+    return [j for j in ids if j not in exist]
+
+
+def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> int:
+    """案2b: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
+    生成待ちあり(数分)。欠落時のみ発火。Returns: upsert試行した求人数(近似)."""
+    from scripts.job_application_sync.fetchers import aw_csv_fetcher as awf
+    from scripts.job_application_sync import airwork_import as air
+    zip_path = asyncio.run(awf.fetch_aw_xlsx(
+        bid, b_pw, out_dir, headless=True, mode="full",
+        storage_state_path=_session_path(bid)))
+    # login_id=bid で LISTING を作成 (応募linkと同じキーに揃える)。
+    # client_code はXLSX側と異なるため strict_client_code=False。
+    air.run_xlsx(str(zip_path), login_id=bid, dry_run=False,
+                 strict_client_code=False)
+    return len(missing)
+
+
+def process_aw_account(
+    company: str, b_ids: list[str], b_pw: str,
+    out_dir: Path, dry_run: bool = True,
+) -> dict:
+    """AW 1アカウントの応募を取得→(案2b求人先行)→登録。複数B系IDは順に試行。
+    Returns: {ok, linked, unlinked, dup, jobs_fetched, error, login_id}"""
+    token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+    result = {"ok": False, "linked": 0, "unlinked": 0, "dup": 0,
+              "jobs_fetched": 0, "error": "", "login_id": ""}
+    last_err = ""
+    for bid in b_ids or []:
+        if not bid or bid in ("ー", "-"):
+            continue
+        try:
+            csv_path = asyncio.run(_fetch_aw_csv(bid, b_pw, out_dir))
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{bid}: {type(e).__name__}: {str(e)[:100]}"
+            continue
+        rows = ai.load_applicants_csv(str(csv_path))
+        if dry_run:
+            result.update(ok=True, login_id=bid, linked=0, unlinked=len(rows),
+                          csv=csv_path.name, total=len(rows))
+            return result
+        # 案2b: 応募の求人LISTINGが欠落していれば、その社の求人を先にfetch→upsert
+        job_ids = list({r.media_job_id for r in rows if r.media_job_id})
+        jobs_fetched = 0
+        try:
+            missing = _missing_aw_listings(job_ids, token)
+            if missing:
+                jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir)
+                # ★index反映待ち: 作成直後のLISTINGは検索に載らない(6-8s要)。
+                # 待たずに応募importすると対象外で作られdedupで永久に紐付かない。
+                time.sleep(15)
+        except Exception as e:  # noqa: BLE001
+            # 求人fetch失敗しても応募登録は続行 (未特定=対象外で残る)
+            print(f"  [案2b] 求人fetch失敗(応募は続行): "
+                  f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+        # 応募import (求人が揃った状態で紐付け)
+        cli = ai.RealHubSpotClient(token)
+        results = ai.run_import(rows, cli, default_login_id=bid)
+        from collections import Counter
+        st = Counter(r.status for r in results)
+        result.update(ok=True, login_id=bid, jobs_fetched=jobs_fetched,
+                      linked=st.get("linked", 0),
+                      unlinked=st.get("unlinked", 0),
+                      dup=st.get("skip_duplicate", 0), total=len(results))
+        return result
+    result["error"] = last_err or "有効なB系IDなし"
+    return result
+
+
+# ============================================================================
+# HR 1マスター処理 (日付範囲で全顧客一括fetch → applicant_import)
+# ============================================================================
+def _q_date_to_iso(s: str) -> Optional[str]:
+    """queue の日付 '2026/5/12' → '2026-05-12'."""
+    import re
+    m = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", (s or "").strip())
+    if not m:
+        return None
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+async def _fetch_hr_csv(out_dir: Path, date_from: str, date_to: str) -> Path:
+    from scripts.job_application_sync.fetchers import hr_applicant_fetcher as hf
+    return await hf.fetch_hr_applicants(out_dir, date_from, date_to, headless=True)
+
+
+def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
+                     date_from: str = "", date_to: str = "") -> dict:
+    """HR応募を日付範囲で1マスター取得→登録。
+    date_from/to 未指定なら queue項目の日付範囲(最大60日にcap)から算出。"""
+    token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+    result = {"ok": False, "linked": 0, "unlinked": 0, "dup": 0, "error": "",
+              "date_from": "", "date_to": ""}
+    # 日付範囲決定
+    if not (date_from and date_to):
+        ds = sorted(d for d in (_q_date_to_iso(it.columns.get("D", ""))
+                                for it in items) if d)
+        if not ds:
+            result["error"] = "HR項目に有効な日付なし"
+            return result
+        date_to = date_to or ds[-1]
+        # 60日capで開始日を決定
+        from datetime import date as _date, timedelta
+        y, m, d = map(int, date_to.split("-"))
+        cap = (_date(y, m, d) - timedelta(days=60)).isoformat()
+        date_from = date_from or max(ds[0], cap)
+    result["date_from"], result["date_to"] = date_from, date_to
+    try:
+        csv_path = asyncio.run(_fetch_hr_csv(out_dir, date_from, date_to))
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        return result
+    rows = ai.load_applicants_csv(str(csv_path))
+    if dry_run:
+        result.update(ok=True, unlinked=len(rows), total=len(rows),
+                      csv=csv_path.name)
+        return result
+    cli = ai.RealHubSpotClient(token)
+    results = ai.run_import(rows, cli)
+    from collections import Counter
+    st = Counter(r.status for r in results)
+    result.update(ok=True, linked=st.get("linked", 0),
+                  unlinked=st.get("unlinked", 0),
+                  dup=st.get("skip_duplicate", 0), total=len(results))
+    return result
+
+
+# ============================================================================
+# メイン runner
+# ============================================================================
+def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
+        media_filter: str = "BOTH",
+        hr_date_from: str = "", hr_date_to: str = "") -> dict:
+    lock = Lock()
+    if not lock.acquire():
+        print("[applicant_sync] 別インスタンス実行中 → skip", flush=True)
+        return {"skipped": True}
+    ledger = Ledger()
+    out_dir = _REPO / "scratchpad" / "applicant_sync_csv"
+    summary = {"accounts": 0, "done": 0, "failed": 0, "reported": 0,
+               "unresolved": 0, "linked": 0}
+    try:
+        print(f"[applicant_sync] queue検知... (dry_run={dry_run})", flush=True)
+        items = aq.read_new_items()
+        # 台帳で既にDONEの項目は除外
+        items = [it for it in items if ledger.status(it.row_id) != "DONE"]
+        resolver = aq.AccountResolver().build()
+        grouped, unresolved = aq.aggregate_by_account(items, resolver)
+
+        # 未突合 → 報告(放置ゼロ)
+        if unresolved:
+            summary["unresolved"] = len(unresolved)
+            samp = ", ".join(f"{u.company[:14]}({u.login_id[:20]})"
+                             for u in unresolved[:5])
+            slack_notify(dry_run=dry_run, message=
+                f"⚠️ 応募連携: アカウント特定不可 {len(unresolved)}件 "
+                f"(要手動確認) 例: {samp}")
+
+        # ---- HR: 1マスターで日付範囲一括 (リクロジアドレスで100%突合) ----
+        hr_items = grouped.get("HR::master", [])
+        if hr_items and media_filter in ("HR", "BOTH"):
+            print(f"[applicant_sync] HR: {len(hr_items)}件を1マスターで処理",
+                  flush=True)
+            res = process_hr_batch(hr_items, out_dir, dry_run,
+                                   date_from=hr_date_from, date_to=hr_date_to)
+            if res["ok"]:
+                # 放置ゼロ: 取得した日付範囲に入る項目だけ DONE。
+                # 範囲外(古い/未来)は未登録なので NEW のまま残す(次の広い範囲で処理)。
+                df, dt = res["date_from"], res["date_to"]
+                covered = uncovered = 0
+                for it in hr_items:
+                    d = _q_date_to_iso(it.columns.get("D", ""))
+                    if d and df <= d <= dt:
+                        ledger.mark(it.row_id, "DONE")
+                        covered += 1
+                    else:
+                        uncovered += 1  # NEW のまま
+                summary["done"] += covered
+                summary["linked"] += res.get("linked", 0)
+                print(f"  ✅ HR: 応募取込 linked={res.get('linked')} "
+                      f"unlinked={res.get('unlinked')} dup={res.get('dup')} "
+                      f"範囲={df}〜{dt} / queue項目 DONE={covered} "
+                      f"範囲外残={uncovered}", flush=True)
+            else:
+                atts = 0
+                for it in hr_items:
+                    atts = ledger.bump(it.row_id, res["error"])
+                summary["failed"] += len(hr_items)
+                if atts >= MAX_ATTEMPTS:
+                    summary["reported"] += 1
+                    slack_notify(dry_run=dry_run, message=
+                        f"⚠️ HR応募登録失敗: 理由={res['error']} / {atts}回 / 要確認")
+                print(f"  {'❌' if atts >= MAX_ATTEMPTS else '⏳'} HR: "
+                      f"{res['error']} ({atts}/{MAX_ATTEMPTS}回)", flush=True)
+
+        if media_filter not in ("AW", "BOTH"):
+            ledger.save()
+            print(f"[applicant_sync-done] {summary}", flush=True)
+            return summary   # lock は finally で解放
+
+        aw_groups = {k: v for k, v in grouped.items() if k.startswith("AW::")}
+        # BAN対策: 1runのAWアカウント数を上限でcap(一斉ログイン回避)。
+        cap = limit_accounts if limit_accounts else MAX_AW_ACCOUNTS_PER_RUN
+        keys = list(aw_groups)[:cap]
+        if len(aw_groups) > len(keys):
+            print(f"[applicant_sync] AW {len(aw_groups)}社中 今回{len(keys)}社処理 "
+                  f"(残{len(aw_groups)-len(keys)}社は次サイクル / BAN対策の分散)",
+                  flush=True)
+        for key in keys:
+            group = aw_groups[key]
+            company = key[len("AW::"):]
+            summary["accounts"] += 1
+            # そのアカウントのB系認証を resolver から (代表itemで再解決)
+            acc = resolver.resolve(group[0])
+            if acc is None or acc.closed:
+                for it in group:
+                    ledger.mark(it.row_id, "SKIP", "closed/unresolved")
+                continue
+            res = process_aw_account(company, acc.b_ids, acc.b_pw, out_dir, dry_run)
+            if res["ok"]:
+                for it in group:
+                    ledger.mark(it.row_id, "DONE")
+                summary["done"] += len(group)
+                summary["linked"] += res.get("linked", 0)
+                print(f"  ✅ {company[:18]}: 応募{len(group)}件 "
+                      f"linked={res.get('linked')} unlinked={res.get('unlinked')} "
+                      f"dup={res.get("dup")} 求人fetch={res.get("jobs_fetched")} (login={res.get("login_id")})", flush=True)
+            else:
+                # 失敗 → リトライ回数を数え、上限超過で Slack 報告
+                atts = 0
+                for it in group:
+                    atts = ledger.bump(it.row_id, res["error"])
+                summary["failed"] += len(group)
+                if atts >= MAX_ATTEMPTS:
+                    summary["reported"] += 1
+                    slack_notify(dry_run=dry_run, message=
+                        f"⚠️ 応募登録失敗: {company} / 理由={res['error']} / "
+                        f"{atts}回試行済 / 要手動確認")
+                    print(f"  ❌ {company[:18]}: {res['error']} "
+                          f"({atts}回→Slack報告)", flush=True)
+                else:
+                    print(f"  ⏳ {company[:18]}: {res['error']} "
+                          f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
+        ledger.save()
+    finally:
+        lock.release()
+    print(f"[applicant_sync-done] {summary}", flush=True)
+    return summary
+
+
+def reconcile(dry_run: bool = False) -> dict:
+    """照合スイープ (放置ゼロの最後の砦, 日次想定).
+
+    台帳とqueueを突合し「詰まった項目」を検出してSlack報告する:
+      - FAILED で試行上限に達した項目 (自動回復せず放置になりかけ)
+      - 長期 NEW のまま処理されていない項目 (queueにあるが未着手)
+    黙って宙に浮く項目をゼロにするための人手トリガー。
+    """
+    ledger = Ledger()
+    stuck_failed = [rid for rid, e in ledger.data.items()
+                    if e.get("status") == "FAILED"
+                    and e.get("attempts", 0) >= MAX_ATTEMPTS]
+    try:
+        items = aq.read_new_items()
+    except Exception as e:  # noqa: BLE001
+        slack_notify(f"⚠️ 照合スイープ: queue読取失敗 {e}", dry_run)
+        return {"error": str(e)}
+    # queueにあるが台帳で未DONE/未FAILEDのまま溜まっている件数
+    pending = [it for it in items if ledger.status(it.row_id) in ("NEW",)]
+    report = {"stuck_failed": len(stuck_failed), "pending_new": len(pending)}
+    if stuck_failed or len(pending) > 200:
+        slack_notify(
+            f"🔎 照合スイープ: 要確認 — リトライ上限失敗={len(stuck_failed)}件 / "
+            f"未処理NEW滞留={len(pending)}件 (放置ゼロ点検)", dry_run)
+    print(f"[reconcile] {report}", flush=True)
+    return report
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="応募連携 本線 runner")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--dry-run", dest="dry_run", action="store_true", default=True)
+    g.add_argument("--actual", dest="dry_run", action="store_false")
+    p.add_argument("--limit-accounts", type=int, default=None)
+    p.add_argument("--media", choices=["AW", "HR", "BOTH"], default="BOTH")
+    p.add_argument("--hr-date-from", default="")
+    p.add_argument("--hr-date-to", default="")
+    p.add_argument("--reconcile", action="store_true",
+                   help="照合スイープ(日次): 詰まった項目を検出しSlack報告")
+    return p.parse_args(argv)
+
+
+if __name__ == "__main__":
+    a = _parse_args()
+    if a.reconcile:
+        reconcile(dry_run=a.dry_run)
+        sys.exit(0)
+    run(dry_run=a.dry_run, limit_accounts=a.limit_accounts,
+        media_filter=a.media, hr_date_from=a.hr_date_from,
+        hr_date_to=a.hr_date_to)
