@@ -118,7 +118,36 @@ AW_XLSX_OPTIONAL_COLUMNS: dict[str, str] = {
     "勤務地名(working_location_id_jp)": "work_location_name",
     "勤務地都道府県(working_location_prefecture)": "work_location_prefecture",
     "勤務地市区町村(working_location_city_area)": "work_location_city",
+    # 応募先求人情報コピー用の詳細 (2026-07-08 実XLSX 265列で確認)
+    "職種1(occupation_id_jp1)": "occupation1",
+    "給与形態(salary_form_jp)": "salary_form",
+    "勤務形態(working_style_jp)": "working_style",
+    "勤務時間・シフト・最低勤務期間の補足説明(working_time_supplement)": "working_time_note",
 }
+
+
+def _aw_listing_detail_props(row: dict) -> dict:
+    """AW XLSX 行 → LISTING の求人詳細プロパティ (非空のみ)。
+
+    HR と同じ LISTING フィールドに詰め、応募コピー(get_oubosaki_props)が
+    そのまま拾えるようにする。勤務地は 都道府県+市区町村 を連結。
+    """
+    p: dict = {}
+    pref = (row.get("work_location_prefecture") or "").strip()
+    city = (row.get("work_location_city") or "").strip()
+    qinwude = (pref + city).strip() or (row.get("work_location_name") or "").strip()
+    for val, hs_prop in [
+        (row.get("description"), "shigotonaiyou"),
+        (row.get("occupation1") or row.get("job_name"), "zhizhong"),
+        (qinwude, "qinwude"),
+        (row.get("working_style"), "kinmukeitai"),
+        (row.get("salary_form"), "kyuuyokeitai"),
+        (row.get("working_time_note"), "kinmujikan"),
+    ]:
+        v = (str(val).strip() if val else "")
+        if v:
+            p[hs_prop] = v
+    return p
 
 AW_XLSX_DEFAULT_SHEET = "Sheet1"
 
@@ -514,6 +543,14 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
         if not existing_url and jid:
             p["url_airwork"] = f"{recruit_site_url.rstrip('/')}/{jid}/"
 
+    # 求人詳細を既存空欄のみ補完 (媒体値でメディア詳細を埋める。人手編集は保護)
+    detail = _aw_listing_detail_props(row)
+    for hs_prop, v in detail.items():
+        existing = existing_props.get(hs_prop)
+        existing = existing.strip() if isinstance(existing, str) else ""
+        if not existing:
+            p[hs_prop] = v
+
     return p
 
 
@@ -546,6 +583,9 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
         p["url_airwork"] = row["url"]
     elif recruit_site_url:
         p["url_airwork"] = f"{recruit_site_url.rstrip('/')}/{jid}/"
+
+    # 求人詳細 (仕事内容/職種/勤務地/勤務形態/給与形態/勤務時間) を LISTING に格納
+    p.update(_aw_listing_detail_props(row))
 
     # 求人名 = LISTING 必須プロパティ (Phase 0b HR編で判明)
     p["hs_name"] = row.get("job_name") or f"Air Work求人 {jid}"
