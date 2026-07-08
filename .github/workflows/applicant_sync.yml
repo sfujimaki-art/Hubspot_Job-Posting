@@ -65,9 +65,10 @@ jobs:
           HRHACKER_USER: ${{ secrets.HRHACKER_USER }}
           HRHACKER_PASS: ${{ secrets.HRHACKER_PASS }}
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
+          GOOGLE_SA_JSON: /tmp/sa.json
+          SHEETS_AUTH_MODE: sa   # Actionsは Service Account でシート読取 (要: 2シートをSAに共有)
           JAS_APPLICANT_QUEUE_SHEET_ID: ${{ secrets.JAS_APPLICANT_QUEUE_SHEET_ID }}
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
-          JAS_GCS_BUCKET: ${{ secrets.JAS_GCS_BUCKET }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
           PYTHONIOENCODING: utf-8
           MEDIA: ${{ inputs.media || 'BOTH' }}
