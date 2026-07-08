@@ -126,27 +126,41 @@ AW_XLSX_OPTIONAL_COLUMNS: dict[str, str] = {
 }
 
 
+# LISTING の給与形態(kyuuyokeitai)は enum。許可値のみ書込む(他は落ちる)。
+_KYUUYO_KEITAI_OK = {"月給", "年俸", "時給", "日給"}
+
+
 def _aw_listing_detail_props(row: dict) -> dict:
     """AW XLSX 行 → LISTING の求人詳細プロパティ (非空のみ)。
 
     HR と同じ LISTING フィールドに詰め、応募コピー(get_oubosaki_props)が
-    そのまま拾えるようにする。勤務地は 都道府県+市区町村 を連結。
+    そのまま拾えるようにする。
+    注意:
+      - kinmukeitai(勤務形態)はLISTING側が enum[出社/リモート/ハイブリッド]で
+        AWの働き方(固定時間制等)とは別概念のため書込まない。AWの勤務形態は
+        勤務時間(kinmujikan)欄の先頭に畳んで保持する。
+      - kyuuyokeitai(給与形態)は enum のため許可値のみ書込む。
     """
     p: dict = {}
     pref = (row.get("work_location_prefecture") or "").strip()
     city = (row.get("work_location_city") or "").strip()
     qinwude = (pref + city).strip() or (row.get("work_location_name") or "").strip()
+    # 勤務時間 = 勤務形態(固定時間制等) + 勤務時間補足 を連結
+    ws = (str(row.get("working_style") or "")).strip()
+    note = (str(row.get("working_time_note") or "")).strip()
+    kinmujikan = "\n".join([x for x in [ws, note] if x])
     for val, hs_prop in [
         (row.get("description"), "shigotonaiyou"),
         (row.get("occupation1") or row.get("job_name"), "zhizhong"),
         (qinwude, "qinwude"),
-        (row.get("working_style"), "kinmukeitai"),
-        (row.get("salary_form"), "kyuuyokeitai"),
-        (row.get("working_time_note"), "kinmujikan"),
+        (kinmujikan, "kinmujikan"),
     ]:
         v = (str(val).strip() if val else "")
         if v:
             p[hs_prop] = v
+    sal = (str(row.get("salary_form") or "")).strip()
+    if sal in _KYUUYO_KEITAI_OK:
+        p["kyuuyokeitai"] = sal
     return p
 
 AW_XLSX_DEFAULT_SHEET = "Sheet1"
