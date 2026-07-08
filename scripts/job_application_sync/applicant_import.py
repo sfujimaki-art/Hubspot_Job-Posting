@@ -66,6 +66,28 @@ from typing import Any, Iterable, Optional, Protocol
 ASSOC_TYPE_ID_APPT_TO_LISTING = 5  # USER_DEFINED 「応募先求人」
 ASSOC_TYPE_ID_LISTING_TO_APPT = 6  # USER_DEFINED 「応募」
 
+# HR個別求人URL テンプレ (求人IDを付けるだけ, hrhacker_import と同一)
+HR_JOB_URL_TMPL = "https://hr-hacker.com/f-a-c-rikurozi/job-offers/show/{}"
+
+# AW login_id → 管理用メールアドレス の遅延キャッシュ (Deal解決用)
+_AW_LOGIN_MAIL_CACHE: dict = {}
+
+
+def _aw_login_to_mail(login_id: str) -> str:
+    """AW login_id → 管理用メールアドレス。account_loaderを1回だけ読んでキャッシュ。"""
+    if not _AW_LOGIN_MAIL_CACHE:
+        try:
+            from scripts.job_application_sync.fetchers import account_loader as _al
+            for a in _al.iter_aw_accounts(active_only=False):
+                lid = (a.get("login_id") or "").strip()
+                km = (a.get("manage_mail") or "").strip().lower()
+                if lid and km:
+                    _AW_LOGIN_MAIL_CACHE.setdefault(lid, km)
+            _AW_LOGIN_MAIL_CACHE.setdefault("__loaded__", "1")
+        except Exception:  # noqa: BLE001
+            _AW_LOGIN_MAIL_CACHE.setdefault("__loaded__", "1")
+    return _AW_LOGIN_MAIL_CACHE.get(login_id, "")
+
 # ---- oubobaitaimei enum 値 (Phase 0 実測 12択) -----------------------------
 OUBO_BAITAI_VALUES = {
     "HRハッカー", "AirWork", "jobギア", "ジモティー", "Indeed", "ぶるる",
@@ -184,6 +206,7 @@ class HubSpotClient(Protocol):
     def create_appointment(self, properties: dict) -> str: ...
     def associate_appointment_to_listing(self, appointment_id: str, listing_id: str) -> None: ...
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]: ...
+    def get_oubosaki_props(self, listing_id: str, media: str, login_id: str, media_job_id: str) -> dict: ...
 
 
 # ============================================================================
@@ -269,6 +292,10 @@ class DryRunClient:
 
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]:
         return None  # ドライランでは求人フラグ取得なし
+
+    def get_oubosaki_props(self, listing_id: str, media: str,
+                           login_id: str, media_job_id: str) -> dict:
+        return {}  # ドライランでは求人情報コピーなし
 
 
 # ============================================================================
@@ -418,6 +445,93 @@ class RealHubSpotClient:
             return (r.json().get("properties") or {}).get("ichijitaiounoumu_deforuto")
         except Exception:  # noqa: BLE001
             return None
+
+    def _resolve_deal_props(self, listing_id: str, media: str,
+                            login_id: str) -> dict:
+        """紐付く求人(LISTING)の取引(Deal)を解決して取引プロパティを返す。
+
+        HR: LISTING→Deal の関連付け(association)を辿る。
+        AW: 関連付けが無いので airwork_account_login_id → 管理用メールアドレス
+            → Deal.kanri_mail_address で突合 (sync_ichijitaiou と同経路)。
+        取得失敗は {} (best-effort)。
+        """
+        deal_id = None
+        try:
+            a = self._requests.get(
+                f"{self.BASE}/crm/v4/objects/0-420/{listing_id}/associations/0-3",
+                headers=self.headers, timeout=20).json().get("results", [])
+            if a:
+                deal_id = str(a[0].get("toObjectId"))
+        except Exception:  # noqa: BLE001
+            pass
+        if not deal_id and "Air" in media and login_id:
+            km = _aw_login_to_mail(login_id)
+            if km:
+                try:
+                    r = self._requests.post(
+                        f"{self.BASE}/crm/v3/objects/0-3/search",
+                        headers=self.headers, json={"filterGroups": [{"filters": [
+                            {"propertyName": "kanri_mail_address",
+                             "operator": "EQ", "value": km}]}],
+                            "properties": ["dealname", "contract_plan", "service1"],
+                            "limit": 1}, timeout=20).json()
+                    res = r.get("results", [])
+                    if res:
+                        return res[0].get("properties") or {}
+                except Exception:  # noqa: BLE001
+                    pass
+        if not deal_id:
+            return {}
+        try:
+            d = self._requests.get(
+                f"{self.BASE}/crm/v3/objects/0-3/{deal_id}"
+                f"?properties=dealname,contract_plan,service1",
+                headers=self.headers, timeout=20).json()
+            return d.get("properties") or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def get_oubosaki_props(self, listing_id: str, media: str,
+                           login_id: str, media_job_id: str) -> dict:
+        """紐付く求人(LISTING)+取引(Deal)から、応募側の応募先求人情報11項目を構築。
+
+        LISTING直読み8 + Deal経由3。HR URLは求人IDから個別URLを生成。
+        best-effort: 取得失敗した項目は入れない(空で潰さない)。
+        """
+        props: dict = {}
+        try:
+            lp = self._requests.get(
+                f"{self.BASE}/crm/v3/objects/0-420/{listing_id}?properties="
+                "hs_name,shigotonaiyou,zhizhong,qinwude,kinmujikan,"
+                "kinmukeitai,kyuuyokeitai,url_airwork",
+                headers=self.headers, timeout=20).json().get("properties") or {}
+        except Exception:  # noqa: BLE001
+            lp = {}
+        _m = [("hs_name", "oubosaki_kyuujin_title"),
+              ("shigotonaiyou", "oubosaki_shigotonaiyou"),
+              ("zhizhong", "oubosaki_shokushu"),
+              ("qinwude", "oubosaki_kinmuchi"),
+              ("kinmujikan", "oubosaki_kinmujikan"),
+              ("kinmukeitai", "oubosaki_kinmukeitai"),
+              ("kyuuyokeitai", "oubosaki_kyuuyokeitai")]
+        for src, dst in _m:
+            v = lp.get(src)
+            if v:
+                props[dst] = v
+        # URL: HR=求人IDから個別URL生成 / AW=LISTINGのurl_airwork
+        if media == "HRハッカー" and media_job_id:
+            props["oubosaki_kyuujin_url"] = HR_JOB_URL_TMPL.format(media_job_id)
+        elif lp.get("url_airwork"):
+            props["oubosaki_kyuujin_url"] = lp["url_airwork"]
+        # Deal経由3
+        dp = self._resolve_deal_props(listing_id, media, login_id)
+        for src, dst in [("dealname", "oubosaki_torihiki_name"),
+                         ("contract_plan", "oubosaki_contract_plan"),
+                         ("service1", "oubosaki_riyou_service")]:
+            v = dp.get(src)
+            if v:
+                props[dst] = v
+        return props
 
 
 # ============================================================================
@@ -625,10 +739,14 @@ def process_applicant(
             message=f"既存APPOINTMENT {existing} と (media, media_job_id, 電話, メール) 一致",
         )
 
-    # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグを引き継ぐ)
+    # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグ + 応募先求人情報を引き継ぐ)
     ichijitaiou = client.get_listing_ichijitaiou(listing_id) if listing_id else None
     props = build_appointment_properties(
         row, linked=listing_id is not None, ichijitaiou=ichijitaiou)
+    if listing_id:
+        login_id = row.airwork_login_id or default_login_id
+        props.update(client.get_oubosaki_props(
+            listing_id, row.media, login_id, row.media_job_id))
     appt_id = client.create_appointment(props)
 
     # 4. Association (求人特定時のみ)

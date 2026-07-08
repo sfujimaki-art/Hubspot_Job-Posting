@@ -522,6 +522,13 @@ def relink(dry_run: bool = False, limit: int = 1000) -> dict:
             props = {"kokyakushiitotenkijoukyou": "未転記"}
             if ichijitaiou in ("必要", "不要"):
                 props["ichijitaiounoumu"] = ichijitaiou   # 求人→応募 引き継ぎ
+            # 応募先求人情報11項目も引き継ぐ (AWのlogin_idは対象外appt側に無いため
+            # LISTING直読み+HR関連付けのみ。best-effort)
+            media = "HRハッカー" if is_hr else "AirWork"
+            try:
+                props.update(cli.get_oubosaki_props(lid, media, "", jid))
+            except Exception:  # noqa: BLE001
+                pass
             requests.patch(
                 f"https://api.hubapi.com/crm/v3/objects/0-421/{appt_id}",
                 headers=H, json={"properties": props}, timeout=20)
