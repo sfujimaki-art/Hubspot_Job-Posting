@@ -58,7 +58,9 @@ jobs:
           pip install playwright==1.50.0 requests python-dotenv gspread google-auth google-auth-oauthlib openpyxl google-cloud-storage
           python -m playwright install --with-deps chromium chromium-headless-shell
       - name: Write SA json
-        run: printf '%s' "${{ secrets.GOOGLE_SA_JSON }}" > /tmp/sa.json
+        env:
+          SA_JSON_CONTENT: ${{ secrets.GOOGLE_SA_JSON }}
+        run: printf '%s' "$SA_JSON_CONTENT" > /tmp/sa.json   # env経由 (複数行secretをシェル展開で壊さない)
       - name: Applicant sync
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
