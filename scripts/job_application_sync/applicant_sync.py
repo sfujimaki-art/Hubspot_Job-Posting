@@ -408,7 +408,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 summary["linked"] += res.get("linked", 0)
                 print(f"  ✅ {company[:18]}: 応募{len(group)}件 "
                       f"linked={res.get('linked')} unlinked={res.get('unlinked')} "
-                      f"dup={res.get("dup")} 求人fetch={res.get("jobs_fetched")} (login={res.get("login_id")})", flush=True)
+                      f"dup={res.get('dup')} 求人fetch={res.get('jobs_fetched')} (login={res.get('login_id')})", flush=True)
             else:
                 # 失敗 → リトライ回数を数え、上限超過で Slack 報告
                 atts = 0
