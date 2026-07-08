@@ -378,7 +378,8 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                       f"{res['error']} ({atts}/{MAX_ATTEMPTS}回)", flush=True)
 
         if media_filter not in ("AW", "BOTH"):
-            ledger.save()
+            if not dry_run:
+                ledger.save()  # dry-runは台帳を汚さない(実登録してないのにDONEにしない)
             print(f"[applicant_sync-done] {summary}", flush=True)
             return summary   # lock は finally で解放
 
@@ -425,7 +426,8 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 else:
                     print(f"  ⏳ {company[:18]}: {res['error']} "
                           f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
-        ledger.save()
+        if not dry_run:
+            ledger.save()  # dry-runは台帳を汚さない
     finally:
         lock.release()
     print(f"[applicant_sync-done] {summary}", flush=True)

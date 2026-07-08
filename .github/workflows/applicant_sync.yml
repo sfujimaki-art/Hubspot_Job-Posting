@@ -49,9 +49,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data/job_application_sync
-          key: jas-applicant-state-${{ github.run_id }}
+          key: jas-applicant-state-v2-${{ github.run_id }}
           restore-keys: |
-            jas-applicant-state-
+            jas-applicant-state-v2-
       - name: Install deps + Playwright
         run: |
           python -m pip install --upgrade pip
