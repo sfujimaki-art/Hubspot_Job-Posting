@@ -407,7 +407,24 @@ async def _poll_export_list(page, kick_iso: str, timeout_min: int) -> str:
     Returns:
         DL URL (string)
     """
-    await page.goto(EXPORT_LIST_URL, wait_until="domcontentloaded")
+    # kick(_kick_csv_export)の form.submit() が起こしたナビゲーションが settling 中に
+    # 即 goto すると net::ERR_ABORTED でナビゲーション競合する (2026-07-09 実証)。
+    # settle 待ち + リトライで回避 (直接 goto は成功することを確認済)。
+    last_err = None
+    for attempt in range(4):
+        try:
+            await page.goto(EXPORT_LIST_URL, wait_until="domcontentloaded",
+                            timeout=30_000)
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if "ERR_ABORTED" in str(e) or "aborted" in str(e).lower():
+                await asyncio.sleep(3)  # 直前ナビゲーションの settle を待って再試行
+                continue
+            raise
+    if last_err is not None:
+        raise last_err
     deadline = time.time() + timeout_min * 60
     while time.time() < deadline:
         try:
