@@ -107,8 +107,14 @@ def _extract_client_code(xlsx_path: Path) -> str:
 # ============================================================================
 # 1 顧客処理
 # ============================================================================
+# run跨ぎで永続させる状態ディレクトリ (actions/cache が保持するパス)。
+# out_dir(scratchpad/csv_fetched/aw)はcache対象外でcursorが消えるため分離する
+# (2026-07-09 検証で run跨ぎ cursor非永続を実測→ここへ修正)。
+STATE_DIR = Path("data/job_application_sync")
+
+
 def _rotate_slice(accounts: list, limit: int, out_dir: Path, key: str) -> list:
-    """全社を N社ずつローテーション。カーソルを out_dir に保存し続きから返す。
+    """全社を N社ずつローテーション。カーソルを cache対象パスに保存し続きから返す。
 
     「パッチで順番に繰り返す」オンデマンド政策(2026-07-09)。全社一斉を避け、
     1runでN社、次runは続きのN社を処理。末尾まで行ったら先頭へ折返す。
@@ -116,7 +122,8 @@ def _rotate_slice(accounts: list, limit: int, out_dir: Path, key: str) -> list:
     n = len(accounts)
     if n <= limit:
         return accounts
-    cur_path = Path(out_dir) / "aw_rotation_cursor.json"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cur_path = STATE_DIR / "aw_rotation_cursor.json"
     cursor = 0
     if cur_path.exists():
         try:
@@ -191,8 +198,8 @@ def _write_account_results(results: list, out_dir: Path, phase: str) -> dict:
                        "outcome": outcome, "error": r.get("error", "")[:120]})
     summary = dict(cat)
     try:
-        p = Path(out_dir) / f"aw_account_results_{phase}.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        p = STATE_DIR / f"aw_account_results_{phase}.json"  # cache対象パスに永続
         p.write_text(json.dumps({"summary": summary, "detail": detail},
                                 ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:  # noqa: BLE001
