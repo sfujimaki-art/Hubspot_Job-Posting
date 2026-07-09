@@ -74,7 +74,10 @@ jobs:
           TARGET: ${{ inputs.target_login_ids }}
           LIMIT: ${{ inputs.limit }}
         run: |
+          # hr_watcher は --dry-run/--actual 両対応、aw_orchestrator は --actual のみ
+          # (dry-runが既定) なので媒体別にフラグを分ける。
           FLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "--dry-run")
+          AWFLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "")
           TGT=$([ -n "$TARGET" ] && echo "--target-login-ids $TARGET" || echo "--from-active-deals")
           LIM=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "")
           case "$PHASE" in
@@ -87,6 +90,6 @@ jobs:
               ;;
             aw-collect)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
-                --phase collect $FLAG --parallel 2
+                --phase collect $AWFLAG --parallel 2
               ;;
           esac
