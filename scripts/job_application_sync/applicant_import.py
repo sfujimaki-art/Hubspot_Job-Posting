@@ -473,7 +473,8 @@ class RealHubSpotClient:
                         headers=self.headers, json={"filterGroups": [{"filters": [
                             {"propertyName": "kanri_mail_address",
                              "operator": "EQ", "value": km}]}],
-                            "properties": ["dealname", "contract_plan", "service1"],
+                            "properties": ["dealname", "contract_plan",
+                                           "service1", "itijitaiou"],
                             "limit": 1}, timeout=20).json()
                     res = r.get("results", [])
                     if res:
@@ -485,7 +486,7 @@ class RealHubSpotClient:
         try:
             d = self._requests.get(
                 f"{self.BASE}/crm/v3/objects/0-3/{deal_id}"
-                f"?properties=dealname,contract_plan,service1",
+                f"?properties=dealname,contract_plan,service1,itijitaiou",
                 headers=self.headers, timeout=20).json()
             return d.get("properties") or {}
         except Exception:  # noqa: BLE001
@@ -523,7 +524,7 @@ class RealHubSpotClient:
             props["oubosaki_kyuujin_url"] = HR_JOB_URL_TMPL.format(media_job_id)
         elif lp.get("url_airwork"):
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
-        # Deal経由3
+        # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
         dp = self._resolve_deal_props(listing_id, media, login_id)
         for src, dst in [("dealname", "oubosaki_torihiki_name"),
                          ("contract_plan", "oubosaki_contract_plan"),
@@ -531,6 +532,14 @@ class RealHubSpotClient:
             v = dp.get(src)
             if v:
                 props[dst] = v
+        # 1次対応: Dealのitijitaiou(true/false)から直接 必要/不要 を決める。
+        # LISTING.ichijitaiounoumu_deforuto(sync_ichijitaiouが後で埋める値)に
+        # 依存せず、応募紐付け時点で確定できる=順序非依存(逆証明Dの根治)。
+        it = dp.get("itijitaiou")
+        if it == "true":
+            props["ichijitaiounoumu"] = "必要"
+        elif it == "false":
+            props["ichijitaiounoumu"] = "不要"
         return props
 
 
