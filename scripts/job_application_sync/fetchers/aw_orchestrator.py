@@ -107,6 +107,99 @@ def _extract_client_code(xlsx_path: Path) -> str:
 # ============================================================================
 # 1 顧客処理
 # ============================================================================
+def _rotate_slice(accounts: list, limit: int, out_dir: Path, key: str) -> list:
+    """全社を N社ずつローテーション。カーソルを out_dir に保存し続きから返す。
+
+    「パッチで順番に繰り返す」オンデマンド政策(2026-07-09)。全社一斉を避け、
+    1runでN社、次runは続きのN社を処理。末尾まで行ったら先頭へ折返す。
+    """
+    n = len(accounts)
+    if n <= limit:
+        return accounts
+    cur_path = Path(out_dir) / "aw_rotation_cursor.json"
+    cursor = 0
+    if cur_path.exists():
+        try:
+            cursor = int(json.loads(cur_path.read_text(encoding="utf-8")).get(key, 0))
+        except Exception:  # noqa: BLE001
+            cursor = 0
+    cursor %= n
+    end = cursor + limit
+    if end <= n:
+        sliced = accounts[cursor:end]
+    else:                                   # 折返し
+        sliced = accounts[cursor:] + accounts[: end - n]
+    new_cursor = end % n
+    try:
+        data = {}
+        if cur_path.exists():
+            data = json.loads(cur_path.read_text(encoding="utf-8"))
+        data[key] = new_cursor
+        cur_path.parent.mkdir(parents=True, exist_ok=True)
+        cur_path.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[orchestrate] incremental: {n}社中 cursor {cursor}→{new_cursor} "
+          f"の{len(sliced)}社を処理", flush=True)
+    return sliced
+
+
+def _classify_error(err: str) -> str:
+    """NG理由を住み分け用に分類 (login失敗/生成/その他)."""
+    e = (err or "").lower()
+    if any(k in e for k in ["login", "sso", "id/pw", "パスワード",
+                            "資格", "dashboards に遷移", "認証"]):
+        return "login_fail"
+    if any(k in e for k in ["429", "quota", "sheets"]):
+        return "sheets_429"
+    if any(k in e for k in ["not_ready", "生成", "timeout", "タイムアウト"]):
+        return "generation"
+    return "other"
+
+
+def _slack_notify(message: str) -> None:
+    """AW巡回結果サマリをSlackへ (webhook未設定なら何もしない)."""
+    url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
+    if not url:
+        return
+    try:
+        import requests
+        requests.post(url, json={"text": message}, timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _write_account_results(results: list, out_dir: Path, phase: str) -> dict:
+    """per-account結果を状態JSONに保存し、住み分けサマリを返す (C: ログ行き先B)."""
+    from collections import Counter
+    cat = Counter()
+    detail = []
+    for r in results:
+        st = r.get("status")
+        if st in ("ok", "queued"):
+            cat["login_success"] += 1
+            outcome = "login_success"
+        elif st == "not_ready":
+            cat["generation"] += 1
+            outcome = "generation_not_ready"
+        else:
+            c = _classify_error(r.get("error", ""))
+            cat[c] += 1
+            outcome = c
+        detail.append({"login_id": r.get("login_id"),
+                       "company": r.get("company"),
+                       "outcome": outcome, "error": r.get("error", "")[:120]})
+    summary = dict(cat)
+    try:
+        p = Path(out_dir) / f"aw_account_results_{phase}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"summary": summary, "detail": detail},
+                                ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    return summary
+
+
 async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
                       dry_run: bool, headless: bool,
                       phase: str = "full") -> dict:
@@ -368,7 +461,11 @@ async def orchestrate(parallel: int = 5,
             f"{len(accounts)}/{len(target_set)} matched",
             flush=True,
         )
-    if limit:
+    # incremental: 全社一斉を避け「N社ずつローテーション」で巡回 (2026-07-09)。
+    # from_active_deals + limit のときのみカーソルを進めて続きから処理する。
+    if limit and from_active_deals and not target_login_ids:
+        accounts = _rotate_slice(accounts, limit, out_dir, key=phase)
+    elif limit:
         accounts = accounts[:limit]
     total = len(accounts)
     print(
@@ -399,6 +496,13 @@ async def orchestrate(parallel: int = 5,
 
     tasks = [_wrapped(acc) for acc in accounts]
     results: list[dict] = await asyncio.gather(*tasks)
+
+    # C: per-account結果を状態JSONに保存 + Slackサマリ (住み分け・ログ行き先A+B)
+    acct_summary = _write_account_results(results, out_dir, phase)
+    print(f"[orchestrate] 住み分け({phase}): {acct_summary}", flush=True)
+    _slack_notify(
+        f"🔄 AW巡回({phase}) {total}社処理: "
+        + " / ".join(f"{k}={v}" for k, v in acct_summary.items()))
 
     # --- Phase1(create): 生成トリガー成功社をキューに保存 (Phase2引き継ぎ) ---
     if phase == "create":

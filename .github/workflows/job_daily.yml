@@ -69,6 +69,7 @@ jobs:
           GOOGLE_SA_JSON: /tmp/sa.json
           SHEETS_AUTH_MODE: sa
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
+          SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
           PYTHONIOENCODING: utf-8
           PHASE: ${{ inputs.phase || 'hr' }}
           TARGET: ${{ inputs.target_login_ids }}
@@ -79,7 +80,8 @@ jobs:
           FLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "--dry-run")
           AWFLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "")
           TGT=$([ -n "$TARGET" ] && echo "--target-login-ids $TARGET" || echo "--from-active-deals")
-          LIM=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "")
+          # incremental: 全社一斉を避け既定20社/run(未指定時)。ローテーションで全社を順次。
+          LIM=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 20")
           case "$PHASE" in
             hr)
               python scripts/job_application_sync/hr_watcher.py $FLAG --skip-aw

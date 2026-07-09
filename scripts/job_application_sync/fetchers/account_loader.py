@@ -149,6 +149,42 @@ def _iter_records(
         }
 
 
+# ── シート読取のプロセス内キャッシュ (Sheets API 429根治, 2026-07-09) ──────────
+# account_loader は呼ぶたびにシート全体を読んでいた。find_account_by_login_id は
+# prefer A/B で2回読むため、aw-collect の per-account 呼出で分間読取上限を突破し
+# 429 を招いていた (診断確定)。プロセス内で1回だけ読み、以後は使い回す。
+_SHEET_RECORDS_CACHE: Optional[list[dict]] = None
+
+
+def _load_sheet_records() -> list[dict]:
+    """アカウント情報シートを1回だけ読み、records化してキャッシュ."""
+    global _SHEET_RECORDS_CACHE
+    if _SHEET_RECORDS_CACHE is not None:
+        return _SHEET_RECORDS_CACHE
+    gc = get_sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(SHEET_TAB)
+    # get_all_records はヘッダ空文字重複で失敗するため get_all_values で自前マッピング
+    all_values = ws.get_all_values()
+    records: list[dict] = []
+    if all_values:
+        # ヘッダ名キー + 位置キー(_COL{i}_) を両方付与 (col8='s'等の不適切ヘッダに堅牢)
+        headers = [h if h else f"_COL{i}_" for i, h in enumerate(all_values[0])]
+        for row in all_values[1:]:
+            rec = dict(zip(headers, row))
+            for i, cell in enumerate(row):
+                rec[f"_COL{i}_"] = cell  # 位置キーを常に併記
+            records.append(rec)
+    _SHEET_RECORDS_CACHE = records
+    return records
+
+
+def clear_sheet_cache() -> None:
+    """キャッシュ破棄 (長時間プロセスでシート更新を再取得したい場合用)."""
+    global _SHEET_RECORDS_CACHE
+    _SHEET_RECORDS_CACHE = None
+
+
 def iter_aw_accounts(
     active_only: bool = True,
     prefer: str = "A",
@@ -169,21 +205,7 @@ def iter_aw_accounts(
     if prefer not in ("A", "B"):
         raise ValueError(f"prefer は 'A' か 'B': got {prefer!r}")
     if records is None:
-        gc = get_sheets_client()
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.worksheet(SHEET_TAB)
-        # get_all_records はヘッダ空文字重複で失敗するため get_all_values で自前マッピング
-        all_values = ws.get_all_values()
-        if not all_values:
-            return
-        # ヘッダ名キー + 位置キー(_COL{i}_) を両方付与 (col8='s'等の不適切ヘッダに堅牢)
-        headers = [h if h else f"_COL{i}_" for i, h in enumerate(all_values[0])]
-        records = []
-        for row in all_values[1:]:
-            rec = dict(zip(headers, row))
-            for i, cell in enumerate(row):
-                rec[f"_COL{i}_"] = cell  # 位置キーを常に併記
-            records.append(rec)
+        records = _load_sheet_records()  # プロセス内キャッシュ (429根治)
     yield from _iter_records(records, active_only=active_only, prefer=prefer)
 
 
