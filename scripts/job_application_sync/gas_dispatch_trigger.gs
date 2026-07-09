@@ -12,7 +12,7 @@
  * 2. GASエディタ → プロジェクトの設定 → スクリプト プロパティ で
  *    キー: GITHUB_PAT  値: 発行したトークン  を登録。
  * 3. トリガー登録:
- *    - dispatchApplicantSync : 時間主導型 / 分ベース / 10分おき
+ *    - dispatchApplicantSync : 時間主導型 / 分ベース / 5分おき (要件: 応募5分に1回)
  *    - dispatchJobDaily      : 時間主導型 / 日タイマー / 午前7時など
  *    (aw-create→aw-collect の2フェーズは dispatchAwCreate/dispatchAwCollect を
  *     それぞれ時間差トリガーで。まずは HR/応募だけでも可)
@@ -41,7 +41,9 @@ function _dispatch(workflowFile, inputs) {
   return code === 204;
 }
 
-/** 応募連携 (実書込・BOTH)。10分おきトリガー推奨。AWは12社/runで漸次消化。 */
+/** 応募連携 (実書込・BOTH)。**5分おきトリガー**(要件: 応募確認は5分に1回)。
+ *  runが5分超でも concurrency group で次runはキュー=直列化され多重起動しない。
+ *  AWは12社/runで漸次消化(BAN対策のセッション再利用+上限)。 */
 function dispatchApplicantSync() {
   _dispatch('applicant_sync.yml', { mode: 'sync', media: 'BOTH', dry_run: 'false' });
 }
