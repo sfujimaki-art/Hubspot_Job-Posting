@@ -110,7 +110,7 @@ async def fetch_hr_csv(
     output_dir: Path,
     is_valid: str = "",
     headless: bool = True,
-    timeout_min: int = 20,
+    timeout_min: Optional[int] = None,
     user: Optional[str] = None,
     password: Optional[str] = None,
 ) -> Path:
@@ -132,6 +132,10 @@ async def fetch_hr_csv(
         raise RuntimeError(
             "HRHACKER_USER / HRHACKER_PASS が未設定 (.env に追記して再実行してください)"
         )
+    # 生成待ち上限: データ量増でCSV生成が長引くため既定を長め+env設定可能に。
+    # (2026-07-09 ユーザー指摘: 今のラグではデータ量増加時に足りなくなる)
+    if timeout_min is None:
+        timeout_min = int(os.environ.get("HR_CSV_TIMEOUT_MIN", "30"))
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -425,7 +429,15 @@ async def _poll_export_list(page, kick_iso: str, timeout_min: int) -> str:
             raise
     if last_err is not None:
         raise last_err
+    # 明確な生成ラグ: kick直後はまだ生成が始まっていないので、ポーリング前に
+    # 明示的に待つ (env HR_CSV_KICK_WAIT_SEC, 既定30秒)。データ量増でも
+    # 「作成ボタン→ラグ→再取得」の設計を明確化 (2026-07-09 ユーザー指摘)。
+    kick_wait = int(os.environ.get("HR_CSV_KICK_WAIT_SEC", "30"))
+    print(f"[hr_csv] CSV生成待ち: 初期ラグ {kick_wait}s → "
+          f"以後15秒ごとにポーリング(最大{timeout_min}分)", flush=True)
+    await asyncio.sleep(kick_wait)
     deadline = time.time() + timeout_min * 60
+    start = time.time()
     while time.time() < deadline:
         try:
             await page.wait_for_load_state("networkidle", timeout=15_000)
@@ -448,7 +460,12 @@ async def _poll_export_list(page, kick_iso: str, timeout_min: int) -> str:
         )
         for r in rows:
             if r.get("dl") and r.get("shuryou"):
+                elapsed = int(time.time() - start) + kick_wait
+                print(f"[hr_csv] CSV生成完了を検出 (待ち{elapsed}s)", flush=True)
                 return r["dl"]
+        waited = int(time.time() - start) + kick_wait
+        print(f"[hr_csv] 生成中... 経過{waited}s / 上限{timeout_min * 60}s",
+              flush=True)
         await asyncio.sleep(15)
         try:
             await page.reload(wait_until="domcontentloaded")
@@ -457,7 +474,8 @@ async def _poll_export_list(page, kick_iso: str, timeout_min: int) -> str:
 
     raise RuntimeError(
         f"CSV 生成が {timeout_min} 分以内に完了しませんでした "
-        f"(kick={kick_iso}, url={EXPORT_LIST_URL})"
+        f"(kick={kick_iso}, url={EXPORT_LIST_URL})。"
+        f"データ量が多い場合は環境変数 HR_CSV_TIMEOUT_MIN を増やす。"
     )
 
 
