@@ -20,10 +20,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "動作 (sync=応募登録 / relink=再紐付け / reconcile=照合 / ichijitaiou=1次対応連動)"
+        description: "動作 (sync/relink/reconcile/ichijitaiou/deal-assoc)"
         default: "sync"
         type: choice
-        options: ["sync", "relink", "reconcile", "ichijitaiou"]
+        options: ["sync", "relink", "reconcile", "ichijitaiou", "deal-assoc"]
       media:
         description: "処理媒体 (AW/HR/BOTH) ※mode=sync時のみ"
         default: "BOTH"
@@ -82,7 +82,10 @@ jobs:
         run: |
           # 状態(台帳/セッション)は actions/cache で保持 (GCS請求先問題の代替)。
           FLAG=$([ "${{ inputs.dry_run }}" = "true" ] && echo "--dry-run" || echo "--actual")
-          if [ "$MODE" = "ichijitaiou" ]; then
+          if [ "$MODE" = "deal-assoc" ]; then
+            # LISTING→Deal 関連付け (§21.1 要件漏れ是正)。ichijitaiouより前に走る想定。
+            python scripts/job_application_sync/sync_deal_association.py $FLAG
+          elif [ "$MODE" = "ichijitaiou" ]; then
             # 1次対応連動 (Deal→LISTING)。sync_ichijitaiou は別スクリプト。
             python scripts/job_application_sync/sync_ichijitaiou.py $FLAG
           else

@@ -134,9 +134,10 @@ def map_hr_status(original: str) -> Optional[str]:
     if s == "公開終了":
         return "公開終了"
     if s == "非公開":
-        # v0.2 §10: 非公開 = 公開中ではない (契約求人数除外)
-        # HubSpot共通ステータスは未設定 ("要定義" sentinel として None を返す)
-        return None
+        # 2026-07-09 ユーザー確定(a): 非公開になった求人は kyuujin_status も
+        # 「公開終了」に自動変更する(ステータス自動変更機能)。
+        # 契約求人数(=公開中)には引き続き含まれない(公開終了なので除外は維持)。
+        return "公開終了"
     # 未知ステータス: そのまま渡さず None
     return None
 
@@ -241,7 +242,38 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
         if csv_val and not existing_val:
             p[hs_prop] = csv_val
 
+    # 店舗ID: 既存空欄なら補完 (Deal突合キー。既存1379件以外を埋める)
+    if row.get("shop_id"):
+        ex_shop = existing_props.get("id_shop_hrhakkaa")
+        ex_shop = ex_shop.strip() if isinstance(ex_shop, str) else ""
+        if not ex_shop:
+            p["id_shop_hrhakkaa"] = str(row["shop_id"]).strip()
+
+    # 公開開始日/終了日 (§21.1): 常に最新CSV値で更新 (媒体側の日付は変わりうる)
+    for src, prop in [("start_date", "koukai_kaishi_nichiji"),
+                      ("end_date", "koukai_shuuryou_nichiji")]:
+        ms = _hr_date_to_millis(row.get(src))
+        if ms is not None:
+            p[prop] = ms
+
     return p
+
+
+def _hr_date_to_millis(s: object) -> Optional[int]:
+    """CSVの日時文字列 → epoch millis(UTC midnight) (HubSpot date用)。不能はNone。"""
+    import calendar
+    if not s:
+        return None
+    txt = str(s).strip().replace("/", "-")
+    if not txt:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(txt, fmt)
+            return calendar.timegm((dt.year, dt.month, dt.day, 0, 0, 0)) * 1000
+        except ValueError:
+            continue
+    return None
 
 
 def build_create_props(row: dict, today_iso: str, now_iso: str,
@@ -254,6 +286,18 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
 
     # 必須: 媒体ID
     p["id_hrhakkaa"] = jid
+
+    # 店舗ID (§21.1 + Deal突合キー): CSV「店舗id」→ id_shop_hrhakkaa。
+    # これが無いと後段の LISTING→Deal 関連付け(shop_id→hrhacker_shop_ids)が出来ない。
+    if row.get("shop_id"):
+        p["id_shop_hrhakkaa"] = str(row["shop_id"]).strip()
+
+    # 公開開始日/終了日 (§21.1): CSVの日時 → LISTINGへ格納
+    for src, prop in [("start_date", "koukai_kaishi_nichiji"),
+                      ("end_date", "koukai_shuuryou_nichiji")]:
+        ms = _hr_date_to_millis(row.get(src))
+        if ms is not None:
+            p[prop] = ms
 
     # URL (CSVに無ければ URL テンプレートから生成)
     # ※ 2026-07-08 HTTP検証: URL_TMPL(.../job-offers/show/{id_hrhakkaa})は

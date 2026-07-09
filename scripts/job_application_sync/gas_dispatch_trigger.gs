@@ -54,9 +54,15 @@ function dispatchRelink() {
   _dispatch('applicant_sync.yml', { mode: 'relink', dry_run: 'false' });
 }
 
+/** LISTING→Deal 関連付け: 新規求人を取引に紐付ける(§21.1要件)。
+ *  求人巡回の後、sync_ichijitaiou の前に実行する(1次対応連動はDeal関連を前提とするため)。
+ *  ※ 実行順序: 求人巡回 → dealAssoc → sync_ichijitaiou → relink。 */
+function dispatchSyncDealAssoc() {
+  _dispatch('applicant_sync.yml', { mode: 'deal-assoc', dry_run: 'false' });
+}
+
 /** 1次対応連動: Deal.itijitaiou → LISTING.ichijitaiounoumu_deforuto。
- *  求人巡回(HR/AW-collect)の後、relinkの前に実行する。日次 or 求人巡回の後トリガー推奨。
- *  ※ 実行順序: 求人巡回 → sync_ichijitaiou → 応募sync/relink (1次対応を応募に載せるため)。 */
+ *  求人巡回(HR/AW-collect)+dealAssoc の後、relinkの前に実行する。 */
 function dispatchSyncIchijitaiou() {
   _dispatch('applicant_sync.yml', { mode: 'ichijitaiou', dry_run: 'false' });
 }
