@@ -508,6 +508,7 @@ def relink(dry_run: bool = False, limit: int = 1000) -> dict:
 
     # 3) 突合できた対象外だけ Association + 対象外解除 + 一次対応引き継ぎ
     relinked = still = ambiguous = 0
+    note_copied = 0
     for appt_id, jid, is_hr in targets:
         hit = (hr_map if is_hr else aw_map).get(jid, "__miss__")
         if hit == "__miss__":
@@ -532,12 +533,17 @@ def relink(dry_run: bool = False, limit: int = 1000) -> dict:
             requests.patch(
                 f"https://api.hubapi.com/crm/v3/objects/0-421/{appt_id}",
                 headers=H, json={"properties": props}, timeout=20)
+            # ②求人のピン留め暗黙知Noteを応募へ複製 (一次対応コーラー用, best-effort)
+            if cli.copy_listing_note(lid, appt_id):
+                note_copied += 1
         relinked += 1
     summary = {"checked": checked, "relinked": relinked,
-               "still_unlinked": still, "ambiguous": ambiguous}
+               "still_unlinked": still, "ambiguous": ambiguous,
+               "note_copied": note_copied}
     if relinked and not dry_run:
         slack_notify(f"🔗 再紐付けスイープ: {relinked}件の対象外応募を求人に紐付け "
-                     f"(確認{checked}件/未紐付け{still}/曖昧{ambiguous})")
+                     f"(確認{checked}件/未紐付け{still}/曖昧{ambiguous}/"
+                     f"暗黙知Note複製{note_copied})")
     print(f"[relink] {summary}", flush=True)
     return summary
 

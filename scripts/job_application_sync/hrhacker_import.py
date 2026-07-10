@@ -87,17 +87,11 @@ HR_CSV_COLUMNS: dict[str, str] = {
 HR_CSV_ENCODING = "shift_jis"
 
 # 内部キー → HubSpotプロパティ内部名 (Phase 0 実測準拠)
-# 既存値保護対象 (人間入力プロパティ): job_name, url
 HUBSPOT_PROPERTY_MAP: dict[str, str] = {
     "media_job_id": "id_hrhakkaa",
     "job_name": "hs_name",
-    "url": "url_hrhakkaa",
     # 媒体原ステータス・正規化ステータス・管理区分等は処理内で個別に組立
 }
-
-# 既存値保護対象 (= CSV値が空ならば送らない / 既存値があっても上書きしない)
-# 人間入力プロパティ
-PROTECTED_PROPS = {"hs_name", "url_hrhakkaa"}
 
 # 媒体固定値
 MEDIA_NAME = "HRハッカー"
@@ -168,12 +162,14 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
     """id_hrhakkaa リスト → {media_job_id: {id, properties}} の辞書を返す.
 
     Search API でバッチ取得 (100件チャンク, OR検索).
-    既存値保護のため hs_name / url_hrhakkaa も取得する.
+    id_shop_hrhakkaa は「既存空欄のみ補完」ガードのため既存値を取得する
+    (HR-01: 未取得だとガードが死に毎回無条件上書きになる)。
     """
     result: dict[str, dict] = {}
     if not media_job_ids:
         return result
     target_props = ["id_hrhakkaa", "hs_name", "url_hrhakkaa",
+                    "id_shop_hrhakkaa",
                     PROP_HS_KYUUJIN_STATUS, PROP_MEDIA_ORIG_STATUS]
     headers = _headers()
     # IN operator で 100件ずつ検索
@@ -214,9 +210,12 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
       - 最終同期日 (今)
       - 同期元ファイル名
 
-    人間入力プロパティ (既存値あれば上書きしない / 空値で更新しない):
+    媒体SSOT (①2026-07-10): 媒体を正として常に上書き (CSV非空時のみ):
       - hs_name (求人名)
-      - url_hrhakkaa (URL)
+    ※url_hrhakkaa は HR CSV にURL列が無いため更新では触らない (新規作成時に
+      求人IDからテンプレ生成する build_create_props 側で設定。HR-02)。
+    媒体と無関係なメモ欄 (baitaibetsushousaimemo / kaizenmemo /
+    ichijimensetsu_hiaringukoumoku 等) は同期対象外 = 一切書かない (手入力保護)。
     """
     p: dict = {}
 
@@ -235,12 +234,12 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
     p[PROP_LAST_SYNCED] = now_iso
     p[PROP_DOUKI_FILENAME] = source_filename
 
-    # 既存値保護: 人間入力プロパティは「既存空 AND CSV非空」のときのみ書く
-    for csv_key, hs_prop in [("job_name", "hs_name"), ("url", "url_hrhakkaa")]:
-        csv_val = row.get(csv_key) or ""
-        existing_val = (existing_props.get(hs_prop) or "").strip() if isinstance(existing_props.get(hs_prop), str) else ""
-        if csv_val and not existing_val:
-            p[hs_prop] = csv_val
+    # ①媒体SSOT (2026-07-10): タイトルは媒体を正として常に上書き(CSV非空時)。
+    # 空CSV値では上書きしない(ブランク化防止)。メモ欄は同期対象外=一切書かない。
+    # URLはHR CSVに列が無いため更新では扱わない(HR-02)。
+    csv_name = (row.get("job_name") or "").strip()
+    if csv_name:
+        p["hs_name"] = csv_name
 
     # 店舗ID: 既存空欄なら補完 (Deal突合キー。既存1379件以外を埋める)
     if row.get("shop_id"):
@@ -482,6 +481,16 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dic
         print(f"  作成: ✅{c_ok} ❌{c_ng}")
         if u_err: print(f"  更新エラー: {u_err[:3]}")
         if c_err: print(f"  作成エラー: {c_err[:3]}")
+        # ③新規LISTINGに暗黙知テンプレNoteを付与 (best-effort, 既ピン留めはskip)
+        try:
+            from scripts.job_application_sync.notes import attach_template_notes
+        except ImportError:
+            from notes import attach_template_notes
+        note_ok, note_failed = attach_template_notes(list(idmap.values()))
+        summary["template_notes_attached"] = note_ok
+        summary["template_notes_failed"] = note_failed
+        print(f"  テンプレNote付与: ✅{note_ok}"
+              + (f" ❌{len(note_failed)} {note_failed[:5]}" if note_failed else ""))
         log = {
             "summary": summary,
             "errors": {"update": u_err, "create": c_err},

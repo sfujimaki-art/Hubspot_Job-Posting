@@ -515,9 +515,9 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
       - 最終同期日 (今)
       - 同期元ファイル名
 
-    人間入力プロパティ (既存値あれば上書きしない / 空値で潰さない):
-      - hs_name (求人名)
-      - url_airwork (URL)
+    媒体SSOT (①2026-07-10): 媒体を正として常に上書き (媒体値が非空時のみ):
+      - hs_name (求人名) / url_airwork (URL) / 求人詳細
+    媒体と無関係なメモ欄は _aw_listing_detail_props に含めず = 一切触らない。
 
     ★ §24-3 ガード: 本関数は呼出側で「XLSXに存在する求人」のみに適用される前提。
                     未検出 LISTING は呼出側で除外され, 本関数は呼ばれない。
@@ -541,28 +541,24 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
     p[PROP_LAST_SYNCED] = now_iso
     p[PROP_DOUKI_FILENAME] = source_filename
 
-    # 既存値保護: 人間入力プロパティは「既存空 AND 入力非空」のときのみ書く
+    # ①媒体SSOT (2026-07-10): タイトル/URLは媒体を正として常に上書き(非空時)。
+    # 空値ではブランク化しない。メモ欄は同期対象外=一切書かない。
     for src_key, hs_prop in [("job_name", "hs_name"), ("url", "url_airwork")]:
-        src_val = row.get(src_key) or ""
-        existing_raw = existing_props.get(hs_prop)
-        existing_val = existing_raw.strip() if isinstance(existing_raw, str) else ""
-        if src_val and not existing_val:
+        src_val = (row.get(src_key) or "").strip()
+        if src_val:
             p[hs_prop] = src_val
 
-    # URL空欄検知 → 採用サイトURL+求人IDで補完 (既存url_airworkが空のときのみ)
+    # URL空欄なら採用サイトURL+求人IDで補完 (媒体にURLが無い場合のみ生成)
     if recruit_site_url and not p.get("url_airwork"):
-        existing_url = existing_props.get("url_airwork")
-        existing_url = existing_url.strip() if isinstance(existing_url, str) else ""
         jid = row.get("media_job_id", "")
-        if not existing_url and jid:
+        if jid:
             p["url_airwork"] = f"{recruit_site_url.rstrip('/')}/{jid}/"
 
-    # 求人詳細を既存空欄のみ補完 (媒体値でメディア詳細を埋める。人手編集は保護)
+    # 求人詳細 (仕事内容/職種/勤務地/勤務時間/給与形態) = 媒体を正として常に上書き。
+    # 媒体値が非空のときのみ書く(空でブランク化しない)。メモ欄は含まれない。
     detail = _aw_listing_detail_props(row)
     for hs_prop, v in detail.items():
-        existing = existing_props.get(hs_prop)
-        existing = existing.strip() if isinstance(existing, str) else ""
-        if not existing:
+        if v:
             p[hs_prop] = v
 
     return p
@@ -812,6 +808,16 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
             print(f"  更新エラー: {u_err[:3]}")
         if c_err:
             print(f"  作成エラー: {c_err[:3]}")
+        # ③新規LISTINGに暗黙知テンプレNoteを付与 (best-effort, 既ピン留めはskip)
+        try:
+            from scripts.job_application_sync.notes import attach_template_notes
+        except ImportError:
+            from notes import attach_template_notes
+        note_ok, note_failed = attach_template_notes(list(idmap.values()))
+        summary["template_notes_attached"] = note_ok
+        summary["template_notes_failed"] = note_failed
+        print(f"  テンプレNote付与: OK={note_ok}"
+              + (f" NG={len(note_failed)} {note_failed[:5]}" if note_failed else ""))
         log = {
             "summary": summary,
             "errors": {"update": u_err, "create": c_err},

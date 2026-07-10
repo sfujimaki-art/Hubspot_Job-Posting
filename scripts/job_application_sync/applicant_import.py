@@ -191,6 +191,8 @@ class ProcessResult:
     appointment_id: Optional[str] = None
     appointment_properties: dict = field(default_factory=dict)
     message: str = ""
+    # ②求人由来暗黙知Noteの複製結果 (複製したnote_id / None=skip・該当なし・失敗)
+    note_copied: Optional[str] = None
 
 
 # ============================================================================
@@ -207,6 +209,7 @@ class HubSpotClient(Protocol):
     def associate_appointment_to_listing(self, appointment_id: str, listing_id: str) -> None: ...
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]: ...
     def get_oubosaki_props(self, listing_id: str, media: str, login_id: str, media_job_id: str) -> dict: ...
+    def copy_listing_note(self, listing_id: str, appointment_id: str) -> Optional[str]: ...
 
 
 # ============================================================================
@@ -234,6 +237,7 @@ class DryRunClient:
         self.search_log: list = []
         self.created_appts: list = []
         self.associations: list = []
+        self.note_copies: list = []
         self._next_id = 1000000
 
     def search_listing_hr(self, media_job_id: str) -> Optional[str]:
@@ -296,6 +300,13 @@ class DryRunClient:
     def get_oubosaki_props(self, listing_id: str, media: str,
                            login_id: str, media_job_id: str) -> dict:
         return {}  # ドライランでは求人情報コピーなし
+
+    def copy_listing_note(self, listing_id: str,
+                          appointment_id: str) -> Optional[str]:
+        # ドライランでは実コピーせず記録のみ (②検証用)
+        self.note_copies.append({"listing_id": listing_id,
+                                 "appointment_id": appointment_id})
+        return None
 
 
 # ============================================================================
@@ -542,6 +553,26 @@ class RealHubSpotClient:
             props["ichijitaiounoumu"] = "不要"
         return props
 
+    def copy_listing_note(self, listing_id: str,
+                          appointment_id: str) -> Optional[str]:
+        """②LISTINGの暗黙知テンプレNote本文を応募へ複製 (best-effort)。
+
+        失敗はサイレントにせず warn 出力する ([[feedback_always_report_execution_result]])。
+        """
+        try:
+            try:  # INT-01: script実行/パッケージ両対応の二重import
+                from scripts.job_application_sync.notes import (
+                    copy_listing_note_to_appointment)
+            except ImportError:
+                from notes import copy_listing_note_to_appointment
+            token = self.headers["Authorization"].split(" ", 1)[1]
+            return copy_listing_note_to_appointment(
+                listing_id, appointment_id, dry_run=False, token=token)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] ②Note複製 失敗 listing={listing_id} "
+                  f"appt={appointment_id}: {e}", flush=True)
+            return None
+
 
 # ============================================================================
 # 正規化ヘルパ
@@ -761,11 +792,13 @@ def process_applicant(
     # 4. Association (求人特定時のみ)
     if listing_id:
         client.associate_appointment_to_listing(appt_id, listing_id)
+        # ②求人のピン留め暗黙知Noteを応募へ複製 (一次対応コーラー用, best-effort)
+        note_copied = client.copy_listing_note(listing_id, appt_id)
         return ProcessResult(
             status="linked", applicant_key=applicant_key,
             media=row.media, media_job_id=row.media_job_id,
             listing_id=listing_id, appointment_id=appt_id,
-            appointment_properties=props,
+            appointment_properties=props, note_copied=note_copied,
         )
     else:
         return ProcessResult(
@@ -799,6 +832,11 @@ def summarize(results: list[ProcessResult]) -> dict:
                "skip_duplicate": 0, "error": 0}
     for r in results:
         summary[r.status] = summary.get(r.status, 0) + 1
+    # ②求人由来暗黙知Noteの複製実績を可視化 (linked のうち何件コピーできたか)
+    linked = [r for r in results if r.status == "linked"]
+    summary["note_copied"] = sum(1 for r in linked if r.note_copied)
+    summary["note_copy_skipped_or_failed"] = sum(
+        1 for r in linked if not r.note_copied)
     return summary
 
 
