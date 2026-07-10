@@ -104,7 +104,10 @@ def detect_diff(prev: dict, curr: dict) -> dict:
         {"new": [job_id, ...], "removed": [job_id, ...], "changed": [job_id, ...]}
         - new: 前回には無く今回ある求人 (新規掲載)
         - removed: 前回はあったが今回CSVに居ない求人 (掲載終了相当)
-        - changed: 両方に居るが status が変化した求人
+        - changed: 両方に居るが status または タイトル(job_name) が変化した求人
+          (2026-07-10: 媒体SSOTでタイトル改定をHubSpotへ追従させるため、status
+           だけでなく job_name の変化も差分に含める。これが無いと「タイトルだけ
+           変更した日」に hi.run() が発火せず更新が遅延する)
 
     注意:
         v0.2 §24 第3条「HRはCSV未検出を公開終了と判断しない」を尊重する。
@@ -115,10 +118,14 @@ def detect_diff(prev: dict, curr: dict) -> dict:
     curr_ids = set(curr.keys())
     new = sorted(curr_ids - prev_ids)
     removed = sorted(prev_ids - curr_ids)
-    changed = sorted(
-        jid for jid in (prev_ids & curr_ids)
-        if (prev.get(jid) or {}).get("status") != (curr.get(jid) or {}).get("status")
-    )
+
+    def _job_changed(jid: str) -> bool:
+        p = prev.get(jid) or {}
+        c = curr.get(jid) or {}
+        return (p.get("status") != c.get("status")
+                or p.get("job_name") != c.get("job_name"))
+
+    changed = sorted(jid for jid in (prev_ids & curr_ids) if _job_changed(jid))
     return {"new": new, "removed": removed, "changed": changed}
 
 
