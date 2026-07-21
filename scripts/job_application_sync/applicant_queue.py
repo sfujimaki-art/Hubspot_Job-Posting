@@ -75,12 +75,13 @@ def _sheets_client(retries: int = 6):
 # ============================================================================
 @dataclass
 class QueueItem:
-    row_id: str                 # queue の id (JOB-xxx)
+    row_id: str                 # queue の id (JOB-xxx) or シート1直読み時は内容ハッシュ
     media_type: str             # mediaType (HRハッカー / Airワーク... / ...)
     login_id: str               # route.loginId (突合キー)
     company: str                # payload.columns.G (企業名)
     columns: dict = field(default_factory=dict)
     sheet_b_id: str = ""
+    sheet_row: int = 0          # シート1直読み時の行番号 (処理後F列マーク用。0=queue由来)
 
     @property
     def media(self) -> str:
@@ -214,3 +215,121 @@ def aggregate_by_account(
             key = "HR::master"
         grouped.setdefault(key, []).append(it)
     return grouped, unresolved
+
+
+# ============================================================================
+# 4. シート1 直読み (GAS queue投入の座礁を迂回, 2026-07-21)
+# ============================================================================
+# GASの enqueue が行番号(AIRWORK_LAST_PROCESSED_ROW)で座礁し queue に新規が乗らない
+# ため、こちら側で「シート1」を直接読み、F列マーカー(行削除に強い)で未処理を検知する。
+SHEET1_TAB = "シート1"
+S1_SUBJECT = 0   # A: 件名
+S1_MEDIA = 1     # B: 媒体 (admin@hr-hacker.com / Airワーク... )
+S1_FROM = 2      # C: 差出人(loginId抽出元)
+S1_DATE = 3      # D: 日付
+S1_MARK = 5      # F: マーカー (キュー済/済/受入済)
+S1_COMPANY = 6   # G: 企業名
+# 既存GASマーカー + こちら側マーカー(処理済)
+S1_MARKS_DONE = ("キュー済", "済", "受入済")
+S1_MARK_ACCEPTED = "受入済"   # こちら側で処理した印
+_S1_APP_SUBJECTS = ("応募がありました", "応募通知メール")
+
+
+def _first_email(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"<\s*([^>]+@\S+)\s*>", text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+    return m.group(0).strip() if m else ""
+
+
+def _media_type_from_b(b: str) -> str:
+    b = (b or "").strip()
+    if b == "admin@hr-hacker.com":
+        return "HRハッカー"
+    if "airwork" in b.lower() or "Airワーク" in b:
+        return "Airワーク 採用管理"
+    return b
+
+
+def _s1_date_recent(d: str, cutoff_iso: str) -> bool:
+    """'2026/7/21' 形式を ISO 比較。cutoff_iso 以降なら True。空/不正は False。"""
+    d = (d or "").strip()
+    m = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", d)
+    if not m:
+        return False
+    iso = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return iso >= cutoff_iso
+
+
+def read_new_items_from_sheet1(
+    sheet_id: str = "", *, cutoff_iso: str = "", media_filter: str = "HR",
+    limit: Optional[int] = None,
+) -> list[QueueItem]:
+    """シート1を直読みし、F列が未処理(空)の応募行から QueueItem を構築 (GAS迂回)。
+
+    cutoff_iso: この日付(ISO 'YYYY-MM-DD')以降の応募のみ (空=全件)。
+    media_filter: 'HR'/'AW'/'BOTH'。既定HR (AWは認証別対応まで保留)。
+    行番号(sheet_row)を各itemに付与し、処理後 mark_sheet1_rows でF列にマークする。
+    """
+    sid = sheet_id or QUEUE_SHEET_ID
+    if not sid:
+        raise RuntimeError("JAS_APPLICANT_QUEUE_SHEET_ID 未設定")
+    gc = _sheets_client()
+    ws = gc.open_by_key(sid).worksheet(SHEET1_TAB)
+    # 必要列 A〜G のみ範囲取得(全列get_all_valuesは52k行で重い)。
+    # 返り値の各行 index: A=0,B=1,C=2,D=3,E=4,F=5,G=6 (S1_* 定数と一致)
+    vals = ws.get("A2:G")  # 既定=FORMATTED_VALUE (日付は '2026/7/21' 表示)
+    items: list[QueueItem] = []
+    import hashlib
+    for i, r in enumerate(vals, start=2):  # 範囲はA2開始=先頭がデータ行2
+        def g(idx: int) -> str:
+            return (str(r[idx]) if len(r) > idx and r[idx] is not None
+                    else "").strip()
+        subj = g(S1_SUBJECT)
+        if not any(k in subj for k in _S1_APP_SUBJECTS):
+            continue
+        if g(S1_MARK) in S1_MARKS_DONE:
+            continue  # 既に処理済(F列マーカー=行削除に強い判定)
+        media_type = _media_type_from_b(g(S1_MEDIA))
+        mt = media_type.lower()
+        media = ("HR" if ("hr" in mt or "ハッカー" in media_type)
+                 else "AW" if ("airwork" in mt or "ワーク" in media_type)
+                 else "OTHER")
+        if media_filter != "BOTH" and media != media_filter:
+            continue
+        date = g(S1_DATE)
+        if cutoff_iso and not _s1_date_recent(date, cutoff_iso):
+            continue
+        company = re.sub(r"[（(].+?[)）]", "", g(S1_COMPANY)).strip()
+        # 安定ID = 内容ハッシュ (行番号非依存=削除に強い)
+        rid = "S1-" + hashlib.md5(
+            f"{media_type}|{g(S1_FROM)}|{date}|{subj}|{company}".encode("utf-8")
+        ).hexdigest()[:16]
+        items.append(QueueItem(
+            row_id=rid, media_type=media_type,
+            login_id=_first_email(g(S1_FROM)), company=company,
+            columns={"A": subj, "B": g(S1_MEDIA), "C": g(S1_FROM),
+                     "D": date, "G": company},
+            sheet_row=i,
+        ))
+        if limit and len(items) >= limit:
+            break
+    return items
+
+
+def mark_sheet1_rows(rows: list[int], *, sheet_id: str = "",
+                     marker: str = S1_MARK_ACCEPTED) -> int:
+    """シート1 の指定行の F列 にマーカーを書き込む(処理済=再取込防止)。件数を返す。"""
+    rows = sorted(set(r for r in rows if r and r > 1))
+    if not rows:
+        return 0
+    sid = sheet_id or QUEUE_SHEET_ID
+    gc = _sheets_client()
+    ws = gc.open_by_key(sid).worksheet(SHEET1_TAB)
+    # F列(6)を1件ずつ更新(連続範囲でないため)。gspread batch_update で1リクエスト化。
+    data = [{"range": f"F{r}", "values": [[marker]]} for r in rows]
+    ws.batch_update(data)
+    return len(rows)

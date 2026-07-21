@@ -318,7 +318,8 @@ def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
 # ============================================================================
 def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         media_filter: str = "BOTH",
-        hr_date_from: str = "", hr_date_to: str = "") -> dict:
+        hr_date_from: str = "", hr_date_to: str = "",
+        source: str = "queue", hr_cutoff_iso: str = "") -> dict:
     lock = Lock()
     if not lock.acquire():
         print("[applicant_sync] 別インスタンス実行中 → skip", flush=True)
@@ -328,8 +329,20 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     summary = {"accounts": 0, "done": 0, "failed": 0, "reported": 0,
                "unresolved": 0, "linked": 0}
     try:
-        print(f"[applicant_sync] queue検知... (dry_run={dry_run})", flush=True)
-        items = aq.read_new_items()
+        if source == "sheet1":
+            # GAS queue座礁の迂回: シート1を直読み(F列マーカーで未処理判定)。
+            # cutoff未指定なら直近14日(処理を軽く保つ。古いbacklogは別途catch-up)。
+            if not hr_cutoff_iso:
+                from datetime import date as _date, timedelta as _td
+                hr_cutoff_iso = (_date.today() - _td(days=14)).isoformat()
+            print(f"[applicant_sync] シート1直読み "
+                  f"(cutoff={hr_cutoff_iso}, dry_run={dry_run})", flush=True)
+            items = aq.read_new_items_from_sheet1(
+                cutoff_iso=hr_cutoff_iso,
+                media_filter=("HR" if media_filter == "BOTH" else media_filter))
+        else:
+            print(f"[applicant_sync] queue検知... (dry_run={dry_run})", flush=True)
+            items = aq.read_new_items()
         # 台帳で既にDONEの項目は除外
         items = [it for it in items if ledger.status(it.row_id) != "DONE"]
         resolver = aq.AccountResolver().build()
@@ -356,13 +369,26 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 # 範囲外(古い/未来)は未登録なので NEW のまま残す(次の広い範囲で処理)。
                 df, dt = res["date_from"], res["date_to"]
                 covered = uncovered = 0
+                covered_rows: list = []
                 for it in hr_items:
                     d = _q_date_to_iso(it.columns.get("D", ""))
                     if d and df <= d <= dt:
                         ledger.mark(it.row_id, "DONE")
                         covered += 1
+                        if it.sheet_row:
+                            covered_rows.append(it.sheet_row)
                     else:
                         uncovered += 1  # NEW のまま
+                # シート1直読み時: 重複防止の本命は台帳(ledger, row_id=内容ハッシュ,
+                # 行削除に強い)。F列マーカーは"あれば尚可"の best-effort(書込権限が
+                # 無ければ台帳のみで機能する。403等でrun全体を落とさない)。
+                if source == "sheet1" and not dry_run and covered_rows:
+                    try:
+                        m = aq.mark_sheet1_rows(covered_rows)
+                        print(f"  シート1 F列マーク: {m}行", flush=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  シート1 F列マーク skip(書込権限無し等/台帳で重複防止): "
+                              f"{type(e).__name__}", flush=True)
                 summary["done"] += covered
                 summary["linked"] += res.get("linked", 0)
                 print(f"  ✅ HR: 応募取込 linked={res.get('linked')} "
@@ -589,6 +615,10 @@ def _parse_args(argv=None):
                    help="照合スイープ(日次): 詰まった項目を検出しSlack報告")
     p.add_argument("--relink", action="store_true",
                    help="再紐付けスイープ: 対象外応募を後から出来た求人に紐付け")
+    p.add_argument("--source", choices=["queue", "sheet1"], default="queue",
+                   help="応募の入力元。sheet1=GAS queue座礁を迂回しシート1を直読み")
+    p.add_argument("--hr-cutoff", default="",
+                   help="シート1直読み時、この日付(YYYY-MM-DD)以降の応募のみ処理")
     return p.parse_args(argv)
 
 
@@ -602,4 +632,4 @@ if __name__ == "__main__":
         sys.exit(0)
     run(dry_run=a.dry_run, limit_accounts=a.limit_accounts,
         media_filter=a.media, hr_date_from=a.hr_date_from,
-        hr_date_to=a.hr_date_to)
+        hr_date_to=a.hr_date_to, source=a.source, hr_cutoff_iso=a.hr_cutoff)
