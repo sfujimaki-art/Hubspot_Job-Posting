@@ -16,10 +16,10 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: "フェーズ (hr / aw-create / aw-collect)"
+        description: "フェーズ (hr / aw-create / aw-collect / reset-queue)"
         default: "hr"
         type: choice
-        options: ["hr", "aw-create", "aw-collect"]
+        options: ["hr", "aw-create", "aw-collect", "reset-queue"]
       target_login_ids:
         description: "AW対象 login_id (カンマ区切り, 空=--from-active-deals)"
         default: ""
@@ -97,5 +97,11 @@ jobs:
             aw-collect)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
                 --phase collect $AWFLAG --parallel 3 $LIMC
+              ;;
+            reset-queue)
+              # 保守用: AW pending queue を空にする。timeout座礁era(collectが
+              # 完走せず生成物が期限切れ死骸化)に溜まったキューの一掃に使う(2026-07-22)。
+              # cache restore済みのキューを{}で上書き→post-jobで空キャッシュ保存。
+              python -c "import json,pathlib; p=pathlib.Path('data/job_application_sync/aw_pending_queue.json'); old=(len(json.loads(p.read_text(encoding='utf-8'))) if p.exists() else 0); p.parent.mkdir(parents=True,exist_ok=True); p.write_text('{}',encoding='utf-8'); print(f'[reset-queue] aw_pending_queue cleared: {old} -> 0')"
               ;;
           esac
