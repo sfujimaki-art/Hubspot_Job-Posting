@@ -223,16 +223,85 @@ def aggregate_by_account(
 # GASの enqueue が行番号(AIRWORK_LAST_PROCESSED_ROW)で座礁し queue に新規が乗らない
 # ため、こちら側で「シート1」を直接読み、F列マーカー(行削除に強い)で未処理を検知する。
 SHEET1_TAB = "シート1"
-S1_SUBJECT = 0   # A: 件名
-S1_MEDIA = 1     # B: 媒体 (admin@hr-hacker.com / Airワーク... )
-S1_FROM = 2      # C: 差出人(loginId抽出元)
-S1_DATE = 3      # D: 日付
-S1_MARK = 5      # F: マーカー (キュー済/済/受入済)
-S1_COMPANY = 6   # G: 企業名
-# 既存GASマーカー + こちら側マーカー(処理済)
+# --- 列位置は「ハードコードしない」(運用者が列を挿入/削除してもズレる, 2026-07-22) ---
+# ヘッダ名で引ける列は名前で、ヘッダ空の列(件名/日付/マーカー)は内容で特定する。
+# 過去、G列(担当CS=人名)を会社名と取り違えてAW突合が全滅した反省(位置依存の罠)。
+_S1_HDR_MEDIA = ("媒体",)               # 媒体 (admin@hr-hacker.com / Airワーク…)
+_S1_HDR_FROM = ("顧客", "差出人")        # 差出人(loginId抽出元)
+_S1_HDR_COMPANY = ("応募管理シート",)    # 会社名(アカウント情報シートと突合する本丸)
+# 既存GASマーカー + こちら側マーカー(処理済)。'キュー済'=GASの enqueue 済み印。
 S1_MARKS_DONE = ("キュー済", "済", "受入済")
-S1_MARK_ACCEPTED = "受入済"   # こちら側で処理した印
+S1_MARK_ENQUEUED = "キュー済"   # マーカー列の一意特定に使う(チェック列の"済"と区別)
+S1_MARK_ACCEPTED = "受入済"     # こちら側で処理した印
 _S1_APP_SUBJECTS = ("応募がありました", "応募通知メール")
+# 列挿入に耐えるため header/data はやや広め(A:Q)に読む。
+_S1_READ_RANGE = "A1:Q"
+
+
+def _norm_header(h: str) -> str:
+    return (h or "").strip().replace(" ", "").replace("　", "")
+
+
+def _col_letter(idx: int) -> str:
+    """0始まり列index → A1記法の列文字 (0→A, 25→Z, 26→AA)。"""
+    s, n = "", idx + 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _resolve_s1_columns(header: list, rows: list) -> dict:
+    """シート1の列位置を「ヘッダ名 + 内容」で動的特定し {name: index|None} を返す。
+
+    - 媒体/差出人/会社名: ヘッダ名で引く(_S1_HDR_*)。
+    - 件名/日付/マーカー: ヘッダが空なので内容パターンで特定
+      (件名='応募がありました'を含む / 日付='YYYY/M/D' / マーカー='キュー済'を含む)。
+    列を挿入・削除されても壊れない。見つからない列は None(呼び出し側で警告)。
+    """
+    hmap: dict = {}
+    for i, h in enumerate(header):
+        key = _norm_header(str(h))
+        if key and key not in hmap:
+            hmap[key] = i
+
+    def by_name(names):
+        for n in names:
+            if n in hmap:
+                return hmap[n]
+        return None
+
+    cols = {
+        "media": by_name(_S1_HDR_MEDIA),
+        "from": by_name(_S1_HDR_FROM),
+        "company": by_name(_S1_HDR_COMPANY),
+        "subject": None, "date": None, "marker": None,
+    }
+    taken = {v for v in cols.values() if v is not None}
+    ncol = max((len(r) for r in rows), default=0)
+    for ci in range(ncol):
+        if ci in taken:
+            continue
+        col_vals = [str(r[ci]).strip() for r in rows
+                    if len(r) > ci and r[ci] not in (None, "")]
+        if not col_vals:
+            continue
+        if cols["subject"] is None and any(
+                any(k in v for k in _S1_APP_SUBJECTS) for v in col_vals):
+            cols["subject"] = ci
+            continue
+        # マーカー列は「キュー済」を含む列で一意特定(チェック列の"済"と混同しない)。
+        if cols["marker"] is None and any(
+                S1_MARK_ENQUEUED in v for v in col_vals):
+            cols["marker"] = ci
+            continue
+        # 日付列: 過半数が YYYY/M/D 形式の列。
+        if cols["date"] is None:
+            hit = sum(1 for v in col_vals
+                      if re.match(r"\d{4}/\d{1,2}/\d{1,2}", v))
+            if hit and hit >= len(col_vals) // 2:
+                cols["date"] = ci
+    return cols
 
 
 def _first_email(text: str) -> str:
@@ -268,50 +337,69 @@ def read_new_items_from_sheet1(
     sheet_id: str = "", *, cutoff_iso: str = "", media_filter: str = "HR",
     limit: Optional[int] = None,
 ) -> list[QueueItem]:
-    """シート1を直読みし、F列が未処理(空)の応募行から QueueItem を構築 (GAS迂回)。
+    """シート1を直読みし、マーカー列が未処理の応募行から QueueItem を構築 (GAS迂回)。
 
+    列位置はヘッダ名+内容で動的特定(_resolve_s1_columns)。列を挿入/削除されても壊れない。
     cutoff_iso: この日付(ISO 'YYYY-MM-DD')以降の応募のみ (空=全件)。
     media_filter: 'HR'/'AW'/'BOTH'。既定HR (AWは認証別対応まで保留)。
-    行番号(sheet_row)を各itemに付与し、処理後 mark_sheet1_rows でF列にマークする。
+    行番号(sheet_row)を各itemに付与し、処理後 mark_sheet1_rows でマーカー列に書く。
     """
     sid = sheet_id or QUEUE_SHEET_ID
     if not sid:
         raise RuntimeError("JAS_APPLICANT_QUEUE_SHEET_ID 未設定")
     gc = _sheets_client()
     ws = gc.open_by_key(sid).worksheet(SHEET1_TAB)
-    # 必要列 A〜G のみ範囲取得(全列get_all_valuesは52k行で重い)。
-    # 返り値の各行 index: A=0,B=1,C=2,D=3,E=4,F=5,G=6 (S1_* 定数と一致)
-    vals = ws.get("A2:G")  # 既定=FORMATTED_VALUE (日付は '2026/7/21' 表示)
+    # header + data を A:Q で取得(列挿入headroom)。全列get_all_valuesは52k行で重い。
+    vals = ws.get(_S1_READ_RANGE)  # 既定=FORMATTED_VALUE
+    if not vals:
+        return []
+    header, data = vals[0], vals[1:]
+    cols = _resolve_s1_columns(header, data)
+    # 突合キー(会社名)と応募判定(件名)は必須。欠けたら位置依存へ落とさず明示エラー。
+    missing = [k for k in ("subject", "media", "from", "company")
+               if cols.get(k) is None]
+    if missing:
+        raise RuntimeError(
+            f"シート1の列をヘッダ名/内容で特定できず: {missing} "
+            f"(header={[_norm_header(str(h)) for h in header]}) — "
+            f"'媒体'/'顧客'/'応募管理シート' 見出しと件名列を確認")
+
+    def col(name: str):
+        return cols.get(name)
+
     items: list[QueueItem] = []
     import hashlib
-    for i, r in enumerate(vals, start=2):  # 範囲はA2開始=先頭がデータ行2
-        def g(idx: int) -> str:
+    for i, r in enumerate(data, start=2):  # data先頭=シート行2
+        def g(name: str) -> str:
+            idx = col(name)
+            if idx is None:
+                return ""
             return (str(r[idx]) if len(r) > idx and r[idx] is not None
                     else "").strip()
-        subj = g(S1_SUBJECT)
+        subj = g("subject")
         if not any(k in subj for k in _S1_APP_SUBJECTS):
             continue
-        if g(S1_MARK) in S1_MARKS_DONE:
-            continue  # 既に処理済(F列マーカー=行削除に強い判定)
-        media_type = _media_type_from_b(g(S1_MEDIA))
+        if g("marker") in S1_MARKS_DONE:
+            continue  # 既に処理済(マーカー列=行削除に強い判定)
+        media_type = _media_type_from_b(g("media"))
         mt = media_type.lower()
         media = ("HR" if ("hr" in mt or "ハッカー" in media_type)
                  else "AW" if ("airwork" in mt or "ワーク" in media_type)
                  else "OTHER")
         if media_filter != "BOTH" and media != media_filter:
             continue
-        date = g(S1_DATE)
+        date = g("date")
         if cutoff_iso and not _s1_date_recent(date, cutoff_iso):
             continue
-        company = re.sub(r"[（(].+?[)）]", "", g(S1_COMPANY)).strip()
+        company = re.sub(r"[（(].+?[)）]", "", g("company")).strip()
         # 安定ID = 内容ハッシュ (行番号非依存=削除に強い)
         rid = "S1-" + hashlib.md5(
-            f"{media_type}|{g(S1_FROM)}|{date}|{subj}|{company}".encode("utf-8")
+            f"{media_type}|{g('from')}|{date}|{subj}|{company}".encode("utf-8")
         ).hexdigest()[:16]
         items.append(QueueItem(
             row_id=rid, media_type=media_type,
-            login_id=_first_email(g(S1_FROM)), company=company,
-            columns={"A": subj, "B": g(S1_MEDIA), "C": g(S1_FROM),
+            login_id=_first_email(g("from")), company=company,
+            columns={"A": subj, "B": g("media"), "C": g("from"),
                      "D": date, "G": company},
             sheet_row=i,
         ))
@@ -322,14 +410,21 @@ def read_new_items_from_sheet1(
 
 def mark_sheet1_rows(rows: list[int], *, sheet_id: str = "",
                      marker: str = S1_MARK_ACCEPTED) -> int:
-    """シート1 の指定行の F列 にマーカーを書き込む(処理済=再取込防止)。件数を返す。"""
+    """シート1 の指定行のマーカー列にマーカーを書き込む(処理済=再取込防止)。件数を返す。
+
+    マーカー列は位置固定でなくヘッダ行から動的特定する(列挿入/削除に強い)。
+    """
     rows = sorted(set(r for r in rows if r and r > 1))
     if not rows:
         return 0
     sid = sheet_id or QUEUE_SHEET_ID
     gc = _sheets_client()
     ws = gc.open_by_key(sid).worksheet(SHEET1_TAB)
-    # F列(6)を1件ずつ更新(連続範囲でないため)。gspread batch_update で1リクエスト化。
-    data = [{"range": f"F{r}", "values": [[marker]]} for r in rows]
+    # マーカー列を特定(ヘッダ空のためデータ内容='キュー済'から引く)。
+    probe = ws.get(_S1_READ_RANGE + "1000")  # 先頭~1000行で列特定(52k全読み回避)
+    header = probe[0] if probe else []
+    mcol = _resolve_s1_columns(header, probe[1:] if probe else []).get("marker")
+    letter = _col_letter(mcol) if mcol is not None else "F"  # 不明時のみ従来F
+    data = [{"range": f"{letter}{r}", "values": [[marker]]} for r in rows]
     ws.batch_update(data)
     return len(rows)
