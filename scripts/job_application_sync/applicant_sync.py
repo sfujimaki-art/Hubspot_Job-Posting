@@ -337,9 +337,10 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 hr_cutoff_iso = (_date.today() - _td(days=14)).isoformat()
             print(f"[applicant_sync] シート1直読み "
                   f"(cutoff={hr_cutoff_iso}, dry_run={dry_run})", flush=True)
+            # media_filter を素通し(BOTH=HR+AW を読む)。AWは後段 aw_groups で処理。
+            # (旧: BOTHをHRへ潰してAW保留していたが、突合復活に伴い解除 2026-07-22)
             items = aq.read_new_items_from_sheet1(
-                cutoff_iso=hr_cutoff_iso,
-                media_filter=("HR" if media_filter == "BOTH" else media_filter))
+                cutoff_iso=hr_cutoff_iso, media_filter=media_filter)
         else:
             print(f"[applicant_sync] queue検知... (dry_run={dry_run})", flush=True)
             items = aq.read_new_items()

@@ -92,10 +92,11 @@ jobs:
             case "$MODE" in
               relink)    EXTRA="--relink" ;;
               reconcile) EXTRA="--reconcile" ;;
-              # sync: GAS queue が行番号座礁で凍結したため、シート1直読み(HR)へ切替
+              # sync: GAS queue が行番号座礁で凍結したため、シート1直読みへ切替
               # (2026-07-21)。台帳(row_id=内容ハッシュ)で重複防止・行削除に強い。
-              # AWは認証(B系)全滅の別課題のため当面停止(--media HR)。
-              *)         EXTRA="--source sheet1 --media HR" ;;
+              # AW突合は列解決の是正で復活(2026-07-22)→HR+AW両取込(--media BOTH)。
+              # AWは MAX_AW_ACCOUNTS_PER_RUN で1run社数をcap(一斉ログインBAN対策)。
+              *)         EXTRA="--source sheet1 --media BOTH" ;;
             esac
             python scripts/job_application_sync/applicant_sync.py $FLAG $EXTRA
           fi
