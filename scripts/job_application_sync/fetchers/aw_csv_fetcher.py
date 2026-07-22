@@ -387,7 +387,10 @@ async def fetch_aw_xlsx(
 
             # --- mode=collect: 生成済み前提。create押さず短時間で回収 (Phase2) ---
             if mode == "collect":
-                timeout_min = 3  # 生成済みのはず → 短timeout。未完なら AWNotReadyError
+                # キューは日跨ぎで蓄積=生成は数時間前が大半→2分猶予で十分。
+                # 未完に長く張り付くと1run処理数が減りキューが滞留するため短縮
+                # (2026-07-22。env AW_COLLECT_TIMEOUT_MIN で調整可)。
+                timeout_min = int(os.environ.get("AW_COLLECT_TIMEOUT_MIN", "2"))
             elif not already_ready:
                 clicked = await _click_button_by_text(page, BTN_CREATE)
                 if not clicked:

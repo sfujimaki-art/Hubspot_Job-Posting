@@ -392,8 +392,19 @@ async def orchestrate(parallel: int = 5,
     # --- Phase2(collect): キューから対象を構築 (PWはlogin_idで再解決) ---
     if phase == "collect":
         queue = _load_queue()
-        accounts = []
-        for lid, meta in queue.items():
+        # login_id でソート=毎runで安定した順序。_save_queue が順序を変えても
+        # ローテーションカーソルが決定的に前進する(全件を漏れなく巡回)。
+        q_items = sorted(queue.items())
+        # ★重大バグ修正(2026-07-22): 旧実装はキュー全件(259件)を1回の gather で処理し、
+        #   job timeout(30分)に収まらず gather途中でcancel→_save_queue不達→キュー更新も
+        #   作成済みLISTINGも破棄→永久停滞(LISTING 0)。
+        # → ローテーションスライスで毎run N件だけ処理し、必ず完了→キュー永続+LISTING前進。
+        #   未処理(スライス外)は保持、処理済のok/empty/errorは除去、not_readyは残す。
+        slice_n = limit if limit else int(os.environ.get("AW_COLLECT_SLICE", "20"))
+        q_slice = _rotate_slice(q_items, slice_n, out_dir, key="collect")
+        accounts, processed_lids = [], set()
+        for lid, meta in q_slice:
+            processed_lids.add(lid)
             acc = find_account_by_login_id(lid)
             if acc:
                 accounts.append(acc)
@@ -401,10 +412,8 @@ async def orchestrate(parallel: int = 5,
                 accounts.append({"login_id": lid,
                                  "company_name": meta.get("company", ""),
                                  "password": ""})
-        if limit:
-            accounts = accounts[:limit]
-        print(f"[orchestrate] phase=collect: キュー {len(queue)}件 → 対象 {len(accounts)}",
-              flush=True)
+        print(f"[orchestrate] phase=collect: キュー {len(queue)}件 → 今回 {len(accounts)}社処理"
+              f"(残{len(queue)-len(accounts)}社は次サイクル)", flush=True)
         total = len(accounts)
         if total == 0:
             print("[orchestrate] キュー空。Phase1(create)を先に実行してください。", flush=True)
@@ -419,9 +428,13 @@ async def orchestrate(parallel: int = 5,
                   flush=True)
             return r
         results = await asyncio.gather(*[_wrapped_c(a) for a in accounts])
-        # キュー更新: not_ready のみ残す (成功/empty/errorは除去)
-        new_q = {r["login_id"]: queue.get(r["login_id"], {})
-                 for r in results if r["status"] == "not_ready"}
+        # キュー更新: 未処理(スライス外)は保持 / 処理済は not_ready のみ残す
+        # (ok/empty/error は除去)。全件一括でないため未処理を消さないのが要点。
+        new_q = {lid: meta for lid, meta in queue.items()
+                 if lid not in processed_lids}
+        for r in results:
+            if r["status"] == "not_ready":
+                new_q[r["login_id"]] = queue.get(r["login_id"], {})
         _save_queue(new_q)
         ok = sum(1 for r in results if r["status"] == "ok")
         ng = sum(1 for r in results if r["status"] == "error")
