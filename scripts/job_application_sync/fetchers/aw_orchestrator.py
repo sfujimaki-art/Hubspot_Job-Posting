@@ -461,7 +461,9 @@ async def orchestrate(parallel: int = 5,
             cutoff_iso=applications_cutoff, media_filter="AW", limit=None)
         resolver = _aq.AccountResolver().build()
         seen: dict = {}
-        for it in items:
+        # 最新の応募から遡る(シート1は下=最新のため逆順)。求人が生きている可能性が
+        # 高い新しい応募のアカウントから習得し、紐付き歩留まりを最大化する(2026-07-23)。
+        for it in reversed(items):
             acc = resolver.resolve(it)
             if not acc or acc.closed:
                 continue
@@ -495,7 +497,8 @@ async def orchestrate(parallel: int = 5,
                 ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[orchestrate] 未解決メール一覧: {ur_path}", flush=True)
     else:
-        accounts = list(iter_aw_accounts(active_only=True))
+        # 顧客管理シートは下=最新。最新顧客から検証するため逆順(下から)で処理する。
+        accounts = list(iter_aw_accounts(active_only=True))[::-1]
     if target_login_ids:
         target_set = {str(e).strip() for e in target_login_ids if str(e).strip()}
         accounts = [a for a in accounts if a.get("login_id") in target_set]
