@@ -16,10 +16,13 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: "フェーズ (hr / aw-create / aw-collect / reset-queue)"
+        description: "フェーズ (hr / aw-create / aw-create-apps / aw-collect / reset-queue)"
         default: "hr"
         type: choice
-        options: ["hr", "aw-create", "aw-collect", "reset-queue"]
+        options: ["hr", "aw-create", "aw-create-apps", "aw-collect", "reset-queue"]
+      apps_cutoff:
+        description: "aw-create-apps の応募日カットオフ (ISO, 空=全件)"
+        default: ""
       target_login_ids:
         description: "AW対象 login_id (カンマ区切り, 空=--from-active-deals)"
         default: ""
@@ -69,6 +72,7 @@ jobs:
           GOOGLE_SA_JSON: /tmp/sa.json
           SHEETS_AUTH_MODE: sa
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
+          JAS_APPLICANT_QUEUE_SHEET_ID: ${{ secrets.JAS_APPLICANT_QUEUE_SHEET_ID }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
           PYTHONIOENCODING: utf-8
           PHASE: ${{ inputs.phase || 'hr' }}
@@ -93,6 +97,13 @@ jobs:
             aw-create)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
                 $TGT --phase create --parallel 2 $LIM
+              ;;
+            aw-create-apps)
+              # 応募起点ブートストラップ(導入期): 応募が来た社の求人を一括習得。
+              # 日常の aw-create(--from-active-deals)は温存。生成トリガーのみ+enqueue。
+              python scripts/job_application_sync/fetchers/aw_orchestrator.py \
+                --phase create --from-applications \
+                --applications-cutoff "${{ inputs.apps_cutoff }}" --parallel 2 $LIM
               ;;
             aw-collect)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \

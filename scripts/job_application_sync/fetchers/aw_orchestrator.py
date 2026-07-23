@@ -363,6 +363,8 @@ async def orchestrate(parallel: int = 5,
                       log_dir: Optional[Path] = None,
                       target_login_ids: Optional[list] = None,
                       from_active_deals: bool = False,
+                      from_applications: bool = False,
+                      applications_cutoff: str = "",
                       phase: str = "full") -> dict:
     """AW アカウントを並列処理。
 
@@ -450,7 +452,28 @@ async def orchestrate(parallel: int = 5,
         return {"ok": ok, "ng": ng, "not_ready": nr, "total": total,
                 "log": str(log_path)}
 
-    if from_active_deals:
+    if from_applications:
+        # 応募起点(ブートストラップ, 2026-07-23): AW求人がHubSpotに未存在の導入期に、
+        # 「応募が来た社」の求人を一括習得するための入口。日常の差分検知は別(温存)。
+        # 既存の read_new_items_from_sheet1 + AccountResolver を流用(車輪の再発明なし)。
+        from scripts.job_application_sync import applicant_queue as _aq
+        items = _aq.read_new_items_from_sheet1(
+            cutoff_iso=applications_cutoff, media_filter="AW", limit=None)
+        resolver = _aq.AccountResolver().build()
+        seen: dict = {}
+        for it in items:
+            acc = resolver.resolve(it)
+            if not acc or acc.closed:
+                continue
+            for bid in acc.b_ids:
+                if bid and bid not in ("ー", "-") and bid not in seen:
+                    seen[bid] = {"login_id": bid, "password": acc.b_pw,
+                                 "company_name": acc.company}
+        accounts = list(seen.values())
+        print(f"[orchestrate] --from-applications: 応募{len(items)}件 → "
+              f"AW解決アカウント {len(accounts)}社(cutoff={applications_cutoff})",
+              flush=True)
+    elif from_active_deals:
         # Deal起点: アクティブDeal(納品管理pipeline)のkanri_mail → AWアカウント解決。
         # シート順(古い会社混入)を排除し「現役顧客」のみを巡回対象にする。
         deal_mails = _fetch_active_deal_mails()
@@ -482,8 +505,8 @@ async def orchestrate(parallel: int = 5,
             flush=True,
         )
     # incremental: 全社一斉を避け「N社ずつローテーション」で巡回 (2026-07-09)。
-    # from_active_deals + limit のときのみカーソルを進めて続きから処理する。
-    if limit and from_active_deals and not target_login_ids:
+    # from_active_deals/from_applications + limit のときカーソルを進めて続きから処理。
+    if limit and (from_active_deals or from_applications) and not target_login_ids:
         accounts = _rotate_slice(accounts, limit, out_dir, key=phase)
     elif limit:
         accounts = accounts[:limit]
@@ -629,6 +652,11 @@ def parse_args(argv=None):
                    help="アクティブDeal(納品管理pipeline)のkanri_mail から巡回対象を"
                         "抽出 (現役顧客のみ)。シート順の古い会社混入を排除。"
                         "未解決メールは aw_unresolved_deal_mails_*.json に出力")
+    p.add_argument("--from-applications", action="store_true",
+                   help="応募起点(導入期ブートストラップ): 応募が来た社の求人を一括習得。"
+                        "シート1のAW応募→AWアカウント解決を対象にする")
+    p.add_argument("--applications-cutoff", default="",
+                   help="--from-applications の応募日カットオフ(ISO YYYY-MM-DD, 空=全件)")
     p.add_argument("--phase", choices=["full", "create", "collect"],
                    default="full",
                    help="full=生成+DL+取込(従来) / create=生成トリガーのみ(Phase1,"
@@ -651,6 +679,8 @@ def main(argv=None):
         out_dir=Path(args.out_dir) if args.out_dir else None,
         target_login_ids=target_ids,
         from_active_deals=args.from_active_deals,
+        from_applications=args.from_applications,
+        applications_cutoff=args.applications_cutoff,
         phase=args.phase,
     ))
 
