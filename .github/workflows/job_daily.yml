@@ -100,10 +100,13 @@ jobs:
               ;;
             aw-create-apps)
               # 応募起点ブートストラップ(導入期): 応募が来た社の求人を一括習得。
-              # 日常の aw-create(--from-active-deals)は温存。生成トリガーのみ+enqueue。
+              # 日常の aw-create(--from-active-deals)は温存。
+              # mode=full(1ラン内で生成→待機→回収→LISTING化)で完結=キャッシュ共有キューの
+              # clobber事故を回避(2026-07-23)。少数/ランで確実に。limit未指定なら3社。
+              LIMA=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 3")
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
-                --phase create --from-applications \
-                --applications-cutoff "${{ inputs.apps_cutoff }}" --parallel 2 $LIM
+                --phase full --from-applications --actual \
+                --applications-cutoff "${{ inputs.apps_cutoff }}" --parallel 3 $LIMA
               ;;
             aw-collect)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
