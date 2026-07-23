@@ -750,10 +750,16 @@ def process_applicant(
         if row.media_job_id:
             login_id = row.airwork_login_id or default_login_id
             if login_id:
-                # 本来の複合キー (id_airwork AND airwork_account_login_id) 検索
+                # まず複合キー (id_airwork AND airwork_account_login_id) 検索
                 listing_id = client.search_listing_aw(row.media_job_id, login_id)
-            else:
-                # login_id 無し → id_airwork 単独検索 + 一意性ガード
+            if not listing_id:
+                # id_airwork 単独検索 + 一意性ガードでフォールバック。
+                # login_id 無し時に加え、複合キーがミスした時もここに来る。
+                # 理由(2026-07-23 実データ確定): AW応募CSVは airwork_account_login_id 列を
+                # 持たず、応募側loginは bid(ログインID/メール)にフォールバックする一方、
+                # LISTING側は client_code(数値, 例1584214)を保持 → 複合キーが構造的に不一致
+                # (AW応募の99.7%が対象外化した主因)。id_airwork は AirWork 全体で一意なので
+                # len==1 で §24 顧客横断誤紐付け防止を担保しつつ安全に紐付けできる。
                 candidates = client.search_listing_aw_by_id(row.media_job_id)
                 if len(candidates) == 1:
                     listing_id = candidates[0]
