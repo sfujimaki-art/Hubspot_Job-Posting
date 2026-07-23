@@ -13,6 +13,11 @@ on:
   schedule:
     - cron: "0 22 * * *"    # 毎日 22:00 UTC (= 07:00 JST) HR差分
     - cron: "20 22 * * *"   # 20分後に AW-collect (create→生成待ち→collect)
+    # AW応募起点ブートストラップ(導入期): 応募が来た社の求人を最新から遡って習得。
+    # 3社/run × 3回/日 で残アカウントを数日で完走させる。求人が揃ったら停止してよい。
+    - cron: "0 1 * * *"     # 10:00 JST
+    - cron: "0 5 * * *"     # 14:00 JST
+    - cron: "0 9 * * *"     # 18:00 JST
   workflow_dispatch:
     inputs:
       phase:
@@ -75,10 +80,27 @@ jobs:
           JAS_APPLICANT_QUEUE_SHEET_ID: ${{ secrets.JAS_APPLICANT_QUEUE_SHEET_ID }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
           PYTHONIOENCODING: utf-8
-          PHASE: ${{ inputs.phase || 'hr' }}
+          # cron実行時は inputs が無く既定'hr'になっていた(=aw-collect cronもHRを実行して
+          # いた潜在バグ)。schedule→phase を明示マッピングして是正(2026-07-23)。
+          PHASE_IN: ${{ inputs.phase }}
+          SCHEDULE: ${{ github.event.schedule }}
+          APPS_CUTOFF_IN: ${{ inputs.apps_cutoff }}
           TARGET: ${{ inputs.target_login_ids }}
           LIMIT: ${{ inputs.limit }}
         run: |
+          # PHASE 決定: 手動dispatchは inputs 優先、cron は schedule から引く。
+          PHASE="$PHASE_IN"
+          if [ -z "$PHASE" ]; then
+            case "$SCHEDULE" in
+              "20 22 * * *")                        PHASE="aw-collect" ;;
+              "0 1 * * *"|"0 5 * * *"|"0 9 * * *")  PHASE="aw-create-apps" ;;
+              *)                                     PHASE="hr" ;;
+            esac
+          fi
+          echo "PHASE=$PHASE (schedule='$SCHEDULE')"
+          # 応募起点の既定カットオフ: 直近60日(求人が生きている可能性が高い窓)
+          APPSCUT="$APPS_CUTOFF_IN"
+          [ -z "$APPSCUT" ] && APPSCUT=$(date -u -d '60 days ago' +%Y-%m-%d)
           # hr_watcher は --dry-run/--actual 両対応、aw_orchestrator は --actual のみ
           # (dry-runが既定) なので媒体別にフラグを分ける。
           FLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "--dry-run")
@@ -106,7 +128,7 @@ jobs:
               LIMA=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 3")
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
                 --phase full --from-applications --actual \
-                --applications-cutoff "${{ inputs.apps_cutoff }}" --parallel 3 $LIMA
+                --applications-cutoff "$APPSCUT" --parallel 3 $LIMA
               ;;
             aw-collect)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
