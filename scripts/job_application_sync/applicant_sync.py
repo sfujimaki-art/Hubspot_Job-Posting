@@ -200,24 +200,6 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
     return len(missing)
 
 
-def _ondemand_aw_job_generation(bid: str, b_pw: str, company: str,
-                                out_dir: Path) -> None:
-    """応募起点のAW求人作成: その社の求人生成を「トリガーのみ(待たない)」+ pending queue
-    投入。生成物は日次 aw-collect が回収→LISTING作成、relink で応募が紐付く。
-    5分/30分バッチに20分生成待ちを持ち込まないため mode='create' を使う(2026-07-23)。"""
-    from scripts.job_application_sync.fetchers import aw_csv_fetcher as awf
-    from scripts.job_application_sync.fetchers import aw_orchestrator as awo
-    # 生成トリガーのみ(mode=create=待たない)。応募CSV取得で確立済のセッションを再利用。
-    asyncio.run(awf.fetch_aw_xlsx(
-        bid, b_pw, out_dir, headless=True, mode="create",
-        storage_state_path=_session_path(bid)))
-    # collect が回収するキューへ投入(login_id=bid をキーに)。
-    q = awo._load_queue()
-    q[bid] = {"company": company, "triggered_at": datetime.now().isoformat(),
-              "source": "applicant"}
-    awo._save_queue(q)
-
-
 def process_aw_account(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
@@ -241,26 +223,13 @@ def process_aw_account(
             result.update(ok=True, login_id=bid, linked=0, unlinked=len(rows),
                           csv=csv_path.name, total=len(rows))
             return result
-        # 応募起点のAW求人作成 (2026-07-23 ユーザー決定): AW求人は導入期で HubSpot に
-        # ほぼ存在しない(HRハッカーは在るがAWは無い)。応募は事実として来ているので、
-        # 応募が指す求人IDのLISTINGが欠落していれば、その社の求人生成を「トリガーのみ
-        # (待たない)」+ pending queue 投入で2段機構へ流す。生成物は日次 aw-collect が
-        # 回収→LISTING作成、relink(id_airwork単独)で対象外→紐付き。
-        # 旧: 同期20分待ち(_ensure_aw_jobs/JAS_ENABLE_INLINE)は5分バッチを破綻させたため廃止。
-        job_ids = list({r.media_job_id for r in rows if r.media_job_id})
+        # 求人LISTINGの習得は job_daily の aw-create-apps(--from-applications, mode=full)
+        # に一本化(2026-07-23)。applicant sync は「応募登録+既存LISTINGへの紐付け」に専念。
+        # 未習得の応募は対象外で登録→求人習得後に relink で紐付く。
+        # (旧 _ondemand_aw_job_generation は applicant側キャッシュにenqueueするが collectは
+        #  job側キャッシュを読むため繋がらない=撤去。同期20分待ちの _ensure_aw_jobs も不使用)
         jobs_fetched = 0
-        try:
-            missing = _missing_aw_listings(job_ids, token)
-            if missing:
-                _ondemand_aw_job_generation(bid, b_pw, company, out_dir)
-                jobs_fetched = len(missing)
-                print(f"  応募起点: 求人LISTING欠落{len(missing)}件 → "
-                      f"{company[:18]} の生成トリガー+enqueue済(翌collectで回収)",
-                      flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"  [応募起点求人生成] トリガー失敗(応募は続行): "
-                  f"{type(e).__name__}: {str(e)[:80]}", flush=True)
-        # 応募import (求人が揃った状態で紐付け)
+        # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
         cli = ai.RealHubSpotClient(token)
         results = ai.run_import(rows, cli, default_login_id=bid)
         from collections import Counter
@@ -516,6 +485,9 @@ def relink(dry_run: bool = False, limit: int = 1000) -> dict:
         body = {"filterGroups": [{"filters": [
             {"propertyName": "kokyakushiitotenkijoukyou",
              "operator": "EQ", "value": "対象外"}]}],
+            # 新しい順スキャン(2026-07-23): 求人を習得したばかりの新鮮な応募ほど
+            # 紐付く可能性が高い。既定(古い順)+limitだと新鮮な紐付け候補に届かず取りこぼす。
+            "sorts": [{"propertyName": "hs_createdate", "direction": "DESCENDING"}],
             "properties": ["oubokyuujinmemo", "oubobaitaimei",
                            "bikou_hiaringu"], "limit": 100}
         if after:
