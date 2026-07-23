@@ -363,8 +363,19 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         else:
             print(f"[applicant_sync] queue検知... (dry_run={dry_run})", flush=True)
             items = aq.read_new_items()
-        # 台帳で既にDONEの項目は除外
-        items = [it for it in items if ledger.status(it.row_id) != "DONE"]
+        # 台帳で処理不要の項目を除外:
+        #   DONE/SKIP = 完了・対象外。
+        #   FAILED かつ試行上限超過 = 認証欠落/ログイン失敗の恒常エラー。除外しないと
+        #   先頭スロットに居座り続け(実測156回リトライ)、後続の正常アカウントが永久に
+        #   処理されずAWが詰まる(2026-07-23 発見)。上限超過はSlack報告済=手動対応待ち。
+        def _skip_item(rid: str) -> bool:
+            st = ledger.status(rid)
+            if st in ("DONE", "SKIP"):
+                return True
+            if st == "FAILED" and ledger.attempts(rid) >= MAX_ATTEMPTS:
+                return True
+            return False
+        items = [it for it in items if not _skip_item(it.row_id)]
         resolver = aq.AccountResolver().build()
         grouped, unresolved = aq.aggregate_by_account(items, resolver)
 
