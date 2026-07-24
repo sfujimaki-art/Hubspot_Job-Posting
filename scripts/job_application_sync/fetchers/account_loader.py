@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 from typing import Iterator, Optional
 
 import gspread
@@ -100,6 +101,35 @@ def _get_field(row: dict, *candidates: str) -> str:
     return ""
 
 
+# ── セル正規化 (2026-07-24) ─────────────────────────────────────────────
+# 顧客管理シートには1セルに複数値/ラベル/メモが混在する行がある(実測 十数件):
+#   'ID：sankikoube\nID：@sanki6451\nID：SANKI7228'      … 複数ID+ラベル
+#   'ID :kountohoku7200'                                  … ラベル(スペース揺れ)
+#   'otsuka@roadcar.jp\n1.0で登録：https://...'           … 資格情報+メモ混在
+# 生値のままログインすると必ず失敗するため、最初の妥当な値だけを抽出する。
+# クリーンなセル(改行/ラベル無し)は無変更で素通し = 既存挙動を壊さない。
+_CRED_LABEL = re.compile(r"^(ID|PW|パスワード)\s*[：:]\s*", re.IGNORECASE)
+_CRED_NOTE = re.compile(r"https?://|登録|※|→|↓")
+
+
+def _first_credential(cell: str, split_comma: bool = True) -> str:
+    """複数値/ラベル/メモ混在セルから最初の妥当な資格情報を返す。
+
+    split_comma: IDはカンマ区切りも分割。PWはカンマを含み得るため False 推奨。
+    ('yamanaka/kisai/10' のようにスラッシュを含む正規IDがあるため / では割らない)
+    """
+    cell = (cell or "").strip()
+    if "\n" not in cell and not _CRED_LABEL.match(cell):
+        return cell  # クリーンなセルは素通し(挙動不変)
+    parts = re.split(r"[\n,]" if split_comma else r"\n", cell)
+    for p in parts:
+        p = _CRED_LABEL.sub("", p.strip())
+        if not p or _CRED_NOTE.search(p):
+            continue
+        return p
+    return ""
+
+
 def _select_credentials(
     row: dict, prefer: str = "B"
 ) -> Optional[tuple[str, str, str]]:
@@ -121,8 +151,9 @@ def _select_credentials(
     def _clean(v: str) -> str:
         return "" if v.strip() in _PLACEHOLDERS else v
 
-    bid = _clean(_get_field(row, COL_AW_ID_B))
-    bpw = _clean(_get_field(row, COL_AW_PW_B))
+    bid = _clean(_first_credential(_get_field(row, COL_AW_ID_B)))
+    bpw = _clean(_first_credential(_get_field(row, COL_AW_PW_B),
+                                   split_comma=False))
     if bid and bpw:
         return bid, bpw, "B"
     return None
