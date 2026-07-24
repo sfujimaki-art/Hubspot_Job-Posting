@@ -244,6 +244,7 @@ def process_aw_account(
                     print(f"  自己修復: {company[:18]} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
                     jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir)
+                    result["acquired_job_ids"] = missing  # 過去分救出(ピンポイントrelink)用
                     time.sleep(15)  # HubSpot search index 反映待ち
             except Exception as e:  # noqa: BLE001
                 print(f"  自己修復失敗(応募は続行・対象外→後続relinkで救出): "
@@ -444,6 +445,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         # 少数に cap。溢れた社は次サイクル(5分毎)で自動的に習得される。
         acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "2"))
         acquired_total = 0
+        acquired_job_ids: list = []
         for key in keys:
             group = aw_groups[key]
             company = key[len("AW::"):]
@@ -459,6 +461,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 allow_acquire=(not dry_run and acquired_total < acquire_budget))
             if res.get("jobs_fetched"):
                 acquired_total += 1
+                acquired_job_ids.extend(res.get("acquired_job_ids") or [])
             if res["ok"]:
                 for it in group:
                     ledger.mark(it.row_id, "DONE")
@@ -484,10 +487,11 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                     print(f"  ⏳ {company[:18]}: {res['error']} "
                           f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
         # 自己修復の仕上げ: 今回求人を習得した場合、過去に取りこぼした(対象外)応募を
-        # 既存 relink(新しい順スキャン)で即救出する。求人ができた直後が最も効果が高い。
-        if acquired_total and not dry_run:
+        # 習得した求人IDに絞ったピンポイントrelinkで即救出する。全走査+sortは
+        # HubSpot検索のページング途切れで取りこぼすため、IDで直接引く(確実・軽量)。
+        if acquired_job_ids and not dry_run:
             try:
-                relink(dry_run=False, limit=1500)
+                relink(dry_run=False, target_job_ids=acquired_job_ids)
             except Exception as e:  # noqa: BLE001
                 print(f"[自己修復relink] 失敗(次回の定期relinkで回収): "
                       f"{type(e).__name__}: {str(e)[:80]}", flush=True)
@@ -499,51 +503,95 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     return summary
 
 
-def relink(dry_run: bool = False, limit: int = 1000) -> dict:
+def relink(dry_run: bool = False, limit: int = 1000,
+           target_job_ids: Optional[list] = None) -> dict:
     """再紐付けスイープ (順序問題の恒久解決).
 
     「求人が登録される前に来た応募」は対象外で記録される(dedupで残る)。
     その後 求人巡回が LISTING を作れば、本スイープが oubokyuujinmemo(媒体求人ID)で
     LISTINGを引いて Association(typeId=5) を張り、対象外→未転記 に解除する。
     → 求人と応募の到着順序に依存せず、必ず後から紐付く。求人巡回の後に定期実行。
+
+    target_job_ids: 指定時はピンポイント救出(自己修復用)。習得したばかりの求人IDに
+    絞って対象外を直接検索する。全走査+sortはHubSpot検索のページング途切れ
+    (実測 checked=100/400 で停止)で取りこぼすため、IDで直接引くのが確実。
     """
     import re as _re
     token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
     H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     cli = ai.RealHubSpotClient(token)
 
-    # 1) 対象外APPOINTMENTを全走査して (appt_id, jid, is_hr) を収集 (検索はまだしない)
+    # 1) 対象外APPOINTMENTを収集して (appt_id, jid, is_hr) を作る (検索はまだしない)
     targets = []  # [(appt_id, jid, is_hr)]
     checked = 0
-    after = None
-    while checked < limit:
-        body = {"filterGroups": [{"filters": [
-            {"propertyName": "kokyakushiitotenkijoukyou",
-             "operator": "EQ", "value": "対象外"}]}],
-            # 新しい順スキャン(2026-07-23): 求人を習得したばかりの新鮮な応募ほど
-            # 紐付く可能性が高い。既定(古い順)+limitだと新鮮な紐付け候補に届かず取りこぼす。
-            "sorts": [{"propertyName": "hs_createdate", "direction": "DESCENDING"}],
-            "properties": ["oubokyuujinmemo", "oubobaitaimei",
-                           "bikou_hiaringu"], "limit": 100}
-        if after:
-            body["after"] = after
-        r = requests.post(
-            "https://api.hubapi.com/crm/v3/objects/0-421/search",
-            headers=H, json=body, timeout=30).json()
-        for o in r.get("results", []):
-            checked += 1
-            p = o.get("properties") or {}
-            jid = (p.get("oubokyuujinmemo") or "").strip()
-            if not jid:  # 旧backlogは bikou_hiaringu から抽出
-                m = _re.search(r"媒体求人ID=(\S+)", p.get("bikou_hiaringu") or "")
-                jid = m.group(1) if m else ""
-            if not jid:
-                continue
-            media = p.get("oubobaitaimei") or ""
-            targets.append((o["id"], jid, ("HR" in media or "ハッカー" in media)))
-        after = r.get("paging", {}).get("next", {}).get("after")
-        if not after:
-            break
+
+    def _collect(o) -> None:
+        nonlocal checked
+        checked += 1
+        p = o.get("properties") or {}
+        jid = (p.get("oubokyuujinmemo") or "").strip()
+        if not jid:  # 旧backlogは bikou_hiaringu から抽出
+            m = _re.search(r"媒体求人ID=(\S+)", p.get("bikou_hiaringu") or "")
+            jid = m.group(1) if m else ""
+        if not jid:
+            return
+        media = p.get("oubobaitaimei") or ""
+        targets.append((o["id"], jid, ("HR" in media or "ハッカー" in media)))
+
+    _PROPS = ["oubokyuujinmemo", "oubobaitaimei", "bikou_hiaringu"]
+    if target_job_ids:
+        ids = sorted({str(j).strip() for j in target_job_ids if str(j).strip()})
+        # (a) oubokyuujinmemo に求人IDを持つ対象外 (IN でバッチ検索)
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            r = requests.post(
+                "https://api.hubapi.com/crm/v3/objects/0-421/search",
+                headers=H, json={"filterGroups": [{"filters": [
+                    {"propertyName": "kokyakushiitotenkijoukyou",
+                     "operator": "EQ", "value": "対象外"},
+                    {"propertyName": "oubokyuujinmemo",
+                     "operator": "IN", "values": chunk}]}],
+                    "properties": _PROPS, "limit": 200}, timeout=30).json()
+            for o in r.get("results", []):
+                _collect(o)
+            time.sleep(0.2)
+        # (b) 旧backlog(oubokyuujinmemo空, bikou_hiaringuにID記載)はトークン検索で補完
+        for jid in ids:
+            r = requests.post(
+                "https://api.hubapi.com/crm/v3/objects/0-421/search",
+                headers=H, json={"filterGroups": [{"filters": [
+                    {"propertyName": "kokyakushiitotenkijoukyou",
+                     "operator": "EQ", "value": "対象外"},
+                    {"propertyName": "oubokyuujinmemo",
+                     "operator": "NOT_HAS_PROPERTY"},
+                    {"propertyName": "bikou_hiaringu",
+                     "operator": "CONTAINS_TOKEN", "value": jid}]}],
+                    "properties": _PROPS, "limit": 100}, timeout=30).json()
+            for o in r.get("results", []):
+                _collect(o)
+            time.sleep(0.2)
+    else:
+        after = None
+        while checked < limit:
+            body = {"filterGroups": [{"filters": [
+                {"propertyName": "kokyakushiitotenkijoukyou",
+                 "operator": "EQ", "value": "対象外"}]}],
+                # 新しい順スキャン(2026-07-23): 求人を習得したばかりの新鮮な応募ほど
+                # 紐付く可能性が高い。※sort付きはページングが途切れる癖あり(実測)。
+                # 確実な救出は target_job_ids のピンポイントモードを使う。
+                "sorts": [{"propertyName": "hs_createdate",
+                           "direction": "DESCENDING"}],
+                "properties": _PROPS, "limit": 100}
+            if after:
+                body["after"] = after
+            r = requests.post(
+                "https://api.hubapi.com/crm/v3/objects/0-421/search",
+                headers=H, json=body, timeout=30).json()
+            for o in r.get("results", []):
+                _collect(o)
+            after = r.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
 
     # 2) 求人IDを媒体別に集約し、LISTINGをバッチ IN検索 (100件/req) して map化
     #    値=(listing_id, 一次対応フラグ)。曖昧(複数一致)は None。
