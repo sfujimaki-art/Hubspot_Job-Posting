@@ -186,16 +186,23 @@ def _missing_aw_listings(job_ids: list[str], token: str) -> list[str]:
 
 
 def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> int:
-    """案2b: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
-    生成待ちあり(数分)。欠落時のみ発火。Returns: upsert試行した求人数(近似)."""
+    """自己修復: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
+    生成待ちあり(timeout_min分)。欠落時のみ発火。Returns: upsert試行した求人数(近似)."""
     from scripts.job_application_sync.fetchers import aw_csv_fetcher as awf
+    from scripts.job_application_sync.fetchers.aw_orchestrator import (
+        _extract_xlsx_from_zip,
+    )
     from scripts.job_application_sync import airwork_import as air
     zip_path = asyncio.run(awf.fetch_aw_xlsx(
         bid, b_pw, out_dir, headless=True, mode="full",
+        # 5分バッチに20分待ちを持ち込まない(既定8分。envで調整可)。
+        timeout_min=int(os.environ.get("JAS_SELFHEAL_TIMEOUT_MIN", "8")),
         storage_state_path=_session_path(bid)))
+    # run_xlsx は .xlsx 限定のため ZIP から展開する (旧実装はZIP直渡しの潜在バグ)。
+    xlsx_path = _extract_xlsx_from_zip(Path(zip_path))
     # login_id=bid で LISTING を作成 (応募linkと同じキーに揃える)。
     # client_code はXLSX側と異なるため strict_client_code=False。
-    air.run_xlsx(str(zip_path), login_id=bid, dry_run=False,
+    air.run_xlsx(xlsx_path, login_id=bid, dry_run=False,
                  strict_client_code=False)
     return len(missing)
 
@@ -203,6 +210,7 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
 def process_aw_account(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
+    allow_acquire: bool = False,
 ) -> dict:
     """AW 1アカウントの応募を取得→(案2b求人先行)→登録。複数B系IDは順に試行。
     Returns: {ok, linked, unlinked, dup, jobs_fetched, error, login_id}"""
@@ -223,12 +231,23 @@ def process_aw_account(
             result.update(ok=True, login_id=bid, linked=0, unlinked=len(rows),
                           csv=csv_path.name, total=len(rows))
             return result
-        # 求人LISTINGの習得は job_daily の aw-create-apps(--from-applications, mode=full)
-        # に一本化(2026-07-23)。applicant sync は「応募登録+既存LISTINGへの紐付け」に専念。
-        # 未習得の応募は対象外で登録→求人習得後に relink で紐付く。
-        # (旧 _ondemand_aw_job_generation は applicant側キャッシュにenqueueするが collectは
-        #  job側キャッシュを読むため繋がらない=撤去。同期20分待ちの _ensure_aw_jobs も不使用)
+        # 自己修復 (2026-07-24 ユーザー設計): 応募の求人LISTINGが欠落していたら、
+        # その場でその社の求人を習得(mode=full=生成待ち内包)してから import する。
+        # → 今回の応募は即紐付き、過去の取りこぼしは呼出側(run)が直後の relink で救出。
+        # 生成待ちが重いので1runの習得社数は呼出側が cap する(allow_acquire)。
         jobs_fetched = 0
+        if allow_acquire:
+            try:
+                job_ids = list({r.media_job_id for r in rows if r.media_job_id})
+                missing = _missing_aw_listings(job_ids, token)
+                if missing:
+                    print(f"  自己修復: {company[:18]} 求人LISTING欠落"
+                          f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
+                    jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir)
+                    time.sleep(15)  # HubSpot search index 反映待ち
+            except Exception as e:  # noqa: BLE001
+                print(f"  自己修復失敗(応募は続行・対象外→後続relinkで救出): "
+                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
         cli = ai.RealHubSpotClient(token)
         results = ai.run_import(rows, cli, default_login_id=bid)
@@ -421,6 +440,10 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             print(f"[applicant_sync] AW {len(aw_groups)}社中 今回{len(keys)}社処理 "
                   f"(残{len(aw_groups)-len(keys)}社は次サイクル / BAN対策の分散)",
                   flush=True)
+        # 自己修復の1run習得budget: 求人習得(mode=full)は生成待ちを内包し重いため
+        # 少数に cap。溢れた社は次サイクル(5分毎)で自動的に習得される。
+        acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "2"))
+        acquired_total = 0
         for key in keys:
             group = aw_groups[key]
             company = key[len("AW::"):]
@@ -431,7 +454,11 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 for it in group:
                     ledger.mark(it.row_id, "SKIP", "closed/unresolved")
                 continue
-            res = process_aw_account(company, acc.b_ids, acc.b_pw, out_dir, dry_run)
+            res = process_aw_account(
+                company, acc.b_ids, acc.b_pw, out_dir, dry_run,
+                allow_acquire=(not dry_run and acquired_total < acquire_budget))
+            if res.get("jobs_fetched"):
+                acquired_total += 1
             if res["ok"]:
                 for it in group:
                     ledger.mark(it.row_id, "DONE")
@@ -456,6 +483,14 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 else:
                     print(f"  ⏳ {company[:18]}: {res['error']} "
                           f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
+        # 自己修復の仕上げ: 今回求人を習得した場合、過去に取りこぼした(対象外)応募を
+        # 既存 relink(新しい順スキャン)で即救出する。求人ができた直後が最も効果が高い。
+        if acquired_total and not dry_run:
+            try:
+                relink(dry_run=False, limit=1500)
+            except Exception as e:  # noqa: BLE001
+                print(f"[自己修復relink] 失敗(次回の定期relinkで回収): "
+                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
         if not dry_run:
             ledger.save()  # dry-runは台帳を汚さない
     finally:
