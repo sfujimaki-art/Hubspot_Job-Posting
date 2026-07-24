@@ -432,12 +432,16 @@ async def orchestrate(parallel: int = 5,
         results = await asyncio.gather(*[_wrapped_c(a) for a in accounts])
         # キュー更新: 未処理(スライス外)は保持 / 処理済は not_ready のみ残す
         # (ok/empty/error は除去)。全件一括でないため未処理を消さないのが要点。
+        # dry-run は保存しない(LISTING未作成のままokをキューから消す事故防止 2026-07-25)。
         new_q = {lid: meta for lid, meta in queue.items()
                  if lid not in processed_lids}
         for r in results:
             if r["status"] == "not_ready":
                 new_q[r["login_id"]] = queue.get(r["login_id"], {})
-        _save_queue(new_q)
+        if dry_run:
+            print("[collect] dry-run のためキュー更新はスキップ(保持)", flush=True)
+        else:
+            _save_queue(new_q)
         ok = sum(1 for r in results if r["status"] == "ok")
         ng = sum(1 for r in results if r["status"] == "error")
         nr = sum(1 for r in results if r["status"] == "not_ready")

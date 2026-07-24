@@ -104,8 +104,13 @@ jobs:
           [ -z "$APPSCUT" ] && APPSCUT=$(date -u -d '60 days ago' +%Y-%m-%d)
           # hr_watcher は --dry-run/--actual 両対応、aw_orchestrator は --actual のみ
           # (dry-runが既定) なので媒体別にフラグを分ける。
-          FLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "--dry-run")
-          AWFLAG=$([ "${{ inputs.dry_run }}" = "false" ] && echo "--actual" || echo "")
+          # schedule実行は本番automation = 常にactual (2026-07-25: inputs無し→dry-run既定に
+          # 落ち、dry-run collectがLISTINGを作らずキューだけ消費する事故が起きた)。
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.dry_run }}" = "false" ]; then
+            FLAG="--actual"; AWFLAG="--actual"
+          else
+            FLAG="--dry-run"; AWFLAG=""
+          fi
           TGT=$([ -n "$TARGET" ] && echo "--target-login-ids $TARGET" || echo "--from-active-deals")
           # incremental: 全社一斉を避け既定20社/run(未指定時)。ローテーションで全社を順次。
           LIM=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 20")

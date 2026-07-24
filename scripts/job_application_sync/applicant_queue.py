@@ -34,14 +34,57 @@ Q_STATUS = 1
 Q_PAYLOAD = 7
 Q_ROUTE = 8
 
-# account_loader シート 列 index (実測 2026-07-07)
-A_COMP = 2
-A_CLOSED = 7
-A_RECLOG = 8      # リクロジアドレス (弊社割当の一意顧客キー。ヘッダは's'に改変されているが本来これ)
-A_AID = 10        # AirWork ID (A系)
-A_BID = 15        # 企業AirWork ID (B系)
-A_BPW = 16        # 企業Airwork PW (B系)
-A_ALIAS = 17      # エイリアスアドレス
+# 顧客管理シートの列は「位置ハードコード禁止」(2026-07-25)。
+# 実害: 「権限共有」列の挿入で会社名が index2→3 にズレ、A_COMP=2 が
+# チェックボックス(TRUE/FALSE)を会社名として読み company_exact 突合が全滅
+# (解決206→100社/unresolved 188→332 に劣化)。シート1と同じ思想で
+# ヘッダ名+内容から動的解決する。→[[feedback_no_positional_hardcode_sheets]]
+_A_HDR = {                     # ヘッダ名で引く列 (正規化=空白/改行除去)
+    "closed": ("クローズ",),
+    "reclog": ("リクロジアドレス",),
+    "aid": ("AirWorkID",),
+    "bid": ("企業AirWorkID",),
+    "bpw": ("企業AirworkPW",),
+    "alias": ("エイリアスアドレス",),
+}
+_A_COMP_PAT = re.compile(r"株式会社|有限会社|合同会社|協同組合")
+
+
+def _resolve_account_columns(header: list, rows: list) -> dict:
+    """顧客管理シートの列位置を ヘッダ名+内容 で動的特定して {name: index} を返す。
+
+    会社名列はヘッダが空のため内容(社名パターンの出現数が最多の列)で特定する。
+    必須列が見つからなければ明示エラー(位置依存へ黙って落とさない)。
+    """
+    def _nh(h: str) -> str:
+        return re.sub(r"[\s　]", "", str(h or ""))
+    hmap: dict = {}
+    for i, h in enumerate(header):
+        k = _nh(h)
+        if k and k not in hmap:
+            hmap[k] = i
+    cols: dict = {}
+    for name, names in _A_HDR.items():
+        cols[name] = next((hmap[_nh(n)] for n in names if _nh(n) in hmap), None)
+    # 会社名: ヘッダ名で引けない(ヘッダ空)ため、ヘッダ空の列のうち
+    # 社名パターン最多の列を採用 (HS名等の別名付き列を誤って拾わない)。
+    taken = {v for v in cols.values() if v is not None}
+    ncol = max((len(r) for r in rows), default=0)
+    best, best_hits = None, 0
+    for ci in range(ncol):
+        if ci in taken or _nh(header[ci] if ci < len(header) else ""):
+            continue  # ヘッダ名のある列は対象外
+        hits = sum(1 for r in rows
+                   if len(r) > ci and _A_COMP_PAT.search(str(r[ci])))
+        if hits > best_hits:
+            best, best_hits = ci, hits
+    cols["comp"] = best
+    missing = [k for k, v in cols.items() if v is None]
+    if missing:
+        raise RuntimeError(
+            f"顧客管理シートの列を特定できず: {missing} "
+            f"(header={[_nh(h) for h in header[:20]]})")
+    return cols
 
 
 def _norm(s: str) -> str:
@@ -144,23 +187,27 @@ class AccountResolver:
         self.idx_aid: dict[str, list] = {}
         self.idx_reclog: dict[str, list] = {}
         self.idx_comp: dict[str, list] = {}
+        self.cols: dict = {}
 
     def build(self) -> "AccountResolver":
         gc = _sheets_client()
         av = gc.open_by_key(al.SHEET_ID).sheet1.get_all_values()
+        # 列はヘッダ名+内容で動的解決 (位置ハードコード禁止。列挿入に耐える)
+        self.cols = _resolve_account_columns(av[0] if av else [], av[1:])
+        c = self.cols
         for r in av[1:]:
             g = lambda i: r[i] if len(r) > i else ""  # noqa: E731
-            for a in _split_multi(g(A_ALIAS)):
+            for a in _split_multi(g(c["alias"])):
                 if "@" in a:
                     self.idx_alias[_norm(a)] = r
-            for b in _split_multi(g(A_BID)):
+            for b in _split_multi(g(c["bid"])):
                 self.idx_bid[_norm(b)] = r
-            if g(A_AID).strip():
-                self.idx_aid[_norm(g(A_AID))] = r
-            if g(A_RECLOG).strip():
-                self.idx_reclog[_norm(g(A_RECLOG))] = r
-            if g(A_COMP).strip():
-                self.idx_comp[_norm(g(A_COMP))] = r
+            if g(c["aid"]).strip():
+                self.idx_aid[_norm(g(c["aid"]))] = r
+            if g(c["reclog"]).strip():
+                self.idx_reclog[_norm(g(c["reclog"]))] = r
+            if g(c["comp"]).strip():
+                self.idx_comp[_norm(g(c["comp"]))] = r
         return self
 
     def resolve(self, item: QueueItem) -> Optional[ResolvedAccount]:
@@ -180,12 +227,13 @@ class AccountResolver:
         if row is None:
             return None
         g = lambda i: row[i] if len(row) > i else ""  # noqa: E731
-        b_ids = _split_multi(g(A_BID))
+        c = self.cols
+        b_ids = _split_multi(g(c["bid"]))
         return ResolvedAccount(
-            company=g(A_COMP),
+            company=g(c["comp"]),
             b_ids=b_ids,
-            b_pw=g(A_BPW),
-            closed=g(A_CLOSED).upper() == "TRUE",
+            b_pw=g(c["bpw"]),
+            closed=g(c["closed"]).upper() == "TRUE",
             matched_by=by,
         )
 

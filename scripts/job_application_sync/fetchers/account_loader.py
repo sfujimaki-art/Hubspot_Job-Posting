@@ -159,10 +159,28 @@ def _select_credentials(
     return None
 
 
+_COMPANY_PAT = re.compile(r"株式会社|有限会社|合同会社|協同組合")
+
+
+def _detect_company_key(records: list[dict]) -> str:
+    """会社名列のキーを内容で特定 (ヘッダ空=_COLn_ のため位置固定できない)。
+
+    「権限共有」列の挿入で会社名が _COL2_→_COL3_ にズレた実害(2026-07-25)への
+    恒久対処。空ヘッダ(_COLn_)キーのうち社名パターン最多のキーを採用。"""
+    from collections import Counter
+    hits: Counter = Counter()
+    for r in records[:300]:
+        for k, v in r.items():
+            if str(k).startswith("_COL") and _COMPANY_PAT.search(str(v or "")):
+                hits[k] += 1
+    return hits.most_common(1)[0][0] if hits else COL_COMPANY
+
+
 def _iter_records(
     records: list[dict], active_only: bool, prefer: str
 ) -> Iterator[dict]:
     """テスト容易性のため records 引数版を分離 (mock 注入可能)."""
+    comp_key = _detect_company_key(records)
     for r in records:
         if active_only:
             closed_v = _get_field(r, COL_CLOSED).upper()
@@ -172,11 +190,13 @@ def _iter_records(
         if not chosen:
             continue
         yield {
-            "company_name": _get_field(r, COL_COMPANY, "会社名"),
+            "company_name": _get_field(r, comp_key, "会社名"),
             "login_id": chosen[0],
             "password": chosen[1],  # 注: ログ / stdout 出力禁止
             "source": chosen[2],
-            "manage_mail": _get_field(r, COL_MANAGE_MAIL).strip().lower(),
+            # ヘッダ改名('s'→'リクロジアドレス')にも位置(_COL8_)にも耐える二段引き
+            "manage_mail": _get_field(
+                r, "リクロジアドレス", COL_MANAGE_MAIL).strip().lower(),
         }
 
 
