@@ -604,7 +604,8 @@ def relink(dry_run: bool = False, limit: int = 1000,
                 "https://api.hubapi.com/crm/v3/objects/0-420/search",
                 headers=H, json={"filterGroups": [{"filters": [
                     {"propertyName": prop, "operator": "IN", "values": chunk}]}],
-                    "properties": [prop, "ichijitaiounoumu_deforuto"],
+                    "properties": [prop, "ichijitaiounoumu_deforuto",
+                                   "hubspot_owner_id"],
                     "limit": 200}, timeout=30).json()
             for o in r.get("results", []):
                 p = o.get("properties") or {}
@@ -612,7 +613,8 @@ def relink(dry_run: bool = False, limit: int = 1000,
                 if not v:
                     continue
                 m[v] = None if v in m else (
-                    o["id"], p.get("ichijitaiounoumu_deforuto"))  # 2件目=曖昧
+                    o["id"], p.get("ichijitaiounoumu_deforuto"),
+                    p.get("hubspot_owner_id"))  # 2件目=曖昧
             time.sleep(0.1)
         return m
     hr_map = _listing_map([j for _, j, ish in targets if ish], "id_hrhakkaa")
@@ -629,12 +631,14 @@ def relink(dry_run: bool = False, limit: int = 1000,
         if hit is None:            # 曖昧(複数LISTING)は§24で紐付けない
             ambiguous += 1
             continue
-        lid, ichijitaiou = hit
+        lid, ichijitaiou, l_owner = hit
         if not dry_run:
             cli.associate_appointment_to_listing(appt_id, lid)
             props = {"kokyakushiitotenkijoukyou": "未転記"}
             if ichijitaiou in ("必要", "不要"):
                 props["ichijitaiounoumu"] = ichijitaiou   # 求人→応募 引き継ぎ
+            if l_owner:
+                props["hubspot_owner_id"] = l_owner       # 担当者も求人から継承
             # 応募先求人情報11項目も引き継ぐ (AWのlogin_idは対象外appt側に無いため
             # LISTING直読み+HR関連付けのみ。best-effort)
             media = "HRハッカー" if is_hr else "AirWork"

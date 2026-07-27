@@ -99,7 +99,7 @@ def build_login_to_mail() -> dict:
 
 
 def _existing_deal_assoc(listing_ids: list) -> dict:
-    """LISTING → Deal 関連の有無を batch/read。{lid: bool}."""
+    """LISTING → Deal 関連を batch/read。{lid: deal_id} (無関連は載らない)."""
     has = {}
     for i in range(0, len(listing_ids), 100):
         chunk = listing_ids[i:i + 100]
@@ -107,7 +107,10 @@ def _existing_deal_assoc(listing_ids: list) -> dict:
             f"{BASE}/crm/v4/associations/0-420/0-3/batch/read", headers=_h(),
             json={"inputs": [{"id": x} for x in chunk]}, timeout=30).json()
         for res in r.get("results", []):
-            has[str(res.get("from", {}).get("id"))] = bool(res.get("to"))
+            to = res.get("to") or []
+            if to:
+                has[str(res.get("from", {}).get("id"))] = str(
+                    to[0].get("toObjectId"))
         time.sleep(0.1)
     return has
 
@@ -122,7 +125,8 @@ def _associate(listing_id: str, deal_id: str) -> bool:
 
 def run(dry_run: bool = True, limit=None) -> dict:
     listings = _search_all(
-        "0-420", ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa"],
+        "0-420", ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
+                  "hubspot_owner_id"],
         [{"propertyName": "hs_object_id", "operator": "HAS_PROPERTY"}], limit)
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
@@ -132,6 +136,7 @@ def run(dry_run: bool = True, limit=None) -> dict:
     login2mail = build_login_to_mail()
 
     hr_ok = aw_ok = already = unresolved = 0
+    created = {}   # 今回作成した lid→deal_id (所有者継承パスで使用)
     for o in listings:
         lid = o["id"]
         if has.get(lid):
@@ -156,13 +161,49 @@ def run(dry_run: bool = True, limit=None) -> dict:
                 unresolved += 1
                 continue
             time.sleep(0.05)
+        created[lid] = str(deal_id)
         if path == "hr":
             hr_ok += 1
         else:
             aw_ok += 1
+
+    # ── 所有者継承 (2026-07-27 ユーザー要望): LISTING.owner が空なら親Deal.owner ──
+    # 取引→求人→応募者チェーンの1段目。2段目(求人→応募者)は applicant_import/relink。
+    pairs = dict(has)
+    pairs.update(created)
+    deal_ids = sorted(set(pairs.values()))
+    downer = {}
+    for i in range(0, len(deal_ids), 100):
+        chunk = deal_ids[i:i + 100]
+        r = requests.post(
+            f"{BASE}/crm/v3/objects/0-3/batch/read", headers=_h(),
+            json={"inputs": [{"id": d} for d in chunk],
+                  "properties": ["hubspot_owner_id"]}, timeout=30).json()
+        for o in r.get("results", []):
+            v = (o.get("properties") or {}).get("hubspot_owner_id")
+            if v:
+                downer[str(o["id"])] = v
+        time.sleep(0.1)
+    lowner = {o["id"]: (o.get("properties") or {}).get("hubspot_owner_id")
+              for o in listings}
+    to_set = [(lid, downer[did]) for lid, did in pairs.items()
+              if did in downer and not lowner.get(lid)]
+    owner_set = 0
+    if not dry_run:
+        for i in range(0, len(to_set), 100):
+            chunk = to_set[i:i + 100]
+            r = requests.post(
+                f"{BASE}/crm/v3/objects/0-420/batch/update", headers=_h(),
+                json={"inputs": [
+                    {"id": lid, "properties": {"hubspot_owner_id": ow}}
+                    for lid, ow in chunk]}, timeout=30)
+            if r.ok:
+                owner_set += len(chunk)
+            time.sleep(0.2)
     summary = {"listings": len(lids), "already_linked": already,
                "hr_associated": hr_ok, "aw_associated": aw_ok,
-               "unresolved": unresolved}
+               "unresolved": unresolved,
+               "owner_target": len(to_set), "owner_set": owner_set}
     print(f"[sync_deal_association] {summary}", flush=True)
     return summary
 

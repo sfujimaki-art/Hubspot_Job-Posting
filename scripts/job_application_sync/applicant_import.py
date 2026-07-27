@@ -124,6 +124,13 @@ HR_APPLICANT_COLUMNS = {
     "電話番号": "電話",
     "メールアドレス": "メール",
     "応募日時": "応募日",
+    # 応募者属性 (2026-07-27 ユーザー要望: 分析用に住所3分割+基本属性を格納)
+    "性別": "性別",
+    "生年月日": "生年月日",
+    "郵便番号": "郵便番号",
+    "都道府県": "都道府県",
+    "市区町村": "市区町村",
+    # 丁目/番地/建物名 は _convert_raw_media_rows で「以下住所」に結合
 }
 
 # AirWORK応募CSV (utf-8 BOM, 59列, 全セル二重引用符)。生列名 → 汎用キー。
@@ -134,6 +141,12 @@ AW_APPLICANT_COLUMNS = {
     "電話番号": "電話",
     "メールアドレス": "メール",
     "応募日時": "応募日",
+    # 応募者属性。AWの住所は1フィールド → _to_applicant_row で3分割パース
+    "性別": "性別",
+    "生年月日": "生年月日",
+    "年齢": "年齢",
+    "郵便番号": "郵便番号",
+    "住所": "住所全体",
 }
 
 # detect_media_from_header の戻り値 → 列マッピング
@@ -165,6 +178,11 @@ def _convert_raw_media_rows(raw_rows: list[dict], media: str) -> list[dict]:
     for r in raw_rows:
         g = {generic: str(r.get(raw) or "").strip() for raw, generic in colmap.items()}
         g["媒体名"] = media  # normalize_media で enum 正規値 (AirWORK→AirWork) に揃う
+        if media == "HRハッカー":
+            # 丁目/番地/建物名 → 市区町村以下住所 に結合 (HRは住所が分離済み)
+            g["以下住所"] = " ".join(
+                s for s in (str(r.get(c) or "").strip()
+                            for c in ("丁目", "番地", "建物名")) if s)
         out.append(g)
     return out
 
@@ -184,6 +202,14 @@ class ApplicantRow:
     media_job_id: str
     airwork_login_id: str = ""  # AW のみ
     raw_lineno: int = 0
+    # 応募者属性 (2026-07-27: 分析用。空=CSVに無し→プロパティ送信しない)
+    gender: str = ""           # 男/女/その他/未回答 (正規化済み)
+    birthdate: str = ""        # YYYY-MM-DD
+    age: str = ""              # 数値文字列 (AW直接 or 生年月日から計算)
+    postal: str = ""           # 郵便番号
+    pref: str = ""             # 都道府県
+    city: str = ""             # 市区町村
+    addr_rest: str = ""        # 市区町村以下住所 (丁目番地建物)
 
 
 @dataclass
@@ -213,6 +239,8 @@ class HubSpotClient(Protocol):
     def create_appointment(self, properties: dict) -> str: ...
     def associate_appointment_to_listing(self, appointment_id: str, listing_id: str) -> None: ...
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]: ...
+    def get_listing_owner(self, listing_id: str) -> Optional[str]: ...
+    def update_appointment(self, appointment_id: str, properties: dict) -> None: ...
     def get_oubosaki_props(self, listing_id: str, media: str, login_id: str, media_job_id: str) -> dict: ...
     def copy_listing_note(self, listing_id: str, appointment_id: str) -> Optional[str]: ...
 
@@ -301,6 +329,17 @@ class DryRunClient:
 
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]:
         return None  # ドライランでは求人フラグ取得なし
+
+    def get_listing_owner(self, listing_id: str) -> Optional[str]:
+        # ドライランでは注入辞書(listing_owners)から返す (テスト用)。既定None
+        return getattr(self, "listing_owners", {}).get(listing_id)
+
+    def update_appointment(self, appointment_id: str, properties: dict) -> None:
+        # dup時の欠損補完 (記録のみ)
+        if not hasattr(self, "updated_appts"):
+            self.updated_appts = []
+        self.updated_appts.append({"id": appointment_id,
+                                   "properties": properties})
 
     def get_oubosaki_props(self, listing_id: str, media: str,
                            login_id: str, media_job_id: str) -> dict:
@@ -461,6 +500,24 @@ class RealHubSpotClient:
             return (r.json().get("properties") or {}).get("ichijitaiounoumu_deforuto")
         except Exception:  # noqa: BLE001
             return None
+
+    def get_listing_owner(self, listing_id: str) -> Optional[str]:
+        """紐付く求人(LISTING)の所有者(親取引から継承)を取得。取得失敗はNone。"""
+        try:
+            url = (f"{self.BASE}/crm/v3/objects/0-420/{listing_id}"
+                   f"?properties=hubspot_owner_id")
+            r = self._requests.get(url, headers=self.headers, timeout=30)
+            r.raise_for_status()
+            return (r.json().get("properties") or {}).get("hubspot_owner_id")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def update_appointment(self, appointment_id: str, properties: dict) -> None:
+        """既存APPOINTMENTのプロパティ更新 (dup時の欠損補完用)。"""
+        url = f"{self.BASE}/crm/v3/objects/0-421/{appointment_id}"
+        r = self._requests.patch(url, headers=self.headers,
+                                 json={"properties": properties}, timeout=30)
+        r.raise_for_status()
 
     def _resolve_deal_props(self, listing_id: str, media: str,
                             login_id: str) -> dict:
@@ -626,6 +683,56 @@ def normalize_media(s: str) -> str:
     return MEDIA_NAME_ALIAS.get(low, raw)
 
 
+_PREFS = ("北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+          "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+          "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+          "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+          "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+          "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+          "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県")
+# 市区町村: 「〇〇郡△△町」は郡ごと1単位。政令市の「〇〇市△△区」は市まで。
+_CITY_RE = re.compile(r"^(.+?郡.+?[町村]|.+?[市区町村])")
+
+
+def split_jp_address(addr: str) -> tuple[str, str, str]:
+    """日本の住所文字列を (都道府県, 市区町村, 以下住所) に分割 (AW用ベストエフォート)。
+
+    都道府県が先頭に無い場合は空、市区町村が切り出せない場合は残り全部を以下住所へ
+    (誤分割で情報を失わない方針)。"""
+    addr = (addr or "").strip()
+    if not addr:
+        return "", "", ""
+    pref = next((p for p in _PREFS if addr.startswith(p)), "")
+    rest = addr[len(pref):].strip()
+    m = _CITY_RE.match(rest)
+    if m:
+        return pref, m.group(1), rest[m.end():].strip()
+    return pref, "", rest
+
+
+def normalize_gender(s: str) -> str:
+    """性別を enum 正規値 (男/女/その他/未回答) に。不明値は空 (送信しない)。"""
+    v = (s or "").strip()
+    if v in ("男", "男性"):
+        return "男"
+    if v in ("女", "女性"):
+        return "女"
+    if v in ("その他", "未回答"):
+        return v
+    return ""
+
+
+def compute_age(birthdate_iso: str, on_date_iso: str) -> str:
+    """生年月日(YYYY-MM-DD)から on_date 時点の満年齢。計算不能は空。"""
+    try:
+        b = datetime.strptime(birthdate_iso, "%Y-%m-%d")
+        o = datetime.strptime(on_date_iso, "%Y-%m-%d")
+        age = o.year - b.year - ((o.month, o.day) < (b.month, b.day))
+        return str(age) if 0 <= age <= 120 else ""
+    except (ValueError, TypeError):
+        return ""
+
+
 def normalize_date(s: str) -> str:
     """応募日: YYYY-MM-DD で返す。失敗時は原文 strip 返却。"""
     if not s:
@@ -675,16 +782,34 @@ def load_applicants_csv(path: Path) -> list[ApplicantRow]:
 
     out = []
     for i, r in enumerate(raw_rows, start=2):  # 2 = header行を1としてデータ先頭
+        def s(key):
+            return str(r.get(key) or "").strip()
+        apply_date = normalize_date(r.get("応募日"))
+        birthdate = normalize_date(r.get("生年月日"))
+        if len(birthdate) != 10:   # 失敗時は原文返却仕様のためISO形のみ採用
+            birthdate = ""
+        # 住所: HRは分離済み列 / AWは「住所全体」1フィールドをパース
+        pref, city, addr_rest = s("都道府県"), s("市区町村"), s("以下住所")
+        if not (pref or city or addr_rest) and s("住所全体"):
+            pref, city, addr_rest = split_jp_address(s("住所全体"))
+        age = s("年齢") if s("年齢").isdigit() else compute_age(birthdate, apply_date)
         out.append(ApplicantRow(
-            name=str(r.get("応募者氏名") or "").strip(),
-            kana=str(r.get("カナ") or "").strip(),
+            name=s("応募者氏名"),
+            kana=s("カナ"),
             phone=normalize_phone(r.get("電話")),
             email=normalize_email(r.get("メール")),
-            apply_date=normalize_date(r.get("応募日")),
+            apply_date=apply_date,
             media=normalize_media(r.get("媒体名")),
-            media_job_id=str(r.get("媒体求人ID") or "").strip(),
-            airwork_login_id=str(r.get("airwork_account_login_id") or "").strip(),
+            media_job_id=s("媒体求人ID"),
+            airwork_login_id=s("airwork_account_login_id"),
             raw_lineno=i,
+            gender=normalize_gender(s("性別")),
+            birthdate=birthdate,
+            age=age,
+            postal=s("郵便番号"),
+            pref=pref if pref in _PREFS else "",
+            city=city,
+            addr_rest=addr_rest,
         ))
     return out
 
@@ -693,7 +818,8 @@ def load_applicants_csv(path: Path) -> list[ApplicantRow]:
 # APPOINTMENT プロパティ構築
 # ============================================================================
 def build_appointment_properties(
-    row: ApplicantRow, *, linked: bool, ichijitaiou: Optional[str] = None
+    row: ApplicantRow, *, linked: bool, ichijitaiou: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ) -> dict:
     """ApplicantRow から APPOINTMENT 書込用プロパティを構築。
 
@@ -719,7 +845,24 @@ def build_appointment_properties(
         # 未設定だとボード表示のどの列にも現れず「登録されていない」ように見える。
         "hs_pipeline": APPLICANT_PIPELINE_ID,
         "hs_pipeline_stage": APPLICANT_STAGE_OUBOUKETSUKE,
+        # 応募者属性 (2026-07-27: 分析用。住所は3分割=都道府県/市区町村/以下住所)
+        "seibetsu": row.gender,
+        "seinengappi": row.birthdate,
+        "nenrei": row.age,
+        "yuubinbangou": row.postal,
+        "todoufuken": row.pref,
+        "shikuchouson": row.city,
+        "shikuchousonikajuusho": row.addr_rest,
+        # 応募経路: 全応募が求人媒体経由のため job_board 固定 (媒体の詳細は
+        # oubobaitaimei が保持。2026-07-27 ユーザー確定)
+        "yingmujinglu": "job_board",
+        # 応募開始(デフォルトカード表示用)。00:00 UTC=09:00 JST で日付ズレなし
+        "hs_appointment_start": (f"{row.apply_date}T00:00:00Z"
+                                 if len(row.apply_date) == 10 else ""),
     }
+    # 担当者 = 紐付いた求人の所有者 (親取引から継承されたもの)。未特定時は未設定
+    if owner_id:
+        props["hubspot_owner_id"] = owner_id
     # 求人側の一次対応フラグ(必要/不要)を応募者に引き継ぐ。unset/None は入れない。
     if ichijitaiou in ("必要", "不要"):
         props["ichijitaiounoumu"] = ichijitaiou
@@ -784,6 +927,26 @@ def process_applicant(
         row.media, row.media_job_id, row.phone, row.email, apply_date=row.apply_date
     )
     if existing:
+        # dup時バックフィル (2026-07-27): スキップでなく既存レコードの応募者属性を補完。
+        # AW過去分はこの経路で5分サイクルが自然に埋める。値はCSV由来で毎回同一のため
+        # 冪等 (注: これらの分析用属性を手修正すると次回上書きされるトレードオフを受容)。
+        fill = {k: v for k, v in {
+            "seibetsu": row.gender, "seinengappi": row.birthdate,
+            "nenrei": row.age, "yuubinbangou": row.postal,
+            "todoufuken": row.pref, "shikuchouson": row.city,
+            "shikuchousonikajuusho": row.addr_rest,
+            "ouboshashimei_kana": row.kana,
+            "yingmujinglu": "job_board",
+        }.items() if v}
+        if listing_id:
+            own = client.get_listing_owner(listing_id)
+            if own:
+                fill["hubspot_owner_id"] = own
+        if fill:
+            try:
+                client.update_appointment(existing, fill)
+            except Exception:  # noqa: BLE001
+                pass  # 補完はbest-effort (本流のdup判定は維持)
         return ProcessResult(
             status="skip_duplicate",
             applicant_key=applicant_key,
@@ -794,10 +957,12 @@ def process_applicant(
             message=f"既存APPOINTMENT {existing} と (media, media_job_id, 電話, メール) 一致",
         )
 
-    # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグ + 応募先求人情報を引き継ぐ)
+    # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグ + 所有者 + 応募先求人情報を引き継ぐ)
     ichijitaiou = client.get_listing_ichijitaiou(listing_id) if listing_id else None
+    owner_id = client.get_listing_owner(listing_id) if listing_id else None
     props = build_appointment_properties(
-        row, linked=listing_id is not None, ichijitaiou=ichijitaiou)
+        row, linked=listing_id is not None, ichijitaiou=ichijitaiou,
+        owner_id=owner_id)
     if listing_id:
         login_id = row.airwork_login_id or default_login_id
         props.update(client.get_oubosaki_props(
