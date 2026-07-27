@@ -124,10 +124,23 @@ def _associate(listing_id: str, deal_id: str) -> bool:
 
 
 def run(dry_run: bool = True, limit=None) -> dict:
+    _props = ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
+              "hubspot_owner_id"]
     listings = _search_all(
-        "0-420", ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
-                  "hubspot_owner_id"],
+        "0-420", _props,
         [{"propertyName": "hs_object_id", "operator": "HAS_PROPERTY"}], limit)
+    # HubSpot検索は10,000件で頭打ちのため、全量スキャンだけだと新規LISTING
+    # (高いobject id)が永久に走査されない。直近14日作成分を別窓で必ず取り込む
+    # (2026-07-27: 新規AW求人がDeal関連されない実害の是正)。
+    import datetime as _dt
+    since = int((_dt.datetime.now(_dt.timezone.utc)
+                 - _dt.timedelta(days=14)).timestamp() * 1000)
+    recent = _search_all(
+        "0-420", _props,
+        [{"propertyName": "hs_createdate", "operator": "GTE",
+          "value": str(since)}], None)
+    seen = {o["id"] for o in listings}
+    listings += [o for o in recent if o["id"] not in seen]
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
     has = _existing_deal_assoc(lids)

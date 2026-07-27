@@ -239,7 +239,11 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
                 headless=headless, mode=mode,
             )
             xlsx_path = _extract_xlsx_from_zip(zip_or_xlsx)
-            client_code = _extract_client_code(xlsx_path)
+            # LISTINGのlogin表現は bid(顧客管理シートのログインID)に統一(2026-07-27)。
+            # 旧: XLSX内の数値client_codeを渡していたため deal-assoc の
+            # login→管理メール→Deal突合が全滅していた(識別子ズレ)。upsert突合は
+            # id_airwork単独(find_hubspot_jobs)のため表現切替でも重複は生じない。
+            _extract_client_code(xlsx_path)  # 妥当性確認のみ(XLSX形式チェック)
             # fetch_aw_xlsx がセッション中に抽出・キャッシュした採用サイトURLを取得。
             # url_airwork 空欄の求人を slug+求人IDで補完する。
             # (テストで aw_csv_fetcher がスタブの場合は関数が無いので防御的に取得)
@@ -252,8 +256,8 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: awi.run_xlsx(xlsx_path, client_code, dry_run=dry_run,
-                                     **xkw),
+                lambda: awi.run_xlsx(xlsx_path, login_id, dry_run=dry_run,
+                                     strict_client_code=False, **xkw),
             )
             t1 = datetime.now()
             return {

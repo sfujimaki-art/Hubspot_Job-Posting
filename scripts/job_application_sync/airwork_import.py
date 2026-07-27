@@ -479,22 +479,28 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
         chunk = [j for j in media_job_ids[i:i + 100] if j]
         if not chunk:
             continue
-        # AND 条件: 同一 filters 配列内に並べることで AND になる
+        # id_airwork 単独で突合 (2026-07-27)。id_airwork は AirWork 全体で一意
+        # (応募紐付けの id_airwork フォールバックと同じ知見)。旧 AND(login) は
+        # login表現の揺れ(数値client_code vs bid)で不一致→同一求人の重複作成を
+        # 招いていた。同一jidが複数件返る理論ケースは login一致を優先。
         body = {
             "limit": 200,
             "properties": target_props,
             "filterGroups": [{"filters": [
                 {"propertyName": "id_airwork", "operator": "IN", "values": chunk},
-                {"propertyName": PROP_AW_LOGIN_ID, "operator": "EQ", "value": login_id},
             ]}],
         }
         r = requests.post(f"{BASE}/crm/v3/objects/0-420/search",
                           headers=headers, json=body, timeout=30)
         r.raise_for_status()
         for o in r.json().get("results", []):
-            jid = (o.get("properties") or {}).get("id_airwork")
-            if jid:
-                result[jid] = {"id": o["id"], "properties": o.get("properties") or {}}
+            p = o.get("properties") or {}
+            jid = p.get("id_airwork")
+            if not jid:
+                continue
+            prev = result.get(jid)
+            if prev is None or p.get(PROP_AW_LOGIN_ID) == login_id:
+                result[jid] = {"id": o["id"], "properties": p}
         time.sleep(0.1)
     return result
 
@@ -504,7 +510,7 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
 # ============================================================================
 def build_update_props(row: dict, existing_props: dict, today_iso: str,
                        now_iso: str, source_filename: str,
-                       recruit_site_url: str = "") -> dict:
+                       recruit_site_url: str = "", login_id: str = "") -> dict:
     """既存LISTING更新用プロパティ. 既存値保護を適用.
 
     更新対象 (常に更新):
@@ -560,6 +566,12 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
     for hs_prop, v in detail.items():
         if v:
             p[hs_prop] = v
+
+    # login表現の正規化 (2026-07-27): 旧数値client_code格納の既存LISTINGを
+    # bid(顧客管理シートのログインID)へ収束させる。deal-assocのlogin→管理メール
+    # →Deal突合が効くようになる。login_id非空時のみ・値が異なる時のみ書く。
+    if login_id and existing_props.get(PROP_AW_LOGIN_ID) != login_id:
+        p[PROP_AW_LOGIN_ID] = login_id
 
     return p
 
@@ -750,7 +762,8 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
             # 既存: 更新 (ステータス問わず値で上書き)
             props = build_update_props(row, existing[jid]["properties"],
                                        today_iso, now_iso, source_filename,
-                                       recruit_site_url=recruit_site_url)
+                                       recruit_site_url=recruit_site_url,
+                                       login_id=login_id)
             updates.append({"id": existing[jid]["id"], "properties": props})
             update_preview.append({"id_airwork": jid,
                                    "hubspot_id": existing[jid]["id"],
