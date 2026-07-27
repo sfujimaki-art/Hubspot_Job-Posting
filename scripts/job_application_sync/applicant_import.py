@@ -64,6 +64,11 @@ from typing import Any, Iterable, Optional, Protocol
 
 # ---- Association type IDs (Phase 0 実測確定) ------------------------------
 ASSOC_TYPE_ID_APPT_TO_LISTING = 5  # USER_DEFINED 「応募先求人」
+
+# 応募者パイプライン「応募管理」と初期ステージ「応募受付」(2026-07-27 実API取得のID。
+# IDはラベル改名に耐える安定参照。ステージ未設定だとボード表示に現れない)
+APPLICANT_PIPELINE_ID = "t_3c8f8179ebedb62c890f1cf2c73ff9c8"
+APPLICANT_STAGE_OUBOUKETSUKE = "1343099551"  # 応募受付
 ASSOC_TYPE_ID_LISTING_TO_APPT = 6  # USER_DEFINED 「応募」
 
 # HR個別求人URL テンプレ (求人IDを付けるだけ, hrhacker_import と同一)
@@ -710,6 +715,10 @@ def build_appointment_properties(
         # 媒体求人ID を応募求人メモに保持 (全応募)。求人が後から出来た時の
         # 再紐付けスイープ(applicant_sync --relink)がこの値でLISTINGを引く。
         "oubokyuujinmemo": row.media_job_id,
+        # パイプライン初期ステージ = 応募管理/応募受付 (2026-07-27 ユーザー確定)。
+        # 未設定だとボード表示のどの列にも現れず「登録されていない」ように見える。
+        "hs_pipeline": APPLICANT_PIPELINE_ID,
+        "hs_pipeline_stage": APPLICANT_STAGE_OUBOUKETSUKE,
     }
     # 求人側の一次対応フラグ(必要/不要)を応募者に引き継ぐ。unset/None は入れない。
     if ichijitaiou in ("必要", "不要"):
