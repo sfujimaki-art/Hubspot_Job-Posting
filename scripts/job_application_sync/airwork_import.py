@@ -211,6 +211,7 @@ PROP_DOUKI_FILENAME = "douki_moto_filename"             # 同期元ファイル�
 PROP_LAST_SYNCED = "doukisaishuujikoku"                 # 最終同期日 (既存)
 PROP_MEDIA_NAME = "shuyoushukkoubaitai"                 # 主要出稿媒体 (既存enum)
 PROP_AW_LOGIN_ID = "airwork_account_login_id"           # AWアカウントログインID (顧客複合キー)
+PROP_PLACEHOLDER = "placeholder_kyuujin"                # プレースホルダ求人(自動生成)フラグ
 
 
 # ============================================================================
@@ -572,6 +573,12 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
     # →Deal突合が効くようになる。login_id非空時のみ・値が異なる時のみ書く。
     if login_id and existing_props.get(PROP_AW_LOGIN_ID) != login_id:
         p[PROP_AW_LOGIN_ID] = login_id
+
+    # プレースホルダ昇格 (2026-07-29): 応募紐付け用に自動生成した骨組み求人へ
+    # 媒体の実データが入ったらフラグを下ろす(=実求人に昇格)。求人名が入る時のみ。
+    if (str(existing_props.get(PROP_PLACEHOLDER)).lower() == "true"
+            and p.get("hs_name")):
+        p[PROP_PLACEHOLDER] = "false"
 
     return p
 
