@@ -474,6 +474,7 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
         "id_airwork", "hs_name", "url_airwork",
         PROP_HS_KYUUJIN_STATUS, PROP_MEDIA_ORIG_STATUS,
         PROP_KANRI_KUBUN, PROP_AW_LOGIN_ID,
+        PROP_PLACEHOLDER,   # 昇格判定に必要 (2026-07-29)
     ]
     headers = _headers()
     for i in range(0, len(media_job_ids), 100):
