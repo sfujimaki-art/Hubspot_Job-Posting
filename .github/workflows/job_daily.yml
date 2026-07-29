@@ -131,10 +131,13 @@ jobs:
               # 日常の aw-create(--from-active-deals)は温存。
               # mode=full(1ラン内で生成→待機→回収→LISTING化)で完結=キャッシュ共有キューの
               # clobber事故を回避(2026-07-23)。少数/ランで確実に。limit未指定なら3社。
-              LIMA=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 3")
+              # 10社/run × 3回/日 = 30社/日 (2026-07-29 ユーザー決定)。206社を約1週間で
+              # 一巡し、白紙プレースホルダを実求人データへ昇格させる。
+              # mode=full は 1社あたり ~2.5分 → parallel 4 で 10社 ≈ 8-10分 (timeout 30分内)。
+              LIMA=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 10")
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
                 --phase full --from-applications --actual \
-                --applications-cutoff "$APPSCUT" --parallel 3 $LIMA
+                --applications-cutoff "$APPSCUT" --parallel 4 $LIMA
               ;;
             aw-collect)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
