@@ -581,8 +581,9 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
                        recruit_site_url: str = "") -> dict:
     """新規LISTING作成用プロパティ.
 
-    ★ 呼出側で original_status == "02" のみを許可している前提 (§14, §23.2)。
-    01 の新規は本関数を呼ばないこと。
+    ★ 2026-07-29 ルール変更(ユーザー決定): 01(掲載終了)の新規も作成する。
+    旧§14/§23.2は02のみ作成し01を捨てていたため「応募はあるのに求人が無い」
+    状態が構造的に発生していた。status は map_airwork_status で 01→公開終了。
 
     recruit_site_url: AW採用サイトURL(https://arwrk.net/recruit/{slug})。
       入力CSVにURLが無い時、これ+求人IDで個別求人URLを生成する(補完)。
@@ -769,9 +770,14 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
                                    "hubspot_id": existing[jid]["id"],
                                    "properties": props})
         else:
-            # 新規候補: 02 (掲載中) のみ作成
+            # 新規候補: 01(掲載終了)も作成する (2026-07-29 ユーザー決定でルール変更)。
+            # 旧ルール(§14, §23.2)は 02 のみ新規作成し 01 は捨てていたため、
+            # 「応募はあるのに求人がHubSpotに無い」状態が構造的に発生していた
+            # (実測: AW export の84%が01=掲載終了。閉鎖済みもexportには含まれる)。
+            # 求人マスタを媒体と一致させ、応募の紐付け先を常に確保する。
+            # JAS_AW_CREATE_01=0 で旧挙動(02のみ)に戻せる。
             orig = (row.get("original_status") or "").strip()
-            if orig != "02":
+            if orig != "02" and os.environ.get("JAS_AW_CREATE_01", "1") != "1":
                 skipped_01_new.append({"id_airwork": jid,
                                        "original_status": orig,
                                        "reason": "01_or_unknown_new"})
@@ -797,8 +803,10 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
 
     print("\n--- 集計 ---")
     print(f"  更新予定: {len(updates)} 件")
-    print(f"  新規作成予定 (02のみ): {len(creates)} 件")
-    print(f"  01新規スキップ: {len(skipped_01_new)} 件 (§14 ガード)")
+    print(f"  新規作成予定 (01/02とも): {len(creates)} 件")
+    if skipped_01_new:
+        print(f"  01新規スキップ: {len(skipped_01_new)} 件 "
+              f"(JAS_AW_CREATE_01=0 の旧挙動)")
 
     if dry_run:
         log = {
