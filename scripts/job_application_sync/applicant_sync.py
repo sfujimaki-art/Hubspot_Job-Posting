@@ -504,7 +504,12 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     # 許可リスト(CUSTOMER_SHEET_ALLOW)が空なら何もしない。
     if not dry_run:
         try:
-            from . import customer_sheet_sync as css
+            try:
+                from . import customer_sheet_sync as css
+            except ImportError:
+                # CIは `python scripts/job_application_sync/applicant_sync.py`
+                # のスクリプト直実行で親パッケージが無い (2026-08-04 本番初回で検知)
+                import customer_sheet_sync as css  # type: ignore
             cs = css.run_all(dry_run=False)
             summary["customer_sheet"] = {k: cs[k] for k in
                                          ("sheets", "ok", "fail", "wrote")}
