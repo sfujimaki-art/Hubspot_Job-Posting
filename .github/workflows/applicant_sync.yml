@@ -64,7 +64,11 @@ jobs:
       - name: Write SA json
         env:
           SA_JSON_CONTENT: ${{ secrets.GOOGLE_SA_JSON }}
-        run: printf '%s' "$SA_JSON_CONTENT" > /tmp/sa.json   # env経由 (複数行secretをシェル展開で壊さない)
+          SHEET_SA_CONTENT: ${{ secrets.CUSTOMER_SHEET_SA_JSON }}
+        run: |
+          printf '%s' "$SA_JSON_CONTENT" > /tmp/sa.json   # env経由 (複数行secretをシェル展開で壊さない)
+          # 顧客シート転記用SA (rl-saiyokanri/sheet-sync)。未設定なら空ファイル→転記はスキップされる
+          if [ -n "$SHEET_SA_CONTENT" ]; then printf '%s' "$SHEET_SA_CONTENT" > /tmp/sheet_sa.json; fi
       - name: Applicant sync
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
@@ -76,6 +80,10 @@ jobs:
           JAS_APPLICANT_QUEUE_SHEET_ID: ${{ secrets.JAS_APPLICANT_QUEUE_SHEET_ID }}
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+          # 顧客シート転記 (2026-08-04 MVP12社)。ALLOW未設定なら転記しない(安全側)
+          CUSTOMER_SHEET_SA_JSON: /tmp/sheet_sa.json
+          CUSTOMER_SHEET_ALLOW: ${{ secrets.CUSTOMER_SHEET_ALLOW }}
+          CUSTOMER_SHEET_START: "2026-08-04T00:00:00Z"   # 運用開始日(これ以前の作成分は転記しない)
           PYTHONIOENCODING: utf-8
           MODE: ${{ inputs.mode || 'sync' }}
           MEDIA: ${{ inputs.media || 'BOTH' }}

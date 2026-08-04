@@ -499,6 +499,25 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             ledger.save()  # dry-runは台帳を汚さない
     finally:
         lock.release()
+    # ---- 顧客シート転記 (2026-08-04 MVP12社) ----
+    # 本線(HubSpot登録)完了後に実行。転記の失敗は本線を道連れにしない。
+    # 許可リスト(CUSTOMER_SHEET_ALLOW)が空なら何もしない。
+    if not dry_run:
+        try:
+            from . import customer_sheet_sync as css
+            cs = css.run_all(dry_run=False)
+            summary["customer_sheet"] = {k: cs[k] for k in
+                                         ("sheets", "ok", "fail", "wrote")}
+            if cs.get("fail"):
+                slack_notify(dry_run=dry_run, message=
+                    f"⚠️ 顧客シート転記: 失敗{cs['fail']}社 "
+                    f"(成功{cs['ok']}社/追記{cs['wrote']}行) "
+                    f"{'; '.join(cs['errors'][:3])}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[customer_sheet_sync] 全体失敗(本線には影響なし): "
+                  f"{type(e).__name__}: {str(e)[:100]}", flush=True)
+            slack_notify(dry_run=dry_run, message=
+                f"⚠️ 顧客シート転記が全体失敗: {type(e).__name__}")
     print(f"[applicant_sync-done] {summary}", flush=True)
     return summary
 
