@@ -99,7 +99,15 @@ def _post_hs(url: str, body: dict, retries: int = 3) -> dict:
     """
     last = None
     for attempt in range(retries + 1):
-        r = requests.post(url, headers=_h(), json=body, timeout=60)
+        try:
+            r = requests.post(url, headers=_h(), json=body, timeout=60)
+        except requests.RequestException as e:
+            # 一時的なネットワーク断/タイムアウトも再試行 (本番run3で実測)
+            last = f"{type(e).__name__}"
+            if attempt < retries:
+                time.sleep(2 ** attempt * 2)
+                continue
+            break
         # 207 Multi-Status: v4 association batch は一部が紐付き無しでも
         # 207+results で返す(正常系)。実運用dry-runで発見 2026-08-04
         if r.status_code in (200, 207):
@@ -126,6 +134,13 @@ def _exec(req, retries: int = 3):
         except HttpError as e:
             code = getattr(getattr(e, "resp", None), "status", None)
             if code in (429, 500, 502, 503) and attempt < retries:
+                time.sleep(2 ** attempt * 2)
+                continue
+            raise
+        except (TimeoutError, ConnectionError, OSError):
+            # ソケットタイムアウト等の一時障害 (本番run3のホンダ西日本で実測)。
+            # 権限403等は HttpError 側なのでここには来ない = 恒常エラーは隠さない
+            if attempt < retries:
                 time.sleep(2 ** attempt * 2)
                 continue
             raise
