@@ -241,6 +241,8 @@ class HubSpotClient(Protocol):
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]: ...
     def get_listing_owner(self, listing_id: str) -> Optional[str]: ...
     def update_appointment(self, appointment_id: str, properties: dict) -> None: ...
+    def get_appointment_props(self, appointment_id: str,
+                              properties: list) -> dict: ...
     def get_oubosaki_props(self, listing_id: str, media: str, login_id: str, media_job_id: str) -> dict: ...
     def copy_listing_note(self, listing_id: str, appointment_id: str) -> Optional[str]: ...
 
@@ -340,6 +342,11 @@ class DryRunClient:
             self.updated_appts = []
         self.updated_appts.append({"id": appointment_id,
                                    "properties": properties})
+
+    def get_appointment_props(self, appointment_id: str,
+                              properties: list) -> dict:
+        # ドライランでは注入辞書(existing_appt_props)から返す (テスト用)。既定{}
+        return getattr(self, "existing_appt_props", {}).get(appointment_id, {})
 
     def get_oubosaki_props(self, listing_id: str, media: str,
                            login_id: str, media_job_id: str) -> dict:
@@ -518,6 +525,18 @@ class RealHubSpotClient:
         r = self._requests.patch(url, headers=self.headers,
                                  json={"properties": properties}, timeout=30)
         r.raise_for_status()
+
+    def get_appointment_props(self, appointment_id: str,
+                              properties: list) -> dict:
+        """既存APPOINTMENTの現在値取得 (dup補完の既存値保護判定用)。失敗は{}。"""
+        try:
+            url = (f"{self.BASE}/crm/v3/objects/0-421/{appointment_id}"
+                   f"?properties={','.join(properties)}")
+            r = self._requests.get(url, headers=self.headers, timeout=30)
+            r.raise_for_status()
+            return r.json().get("properties") or {}
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _resolve_deal_props(self, listing_id: str, media: str,
                             login_id: str) -> dict:
@@ -927,10 +946,13 @@ def process_applicant(
         row.media, row.media_job_id, row.phone, row.email, apply_date=row.apply_date
     )
     if existing:
-        # dup時バックフィル (2026-07-27): スキップでなく既存レコードの応募者属性を補完。
-        # AW過去分はこの経路で5分サイクルが自然に埋める。値はCSV由来で毎回同一のため
-        # 冪等 (注: これらの分析用属性を手修正すると次回上書きされるトレードオフを受容)。
-        fill = {k: v for k, v in {
+        # dup時バックフィル (2026-07-27, 2026-08-05 既存値保護に是正):
+        # スキップでなく既存レコードの空欄属性を補完する。
+        # ★空欄のみ★: 旧実装は無条件上書きだったが、HR通知メール経路とAW xlsx
+        # 経路で住所の分割精度が異なり、後着の雑な分割が良い値を潰す実害が発生
+        # (2026-08-05 ダイセキ2件で実測)。既存値あり保護ルールに従い、
+        # 値が入っている項目には触れない (手修正も保護される)。
+        cand = {k: v for k, v in {
             "seibetsu": row.gender, "seinengappi": row.birthdate,
             "nenrei": row.age, "yuubinbangou": row.postal,
             "todoufuken": row.pref, "shikuchouson": row.city,
@@ -941,7 +963,12 @@ def process_applicant(
         if listing_id:
             own = client.get_listing_owner(listing_id)
             if own:
-                fill["hubspot_owner_id"] = own
+                cand["hubspot_owner_id"] = own
+        fill = {}
+        if cand:
+            cur = client.get_appointment_props(existing, list(cand))
+            fill = {k: v for k, v in cand.items()
+                    if not str(cur.get(k) or "").strip()}
         if fill:
             try:
                 client.update_appointment(existing, fill)
