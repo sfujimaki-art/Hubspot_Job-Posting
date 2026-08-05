@@ -769,6 +769,70 @@ def normalize_date(s: str) -> str:
 # ============================================================================
 # CSV 読込
 # ============================================================================
+APPLY_TIME_LOG = Path("data/job_application_sync/apply_time_log.jsonl")
+
+
+def append_apply_time_log(csv_path, log_path=None) -> int:
+    """生CSVから応募日時(時刻付き)だけを抽出して jsonl へ追記する。
+
+    なぜ必要か (2026-08-05):
+      媒体CSVの「応募日時」は秒まで持つが、normalize_date() が日付へ切り捨てる
+      ため HubSpot 側に時刻が残らない。一次対応のリソースを応募が実際に来る
+      曜日・時間帯へ配置するには時刻が要るので、取込のついでに記録しておく。
+      (data/ 配下は Actions cache で永続化される。scratchpad は run 終了で消える)
+
+    記録するのは日時・媒体・応募IDのみ。**氏名/電話/メール等のPIIは書かない**
+    (本番リポはPUBLIC)。同一応募IDは再追記しない (冪等)。
+
+    Returns: 追記した件数
+    """
+    log = Path(log_path) if log_path else APPLY_TIME_LOG
+    try:
+        raw_rows: list[dict] = []
+        for enc in ("utf-8-sig", "cp932", "utf-8"):
+            try:
+                with open(csv_path, encoding=enc, newline="") as f:
+                    raw_rows = list(csv.DictReader(f))
+                break
+            except UnicodeDecodeError:
+                continue
+        if not raw_rows:
+            return 0
+        media = detect_media_from_header(raw_rows[0].keys()) or ""
+        # 生ヘッダのまま「応募日時」を読む (変換後は日付へ潰れるため変換前に取る)
+        col = next((c for c in ("応募日時", "応募受付日時")
+                    if c in raw_rows[0]), None)
+        if not col:
+            return 0
+        idcol = next((c for c in ("応募ID", "応募者ID") if c in raw_rows[0]), None)
+        seen = set()
+        if log.exists():
+            with log.open(encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        seen.add(json.loads(line).get("id") or "")
+                    except Exception:  # noqa: BLE001 — 壊れ行は無視して継続
+                        continue
+        added = 0
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f:
+            for r in raw_rows:
+                dt = str(r.get(col) or "").strip()
+                if not dt or len(dt) <= 10:      # 日付のみ = 時刻なしは記録しない
+                    continue
+                rid = str(r.get(idcol) or "").strip() if idcol else ""
+                if rid and rid in seen:
+                    continue
+                if rid:
+                    seen.add(rid)
+                f.write(json.dumps({"id": rid, "media": media, "dt": dt},
+                                   ensure_ascii=False) + "\n")
+                added += 1
+        return added
+    except Exception:  # noqa: BLE001 — 分析用の副産物。本流を絶対に止めない
+        return 0
+
+
 def load_applicants_csv(path: Path) -> list[ApplicantRow]:
     """応募CSVを読込み、正規化済 ApplicantRow リストを返す。
 

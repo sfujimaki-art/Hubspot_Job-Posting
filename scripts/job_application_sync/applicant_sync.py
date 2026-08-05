@@ -227,6 +227,8 @@ def process_aw_account(
             last_err = f"{bid}: {type(e).__name__}: {str(e)[:100]}"
             continue
         rows = ai.load_applicants_csv(str(csv_path))
+        # 応募日時(時刻付き)を分析用に記録 (2026-08-05)。本流に影響しない副産物
+        ai.append_apply_time_log(str(csv_path))
         if dry_run:
             result.update(ok=True, login_id=bid, linked=0, unlinked=len(rows),
                           csv=csv_path.name, total=len(rows))
@@ -307,6 +309,8 @@ def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
         result["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         return result
     rows = ai.load_applicants_csv(str(csv_path))
+    # 応募日時(時刻付き)を分析用に記録 (2026-08-05)。本流に影響しない副産物
+    ai.append_apply_time_log(str(csv_path))
     if dry_run:
         result.update(ok=True, unlinked=len(rows), total=len(rows),
                       csv=csv_path.name)
