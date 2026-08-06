@@ -538,6 +538,30 @@ class RealHubSpotClient:
         except Exception:  # noqa: BLE001
             return {}
 
+    def _pick_latest_deal(self, deal_ids: list) -> Optional[str]:
+        """複数の取引から最新を選ぶ (契約更新で取引が増える運用への対応)。
+
+        取得失敗時は先頭(=最古)にフォールバックする。応募の取込を止めるより
+        従来動作で継続する方が実害が小さいため (取込停止=応募が入らない)。
+        """
+        try:
+            from . import deal_series as _ds
+        except ImportError:  # pragma: no cover — CIはスクリプト直実行
+            import deal_series as _ds  # type: ignore
+        try:
+            r = self._requests.post(
+                f"{self.BASE}/crm/v3/objects/0-3/batch/read",
+                headers=self.headers,
+                json={"inputs": [{"id": x} for x in deal_ids],
+                      "properties": ["dealname", "createdate",
+                                     "contract_start_date"]}, timeout=20)
+            r.raise_for_status()
+            props = {o["id"]: (o.get("properties") or {})
+                     for o in r.json().get("results", [])}
+            return _ds.latest_from_associations(deal_ids, props)
+        except Exception:  # noqa: BLE001
+            return deal_ids[0] if deal_ids else None
+
     def _resolve_deal_props(self, listing_id: str, media: str,
                             login_id: str) -> dict:
         """紐付く求人(LISTING)の取引(Deal)を解決して取引プロパティを返す。
@@ -553,7 +577,14 @@ class RealHubSpotClient:
                 f"{self.BASE}/crm/v4/objects/0-420/{listing_id}/associations/0-3",
                 headers=self.headers, timeout=20).json().get("results", [])
             if a:
-                deal_id = str(a[0].get("toObjectId"))
+                ids = [str(x.get("toObjectId")) for x in a if x.get("toObjectId")]
+                # ★最新の取引を選ぶ (2026-08-06 是正):
+                # association配列は作成順(最古が先頭)で返るため、素朴に [0] を
+                # 採ると常に終了した古い契約を見てしまう。実測で検証40件中40件が
+                # 旧取引の情報を応募者へ転記しており、一次対応の要否判定が
+                # 古い契約条件のまま誤り続けていた。
+                deal_id = self._pick_latest_deal(ids) if len(ids) > 1 else (
+                    ids[0] if ids else None)
         except Exception:  # noqa: BLE001
             pass
         if not deal_id and "Air" in media and login_id:

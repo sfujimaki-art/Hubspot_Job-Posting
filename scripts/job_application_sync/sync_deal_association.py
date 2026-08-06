@@ -109,10 +109,34 @@ def _existing_deal_assoc(listing_ids: list) -> dict:
         for res in r.get("results", []):
             to = res.get("to") or []
             if to:
-                has[str(res.get("from", {}).get("id"))] = str(
-                    to[0].get("toObjectId"))
+                ids = [str(t.get("toObjectId")) for t in to if t.get("toObjectId")]
+                # ★最新の取引を採用 (2026-08-06 是正): association配列は
+                # 作成順(最古が先頭)のため [0] だと終了した契約を掴む。
+                # owner継承が古い担当者を引くのを防ぐ。
+                has[str(res.get("from", {}).get("id"))] = (
+                    _latest_of(ids) if len(ids) > 1 else ids[0])
         time.sleep(0.1)
     return has
+
+
+def _latest_of(deal_ids: list) -> str:
+    """複数取引から最新を選ぶ。取得失敗時は先頭(従来動作)へフォールバック。"""
+    try:
+        from . import deal_series as _ds
+    except ImportError:  # pragma: no cover — CIはスクリプト直実行
+        import deal_series as _ds  # type: ignore
+    try:
+        r = requests.post(f"{BASE}/crm/v3/objects/0-3/batch/read", headers=_h(),
+                          json={"inputs": [{"id": x} for x in deal_ids],
+                                "properties": ["dealname", "createdate",
+                                               "contract_start_date"]},
+                          timeout=30)
+        r.raise_for_status()
+        props = {o["id"]: (o.get("properties") or {})
+                 for o in r.json().get("results", [])}
+        return _ds.latest_from_associations(deal_ids, props) or deal_ids[0]
+    except Exception:  # noqa: BLE001
+        return deal_ids[0]
 
 
 def _associate(listing_id: str, deal_id: str) -> bool:

@@ -49,6 +49,11 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
+try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
+    from . import listing_stage as _stage
+except ImportError:  # pragma: no cover
+    import listing_stage as _stage  # type: ignore
+
 # ============================================================================
 # 環境設定
 # ============================================================================
@@ -170,7 +175,10 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
         return result
     target_props = ["id_hrhakkaa", "hs_name", "url_hrhakkaa",
                     "id_shop_hrhakkaa",
-                    PROP_HS_KYUUJIN_STATUS, PROP_MEDIA_ORIG_STATUS]
+                    PROP_HS_KYUUJIN_STATUS, PROP_MEDIA_ORIG_STATUS,
+                    # ステージ保護判定に必要 (2026-08-06): 現ステージが
+                    # 選考進行中/採用決定なら機械は上書きしない
+                    "hs_pipeline_stage"]
     headers = _headers()
     # IN operator で 100件ずつ検索
     for i in range(0, len(media_job_ids), 100):
@@ -227,6 +235,11 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
     normalized = map_hr_status(row.get("original_status", ""))
     if normalized is not None:
         p[PROP_HS_KYUUJIN_STATUS] = normalized
+        # ステージも追従させる (2026-08-06): kyuujin_status だけ更新して
+        # hs_pipeline_stage を放置していたため「公開終了なのにボードは募集中」
+        # が1,083件溜まっていた。選考進行中/採用決定は人の領域なので保護。
+        p.update(_stage.stage_props(
+            normalized, (existing_props or {}).get("hs_pipeline_stage")))
 
     # 同期管理列
     p[PROP_SAISHUU_CSV_BI] = today_iso
@@ -317,6 +330,8 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
     normalized = map_hr_status(row.get("original_status", ""))
     if normalized is not None:
         p[PROP_HS_KYUUJIN_STATUS] = normalized
+        # 新規作成時からステージを付ける (2026-08-06)。未設定だとボードに出ない
+        p.update(_stage.stage_props(normalized))
 
     # 管理区分・取込理由
     p[PROP_KANRI_KUBUN] = "弊社管理"
