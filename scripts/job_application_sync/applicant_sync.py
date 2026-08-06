@@ -187,7 +187,19 @@ def _missing_aw_listings(job_ids: list[str], token: str) -> list[str]:
 
 def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> int:
     """自己修復: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
-    生成待ちあり(timeout_min分)。欠落時のみ発火。Returns: upsert試行した求人数(近似)."""
+
+    生成待ちあり(timeout_min分)。欠落時のみ発火。
+
+    Returns: **実際に取得できた求人数**。
+
+    ★以前は `len(missing)`(要求した数)を返していたため、ログには常に
+      「求人fetch=24」と出るのに実際は7種しか取れていない、という状態を
+      誰も検知できなかった。2026-08-06 に日本梱包運輸倉庫 真岡営業所で
+      応募97件が宙に浮いたが、その原因は「欲しかった求人IDのうち17種が
+      AirWorkのエクスポートに含まれていなかった」ことで、**その事実が
+      ログにもSlackにも一切残らなかった**のが実質的な問題だった。
+      取れなかったIDを必ず報告する。
+    """
     from scripts.job_application_sync.fetchers import aw_csv_fetcher as awf
     from scripts.job_application_sync.fetchers.aw_orchestrator import (
         _extract_xlsx_from_zip,
@@ -204,7 +216,26 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
     # client_code はXLSX側と異なるため strict_client_code=False。
     air.run_xlsx(xlsx_path, login_id=bid, dry_run=False,
                  strict_client_code=False)
-    return len(missing)
+    # 要求したIDのうち、まだLISTINGが無いもの = 取れなかったもの。
+    # 既存の _missing_aw_listings を再利用する(同じ判定を2度書かない)。
+    still = _missing_aw_listings(missing, os.environ.get("HUBSPOT_ACCESS_TOKEN", ""))
+    got = [x for x in missing if x not in still]
+    if still:
+        msg = (f"⚠️ AirWorkの求人を取得できませんでした (login={bid})\n"
+               f"・要求 {len(missing)}件 / 取得 {len(got)}件 / "
+               f"**取れなかった {len(still)}件**\n"
+               f"・求人ID: {', '.join(still[:12])}"
+               f"{' ほか' + str(len(still) - 12) + '件' if len(still) > 12 else ''}\n"
+               "→ 媒体のエクスポートに含まれていない可能性。"
+               "この求人に紐づく応募は「対象外」で作成され、"
+               "relinkでも救済されません")
+        print(f"[selfheal] {msg}", flush=True)
+        try:
+            slack_notify(msg)
+        except Exception:  # noqa: BLE001
+            pass
+    return len(got)
+
 
 
 def process_aw_account(
@@ -249,7 +280,7 @@ def process_aw_account(
                     result["acquired_job_ids"] = missing  # 過去分救出(ピンポイントrelink)用
                     time.sleep(15)  # HubSpot search index 反映待ち
             except Exception as e:  # noqa: BLE001
-                print(f"  自己修復失敗(応募は続行・対象外→後続relinkで救出): "
+                print(f"  自己修復失敗(応募は続行・対象外->後続relinkで救出): "
                       f"{type(e).__name__}: {str(e)[:80]}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
         cli = ai.RealHubSpotClient(token)
@@ -334,7 +365,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         source: str = "queue", hr_cutoff_iso: str = "") -> dict:
     lock = Lock()
     if not lock.acquire():
-        print("[applicant_sync] 別インスタンス実行中 → skip", flush=True)
+        print("[applicant_sync] 別インスタンス実行中 -> skip", flush=True)
         return {"skipped": True}
     ledger = Ledger()
     out_dir = _REPO / "scratchpad" / "applicant_sync_csv"

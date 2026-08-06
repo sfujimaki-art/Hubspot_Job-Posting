@@ -178,12 +178,32 @@ def _latest_of(deal_ids: list) -> str:
         return deal_ids[0]
 
 
-def _associate(listing_id: str, deal_id: str) -> bool:
-    """LISTING→Deal の default関連を作成。"""
+def _associate(listing_id: str, deal_id: str, retries: int = 4) -> bool:
+    """LISTING→Deal の default関連を作成。
+
+    ★リトライ必須: 数千件を1件ずつPUTするため、途中の1回が通信断で落ちると
+      それまでの処理ごと失われる。実際 2026-08-06 の実行が
+      ConnectionResetError(10054) で中断した。
+    """
     url = (f"{BASE}/crm/v4/objects/0-420/{listing_id}"
            f"/associations/default/0-3/{deal_id}")
-    r = requests.put(url, headers=_h(), timeout=20)
-    return r.status_code in (200, 201)
+    for i in range(retries + 1):
+        try:
+            r = requests.put(url, headers=_h(), timeout=30)
+        except requests.RequestException as e:
+            if i < retries:
+                print(f"    [retry {i+1}/{retries}] {type(e).__name__}: "
+                      f"{2 ** i}秒待って再試行", flush=True)
+                time.sleep(2 ** i)
+                continue
+            return False
+        if r.status_code in (200, 201):
+            return True
+        if r.status_code in (429, 500, 502, 503, 504) and i < retries:
+            time.sleep(2 ** i * 2)
+            continue
+        return False
+    return False
 
 
 def run(dry_run: bool = True, limit=None) -> dict:

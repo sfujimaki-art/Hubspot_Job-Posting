@@ -224,15 +224,22 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
-          #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記 → 検知
+          #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
+          #   → メモの転記 → 検知
           python scripts/job_application_sync/sync_deal_association.py $FLAG || RC_ASSOC=$?
           # 契約更新で新しい取引が作られた際の付け替え。sync_deal_association は
           # 「既に紐付いている求人」をスキップする設計なので、旧取引にぶら下がった
           # ままの求人はこちらでしか拾えない。追加のみ・判定不能はSlack通知。
           python scripts/job_application_sync/relink_to_latest_deal.py $FLAG || RC_RELINK=$?
           python scripts/job_application_sync/sync_ichijitaiou.py $FLAG || RC_ICHIJI=$?
+          # 取引の暗黙知メモを配下の求人へ転記する。
+          # メモの正は取引に置いてある(求人は出し直しで作り替えられるため)。
+          # ここが無いと、取引でメモを直しても現場が見る求人には届かない。
+          # 内容ハッシュで冪等: 同じ内容なら貼らない/変わったら貼り直す。
+          # 紐付けが正しくなった後に走らせる(①②の後)。
+          python scripts/job_application_sync/sync_deal_memo_to_listing.py $FLAG || RC_MEMO=$?
           # 顧客管理シートD列の貼り替えにHubSpotが追従しているかの検知。
           # 検知のみ・自動修正しない(人が編集する場所を機械が上書きしない)。
           python scripts/job_application_sync/check_sheet_url_drift.py $SLACKFLAG || RC_DRIFT=$?
@@ -240,13 +247,14 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
           NG=""
           [ $RC_ASSOC  -ne 0 ] && NG="$NG 求人→取引の紐付け"
           [ $RC_RELINK -ne 0 ] && NG="$NG 最新取引への付け替え"
           [ $RC_ICHIJI -ne 0 ] && NG="$NG 一次対応の転記"
+          [ $RC_MEMO   -ne 0 ] && NG="$NG 暗黙知メモの転記"
           [ $RC_DRIFT  -ne 0 ] && NG="$NG 顧客シートURL乖離の検知"
           [ $RC_HEALTH -ne 0 ] && NG="$NG 健全性チェック"
           if [ -n "$NG" ]; then
