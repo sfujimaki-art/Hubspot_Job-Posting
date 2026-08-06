@@ -38,7 +38,18 @@ _REPO = _HERE.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
+
+# Windowsローカルの既定は cp932。ログ出力の1文字で処理全体が落ちるのは
+# 本末転倒なので明示的に固定する (CIは PYTHONIOENCODING=utf-8 で問題ない)。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 os.environ.setdefault("SHEETS_AUTH_MODE", "sa")
+
+from scripts.job_application_sync.hs_paging import iter_all  # noqa: E402
 
 BASE = "https://api.hubapi.com"
 SHEET_ID_RE = re.compile(r"/d/([A-Za-z0-9_-]{30,})")
@@ -114,31 +125,20 @@ def read_master_links() -> dict:
 
 
 def hubspot_sheet_ids() -> dict:
-    """HubSpotの求人が持つ customer_sheet_url → {シートID: 求人数}。"""
+    """HubSpotの求人が持つ customer_sheet_url → {シートID: 求人数}。
+
+    Search API を使わない理由: customer_sheet_url を持つ求人は実測9,230件で
+    (2026-08-06)、Search の10,000件上限まで残り770件しかない。上限に触れると
+    HTTP 400 が返るが素朴な実装は「次が無い」と区別できず、**検知漏れなのに
+    正常終了して見える**。転記先の誤りを見張る監視自体が黙って壊れるのは
+    最悪なので、上限の無い list API で全件走査する。
+    """
     counts = Counter()
-    after = None
-    while True:
-        b = {"filterGroups": [{"filters": [
-            {"propertyName": "customer_sheet_url", "operator": "HAS_PROPERTY"}]}],
-            "properties": ["customer_sheet_url"], "limit": 100}
-        if after:
-            b["after"] = after
-        for i in range(5):
-            r = requests.post(f"{BASE}/crm/v3/objects/0-420/search",
-                              headers=_h(), json=b, timeout=90)
-            if r.status_code == 200:
-                break
-            time.sleep(2 ** i * 2)
-        j = r.json()
-        for o in j.get("results", []):
-            u = (o.get("properties") or {}).get("customer_sheet_url") or ""
-            m = SHEET_ID_RE.search(u)
-            if m:
-                counts[m.group(1)] += 1
-        after = j.get("paging", {}).get("next", {}).get("after")
-        if not after:
-            break
-        time.sleep(0.12)
+    for o in iter_all("0-420", ["customer_sheet_url"], progress_every=10000):
+        u = (o.get("properties") or {}).get("customer_sheet_url") or ""
+        m = SHEET_ID_RE.search(u)
+        if m:
+            counts[m.group(1)] += 1
     return counts
 
 

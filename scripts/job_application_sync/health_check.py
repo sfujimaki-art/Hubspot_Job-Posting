@@ -1,0 +1,326 @@
+# -*- coding: utf-8 -*-
+"""求人・応募データの健全性チェック (2026-08-06) — 検知のみ。
+
+なぜ「処理が成功したか」ではなく「あるべき状態か」を見るのか:
+  2026-08-06 の調査で、日次処理が3つの壊れ方をしていた。いずれも
+  **エラーを出さず、ログ上は正常**だった:
+
+    1. GASのトリガーが消え、deal-assoc は10日 / ichijitaiou は29日
+       一度も起動されていなかった (成功ログが無いだけで、誰も気づけない)
+    2. Search API の10,000件上限に触れると HTTP 400 が返るが、素朴な実装は
+       「もう次が無い」と区別できず、34,666件中10,000件で完走扱いになる
+    3. メモのコピーは正常に動いていたが、中身が空のテンプレートだった
+
+  「動いたか」を見張る監視はこの3つを全部見逃す。**結果の状態を見る**なら
+  どれも「あるべき値との差分」として現れる。だからこちらを監視する。
+
+閾値を超えたら Slack へ通知する。修正はしない (何を直すかは人が決める)。
+
+使い方:
+  python scripts/job_application_sync/health_check.py           # 検知のみ
+  python scripts/job_application_sync/health_check.py --slack   # Slack通知あり
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+load_dotenv(_REPO / ".env")
+
+# Windowsローカルの既定は cp932 で、"—" のような文字で print が落ちる。
+# 監視スクリプトが出力の文字化けで死ぬのは本末転倒なので明示的に固定する。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # pragma: no cover
+        pass
+
+from scripts.job_application_sync.hs_paging import search_all  # noqa: E402
+from scripts.job_application_sync.listing_stage import (  # noqa: E402
+    PROTECTED_STAGES, STATUS_TO_STAGE)
+
+BASE = "https://api.hubapi.com"
+RECENT_DAYS = 14          # 「最近作られた」の窓
+SEARCH_CAP = 10000        # Search API の上限
+SEARCH_WARN = 9000        # ここを超えたら「いずれ静かに壊れる」と警告
+
+
+def _h() -> dict:
+    tok = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+    if not tok:
+        raise SystemExit("HUBSPOT_ACCESS_TOKEN が未設定です")
+    return {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+
+
+def slack_notify(message: str) -> bool:
+    url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
+    if not url:
+        print(f"[slack未設定] {message[:300]}", flush=True)
+        return False
+    try:
+        return requests.post(url, json={"text": message},
+                             timeout=15).status_code == 200
+    except requests.RequestException as e:
+        print(f"[slack送信失敗] {e}", flush=True)
+        return False
+
+
+def _total(obj: str, filters: list) -> int:
+    """Search の総件数だけを取る (1件だけ引いて total を読む)。"""
+    r = requests.post(f"{BASE}/crm/v3/objects/{obj}/search", headers=_h(),
+                      json={"filterGroups": [{"filters": filters}],
+                            "properties": ["hs_object_id"], "limit": 1},
+                      timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"total {obj} HTTP {r.status_code}: {r.text[:120]}")
+    return int(r.json().get("total") or 0)
+
+
+def _assoc(from_type: str, to_type: str, ids: list) -> dict:
+    """{from_id: [to_id,...]} を batch/read で取る。"""
+    m: dict = {}
+    for i in range(0, len(ids), 100):
+        r = requests.post(
+            f"{BASE}/crm/v4/associations/{from_type}/{to_type}/batch/read",
+            headers=_h(), json={"inputs": [{"id": x} for x in ids[i:i + 100]]},
+            timeout=60)
+        if r.status_code not in (200, 207):
+            raise RuntimeError(f"assoc HTTP {r.status_code}: {r.text[:120]}")
+        for res in r.json().get("results", []):
+            m[str(res["from"]["id"])] = [str(t["toObjectId"])
+                                         for t in (res.get("to") or [])]
+        time.sleep(0.1)
+    return m
+
+
+def _batch_props(obj: str, ids: list, props: list) -> dict:
+    out: dict = {}
+    ids = sorted(set(ids))
+    for i in range(0, len(ids), 100):
+        r = requests.post(f"{BASE}/crm/v3/objects/{obj}/batch/read",
+                          headers=_h(),
+                          json={"properties": props,
+                                "inputs": [{"id": x} for x in ids[i:i + 100]]},
+                          timeout=60)
+        if r.status_code not in (200, 207):
+            raise RuntimeError(f"batch/read HTTP {r.status_code}")
+        for o in r.json().get("results", []):
+            out[str(o["id"])] = o.get("properties") or {}
+        time.sleep(0.1)
+    return out
+
+
+# ---------------------------------------------------------------- 各チェック
+
+def check_stage_consistency() -> dict:
+    """公開状態とボード上のステージが食い違っている求人。
+
+    取込に組み込んだステージ追従が働いていれば 0 件になる。増えていれば
+    取込が止まったか、追従の分岐に漏れがある。
+    """
+    bad = 0
+    detail = []
+    for status, want in STATUS_TO_STAGE.items():
+        n = _total("0-420", [
+            {"propertyName": "kyuujin_status", "operator": "EQ", "value": status},
+            {"propertyName": "hs_pipeline_stage", "operator": "NEQ", "value": want},
+            # ★HubSpot Search の NEQ / NOT_IN は **未設定レコードも一致扱いにする**。
+            #   HAS_PROPERTY を併記しないと、下の「未設定」と同じ件数を二重に数える
+            #   (2026-08-06: 実体24件を48件と報告していた)。
+            {"propertyName": "hs_pipeline_stage", "operator": "HAS_PROPERTY"},
+            # 人が動かしたステージは対象外 (機械は触らない領域)
+            {"propertyName": "hs_pipeline_stage", "operator": "NOT_IN",
+             "values": list(PROTECTED_STAGES)},
+        ])
+        if n:
+            detail.append(f"{status}なのに別ステージ: {n:,}件")
+        bad += n
+    # ステージそのものが未設定 = ボードに出ない
+    unset = _total("0-420", [
+        {"propertyName": "kyuujin_status", "operator": "HAS_PROPERTY"},
+        {"propertyName": "hs_pipeline_stage", "operator": "NOT_HAS_PROPERTY"}])
+    if unset:
+        detail.append(f"ステージ未設定(ボード非表示): {unset:,}件")
+    return {"name": "求人ステージが実態と一致しているか", "value": bad + unset,
+            "want": 0, "detail": detail}
+
+
+def check_recent_listings_linked() -> dict:
+    """最近作られた求人が取引に紐付いているか。
+
+    sync_deal_association / relink_to_latest_deal が動いていれば 0 に近づく。
+    止まれば日々増える = **停止検知を兼ねる**。
+    """
+    since = int((datetime.now(timezone.utc)
+                 - timedelta(days=RECENT_DAYS)).timestamp() * 1000)
+    rows = search_all("0-420", ["hs_name", "kyuujin_status", "hs_createdate"],
+                      [{"propertyName": "hs_createdate", "operator": "GTE",
+                        "value": str(since)}])
+    ids = [o["id"] for o in rows]
+    if not ids:
+        return {"name": f"直近{RECENT_DAYS}日の求人が取引に紐付いているか",
+                "value": 0, "want": 0, "detail": ["対象求人なし"]}
+    assoc = _assoc("0-420", "0-3", ids)
+    # 公開終了は紐付いていなくても実害が小さい(既に募集していない)
+    unlinked = [o for o in rows
+                if not assoc.get(o["id"])
+                and (o.get("properties") or {}).get("kyuujin_status") != "公開終了"]
+    return {"name": f"直近{RECENT_DAYS}日の求人が取引に紐付いているか",
+            "value": len(unlinked), "want": 0,
+            "detail": [f"対象 {len(ids):,}件中 未紐付け {len(unlinked):,}件"]
+                      + [f"  例: {(o.get('properties') or {}).get('hs_name','')[:34]}"
+                         for o in unlinked[:3]]}
+
+
+def check_ichijitaiou_sync() -> dict:
+    """一次対応の要否が、紐づく取引と食い違っている求人。
+
+    sync_ichijitaiou が動いていれば 0。29日止まっていた実績があるので見張る。
+    全件だと重いので直近作成分に絞る (止まれば新しい求人から食い違う)。
+    """
+    since = int((datetime.now(timezone.utc)
+                 - timedelta(days=RECENT_DAYS)).timestamp() * 1000)
+    rows = search_all("0-420", ["ichijitaiounoumu_deforuto"],
+                      [{"propertyName": "hs_createdate", "operator": "GTE",
+                        "value": str(since)}])
+    ids = [o["id"] for o in rows]
+    if not ids:
+        return {"name": "一次対応の要否が取引と一致しているか", "value": 0,
+                "want": 0, "detail": ["対象求人なし"]}
+    assoc = _assoc("0-420", "0-3", ids)
+    deal_ids = [d for v in assoc.values() for d in v]
+    if not deal_ids:
+        return {"name": "一次対応の要否が取引と一致しているか", "value": 0,
+                "want": 0, "detail": ["取引に紐付く求人なし"]}
+    flags = _batch_props("0-3", deal_ids, ["itijitaiou"])
+    mismatch = 0
+    for o in rows:
+        ds = assoc.get(o["id"]) or []
+        if not ds:
+            continue
+        vals = [flags.get(d, {}).get("itijitaiou") for d in ds]
+        want = "必要" if "true" in vals else ("不要" if "false" in vals else None)
+        if want and (o.get("properties") or {}).get(
+                "ichijitaiounoumu_deforuto") != want:
+            mismatch += 1
+    return {"name": "一次対応の要否が取引と一致しているか", "value": mismatch,
+            "want": 0,
+            "detail": [f"直近{RECENT_DAYS}日の求人 {len(ids):,}件中 "
+                       f"食い違い {mismatch:,}件"]}
+
+
+def check_search_cap() -> dict:
+    """本番処理が使っている検索が、10,000件上限に近づいていないか。
+
+    上限に触れた瞬間、処理は**エラーを出さずに一部しか処理しなくなる**。
+    実測 (2026-08-06): customer_sheet_url 持ちの求人が9,230件で残り770件だった。
+    先に気づけるよう、9,000件を超えたクエリを警告する。
+    """
+    queries = [
+        ("納品管理PLの取引 (relink)", "0-3",
+         [{"propertyName": "pipeline", "operator": "EQ", "value": "21596025"}]),
+        ("顧客シートURL持ちの求人 (drift)", "0-420",
+         [{"propertyName": "customer_sheet_url", "operator": "HAS_PROPERTY"}]),
+        ("管理用メール持ちの取引 (ichijitaiou)", "0-3",
+         [{"propertyName": "kanri_mail_address", "operator": "HAS_PROPERTY"}]),
+    ]
+    over, detail = 0, []
+    for label, obj, f in queries:
+        try:
+            n = _total(obj, f)
+        except RuntimeError as e:
+            detail.append(f"{label}: 測定失敗 {e}")
+            continue
+        pct = n * 100 // SEARCH_CAP
+        if n >= SEARCH_CAP:
+            over += 1
+            detail.append(f"★{label}: {n:,}件 = 上限超過。既に取りこぼしています")
+        elif n >= SEARCH_WARN:
+            over += 1
+            detail.append(f"{label}: {n:,}件 (上限の{pct}%) — 近日中に頭打ち")
+        else:
+            detail.append(f"{label}: {n:,}件 (上限の{pct}%)")
+    return {"name": "検索の10,000件上限に近づいていないか", "value": over,
+            "want": 0, "detail": detail}
+
+
+def check_recent_applications_linked() -> dict:
+    """最近の応募が求人に紐付いているか (紐付かないと転記も一次対応も効かない)。"""
+    since = int((datetime.now(timezone.utc)
+                 - timedelta(days=3)).timestamp() * 1000)
+    rows = search_all("0-421", ["hs_createdate"],
+                      [{"propertyName": "hs_createdate", "operator": "GTE",
+                        "value": str(since)}])
+    ids = [o["id"] for o in rows]
+    if not ids:
+        return {"name": "直近3日の応募が求人に紐付いているか", "value": 0,
+                "want": 0, "detail": ["対象応募なし"]}
+    assoc = _assoc("0-421", "0-420", ids)
+    unlinked = [i for i in ids if not assoc.get(i)]
+    return {"name": "直近3日の応募が求人に紐付いているか", "value": len(unlinked),
+            "want": 0,
+            "detail": [f"応募 {len(ids):,}件中 求人未紐付け {len(unlinked):,}件"]}
+
+
+CHECKS = [check_stage_consistency, check_recent_listings_linked,
+          check_ichijitaiou_sync, check_search_cap,
+          check_recent_applications_linked]
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--slack", action="store_true", help="異常をSlackへ通知")
+    ap.add_argument("--out-dir", default="data/job_application_sync")
+    a = ap.parse_args(argv)
+
+    results, failed = [], []
+    for fn in CHECKS:
+        try:
+            r = fn()
+        except Exception as e:  # noqa: BLE001
+            # チェック自体の失敗も隠さない (監視が黙って死ぬのを防ぐ)
+            r = {"name": fn.__name__, "value": -1, "want": 0,
+                 "detail": [f"チェック実行に失敗: {type(e).__name__}: {e}"]}
+            failed.append(fn.__name__)
+        results.append(r)
+        mark = "OK" if r["value"] == r["want"] else ("ERR" if r["value"] < 0 else "NG")
+        print(f"[{mark}] {r['name']}: {r['value']}")
+        for d in r["detail"]:
+            print(f"      {d}")
+
+    bad = [r for r in results if r["value"] != r["want"]]
+    out = Path(a.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    snap = {"checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "results": results}
+    (out / "health_check_latest.json").write_text(
+        json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\n=== {len(results) - len(bad)}/{len(results)} 項目が正常 ===")
+    if a.slack and bad:
+        msg = ["⚠️ 求人・応募データの健全性チェックで異常を検知しました"]
+        for r in bad:
+            msg.append(f"・{r['name']}: {r['value']:,} (あるべき値 {r['want']})")
+            for d in r["detail"][:3]:
+                msg.append(f"　　{d}")
+        msg.append("※ このチェックは「処理が動いたか」ではなく"
+                   "「結果があるべき状態か」を見ています")
+        slack_notify("\n".join(msg))
+    # チェック自体が失敗したらCIを赤くする (監視の無音故障を作らない)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

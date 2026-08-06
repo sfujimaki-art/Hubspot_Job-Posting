@@ -32,6 +32,16 @@ if _ENV.exists():
     load_dotenv(_ENV)
 
 from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
+from scripts.job_application_sync.hs_paging import list_all  # noqa: E402
+
+
+# Windowsローカルの既定は cp932。ログ出力の1文字で処理全体が落ちるのは
+# 本末転倒なので明示的に固定する (CIは PYTHONIOENCODING=utf-8 で問題ない)。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 BASE = "https://api.hubapi.com"
 
@@ -98,14 +108,43 @@ def build_login_to_mail() -> dict:
     return m
 
 
+def _post_retry(url: str, body: dict, retries: int = 5) -> dict:
+    """通信断・レート制限で落ちないPOST。
+
+    34,718件の走査は347回のリクエストになるため、途中で1回でも
+    DNS解決やコネクションが落ちると全体が失敗する。実際に
+    2026-08-06 の実行が getaddrinfo failed で中断した。
+    ネットワーク例外とHubSpot側の一時エラーは待って再試行する。
+    """
+    for i in range(retries + 1):
+        try:
+            r = requests.post(url, headers=_h(), json=body, timeout=60)
+        except requests.RequestException as e:
+            if i < retries:
+                wait = 2 ** i
+                print(f"    [retry {i+1}/{retries}] {type(e).__name__}: "
+                      f"{wait}秒待って再試行", flush=True)
+                time.sleep(wait)
+                continue
+            raise
+        if r.status_code in (200, 201, 207):
+            return r.json() if r.content else {}
+        if r.status_code in (429, 500, 502, 503, 504) and i < retries:
+            time.sleep(2 ** i * 2)
+            continue
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
+    raise RuntimeError("retry exhausted")
+
+
 def _existing_deal_assoc(listing_ids: list) -> dict:
     """LISTING → Deal 関連を batch/read。{lid: deal_id} (無関連は載らない)."""
     has = {}
     for i in range(0, len(listing_ids), 100):
         chunk = listing_ids[i:i + 100]
-        r = requests.post(
-            f"{BASE}/crm/v4/associations/0-420/0-3/batch/read", headers=_h(),
-            json={"inputs": [{"id": x} for x in chunk]}, timeout=30).json()
+        r = _post_retry(f"{BASE}/crm/v4/associations/0-420/0-3/batch/read",
+                        {"inputs": [{"id": x} for x in chunk]})
+        if (i // 100) % 50 == 0:
+            print(f"  [assoc] {i:,}/{len(listing_ids):,}", flush=True)
         for res in r.get("results", []):
             to = res.get("to") or []
             if to:
@@ -150,21 +189,11 @@ def _associate(listing_id: str, deal_id: str) -> bool:
 def run(dry_run: bool = True, limit=None) -> dict:
     _props = ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
               "hubspot_owner_id"]
-    listings = _search_all(
-        "0-420", _props,
-        [{"propertyName": "hs_object_id", "operator": "HAS_PROPERTY"}], limit)
-    # HubSpot検索は10,000件で頭打ちのため、全量スキャンだけだと新規LISTING
-    # (高いobject id)が永久に走査されない。直近14日作成分を別窓で必ず取り込む
-    # (2026-07-27: 新規AW求人がDeal関連されない実害の是正)。
-    import datetime as _dt
-    since = int((_dt.datetime.now(_dt.timezone.utc)
-                 - _dt.timedelta(days=14)).timestamp() * 1000)
-    recent = _search_all(
-        "0-420", _props,
-        [{"propertyName": "hs_createdate", "operator": "GTE",
-          "value": str(since)}], None)
-    seen = {o["id"] for o in listings}
-    listings += [o for o in recent if o["id"] not in seen]
+    # Search API は10,000件で HTTP 400 になり、素朴な実装では「もう次が無い」と
+    # 区別できず静かに完走扱いになる。以前は「直近14日分を別窓で足す」緩和策を
+    # 入れていたが(2026-07-27)、15日以上前に作られて紐付いていない求人は永久に
+    # 拾えないままだった。上限の無い list API に替えて根本を断つ(2026-08-06)。
+    listings = list_all("0-420", _props, limit=limit)
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
     has = _existing_deal_assoc(lids)

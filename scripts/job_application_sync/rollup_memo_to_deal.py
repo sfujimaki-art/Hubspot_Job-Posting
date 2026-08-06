@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import os
 import re
@@ -42,15 +43,54 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
 
+# Windowsローカルの既定は cp932。ログ出力の1文字で処理全体が落ちるのは
+# 本末転倒なので明示的に固定する (CIは PYTHONIOENCODING=utf-8 で問題ない)。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
 BASE = "https://api.hubapi.com"
 # 集約メモの署名 (求人側テンプレと区別し、再実行時の冪等判定に使う)
 ROLLUP_SIGNATURE = "📋 暗黙知メモ（取引単位・配下求人を網羅）"
-# 抽出対象の項目 (求人メモのテンプレ見出し)
-FIELDS = ["年齢", "経験年数", "必須資格", "学歴NG", "前職業界NG", "前職企業NG",
-          "確認事項", "必要書類", "回収タイミング", "提出形式", "確認担当"]
-FIELD_RE = re.compile(r"(" + "|".join(FIELDS) + r")[ \t]*[:：][ \t]*([^\n]*)")
+
+# 抽出対象の項目。**現場の入力テンプレート実物に合わせてある**。
+# 2026-08-06 の逆証明で、当初の11項目では記入率99%の「急ぎ度」「採用優先順位」が
+# 丸ごと落ちていたことが判明した(6,145件のメモを全件パースして実測)。
+# テンプレを推測で写さず、実データの出現数と記入率から決めること。
+FIELD_GROUPS = [
+    ("足切り基準", ["年齢", "性別", "経験年数", "必須資格", "学歴NG",
+                    "前職業界NG", "前職企業NG", "理由", "その他", "自由記述"]),
+    ("書類回収ルール", ["必要書類", "回収タイミング", "提出形式", "確認担当"]),
+    ("優先順位", ["採用優先順位", "急ぎ度", "推薦時の注意点"]),
+    ("一次対応で聞くこと", ["保有資格", "在職の有無", "転職理由・転職可能時期",
+                            "連絡可能時間帯", "面接希望時期（曜日・時間帯）", "備考"]),
+    ("二次面接で聞くこと", ["確認事項"]),
+    ("顧客固有の事情", ["顧客が重視するポイント", "顧客固有の質問事項",
+                        "想定NG・特殊事情", "コンサル所感", "選考フロー",
+                        "応募後の対応"]),
+]
+FIELDS = [f for _g, fs in FIELD_GROUPS for f in fs]
+_FIELD_OF_GROUP = {f: g for g, fs in FIELD_GROUPS for f in fs}
+# 現場の書き癖による項目名のゆれ。正規の項目へ寄せる (実測で判明した分だけ)。
+ALIASES = {"必要資格": "必須資格", "必要経験": "経験年数",
+           "必要免許": "必須資格", "希望年齢": "年齢"}
+# 長い項目名を先に置く (「保有資格」より先に「資格」等が来ると誤マッチする)
+_ALT = "|".join(re.escape(f) for f in
+                sorted(FIELDS + list(ALIASES), key=len, reverse=True))
+FIELD_RE = re.compile(r"(" + _ALT + r")[ \t]*[:：][ \t]*([^\n]*)")
+# 「■ 顧客が重視するポイント（書類選考の評価軸）」のように、コロンを使わず
+# 見出しの直後に本文が来る形式。実測で記入332件(コンサル所感)。
+# 本文は同じ行に続く場合と、次の行に来る場合の両方がある(HTMLの組み方次第)。
+FREE_HEADS = ["顧客が重視するポイント", "顧客固有の質問事項",
+              "想定NG・特殊事情", "コンサル所感"]
 # テンプレの既定選択肢 (これは記入ではない)
 DEFAULT_CHOICE = re.compile(r"^[^/]*/[^/]*/")
+# 「記入なし」を意味する値。矢印付きの書き癖も実データにある。
+EMPTY_VALUES = {"なし", "無し", "特になし", "ナシ", "無", "-", "—", "ー", "－",
+                "→なし", "→特になし", "→無し", "不要", "特になし。"}
 
 
 def _h() -> dict:
@@ -79,55 +119,205 @@ def _post(url: str, body: dict, retries: int = 4):
 
 
 def strip_html(s: str) -> str:
+    """HubSpotのリッチテキスト → 平文。**行の切れ目を必ず復元する**。
+
+    以前は <br> と <p> しか改行にしておらず、実物の
+    `</h3><ul><li><p>年齢</strong>:55歳まで` が
+    `■ 足切り基準（顧客非開示）年齢:55歳まで` と1行に潰れていた。
+    見出しと項目がくっつくと項目名の前方一致が壊れ、抽出漏れになる
+    (2026-08-06 実測)。ブロック要素はすべて改行として扱う。
+    """
     t = re.sub(r"<br\s*/?>", "\n", s or "")
-    t = re.sub(r"</?p>", "\n", t)
-    return re.sub(r"<[^>]+>", "", t)
+    t = re.sub(r"</(p|li|h[1-6]|div|tr|ul|ol|table|blockquote)\s*>", "\n", t)
+    t = re.sub(r"<(p|li|h[1-6]|div|tr)(\s[^>]*)?>", "\n", t)
+    t = re.sub(r"<[^>]+>", "", t)
+    # HubSpotのリッチテキストは実体参照を残す。これを解かないと「&nbsp;対面」と
+    # 「対面」が別値として扱われ、共通項目が「求人別の条件」へ落ちる
+    # (実測: 451件中135件=30%で発生していた 2026-08-06)。
+    # unescape で &nbsp; → U+00A0 になり、後段の NFKC が半角空白へ畳む。
+    return html.unescape(t)
+
+
+def clean_value(v: str) -> str:
+    """記入値のノイズを落とす。
+
+    元データには手入力由来の汚れがある (実測):
+      「:なし」  先頭にコロンが残る
+      「なしなし」同じ語の重複
+      「履歴書／職務経歴書」vs「履歴書 / 職務経歴書」区切りの揺れ
+    これを落とさないと、同じ意味の値が別物として扱われ、本来は共通の項目が
+    「求人別の条件」へ大量に振り分けられてメモが無駄に長くなる。
+    """
+    import unicodedata
+    s = html.unescape(str(v or ""))              # 実体参照 (&nbsp; 等) を解く
+    s = unicodedata.normalize("NFKC", s).strip()  # NBSP→半角空白もここで畳む
+    s = re.sub(r"^[:：\s]+", "", s)              # 先頭のコロン
+    s = re.sub(r"[／/]\s*", " / ", s)            # 区切りを統一
+    s = re.sub(r"\s+", " ", s).strip()
+    # 「対面 /」のように区切りだけ残った末尾を落とす (選択肢を消し残した跡)
+    s = re.sub(r"[\s/／、,，・]+$", "", s).strip()
+    # 「なしなし」のように同じ語が2回続く入力を1つに畳む。
+    # ★汎用の (.{1,4}?)\1 は使わないこと。"55"→"5"、"2020"→"20" のように
+    #   **年齢の足切り基準や年数を破壊する**(2026-08-06 実害: 年齢55が5になった)。
+    #   畳んでよいのは意味が変わらない既知の語だけ。
+    for _w in ("特になし", "なし", "無し", "ナシ"):
+        if s == _w + _w:
+            s = _w
+            break
+    return s
+
+
+def norm_key(v: str) -> str:
+    """比較用の正規化キー。表記ゆれを吸収して同値判定を効かせる。"""
+    s = clean_value(v)
+    s = re.sub(r"[\s　・、,，]", "", s)
+    s = re.sub(r"[~〜～]", "-", s)
+    return s.lower()
+
+
+# 正規化で値が変わった全ケースの記録。
+# なぜ要るか: この関数の「表記ゆれ吸収」が実際には値を壊していた
+# (年齢55→5)。壊れていても集約結果を見ただけでは元の値が分からず気づけない。
+# 変換前後を必ず残し、人が突き合わせられるようにする。
+CHANGED: list = []
 
 
 def extract_fields(text: str) -> dict:
-    """メモ本文 → {項目: 値}。既定選択肢の羅列は記入とみなさない。"""
+    """メモ本文 → {項目: 値}。既定選択肢の羅列は記入とみなさない。
+
+    2形式に対応する:
+      「年齢:55」            … コロン区切り (FIELD_RE)
+      「■ コンサル所感 本文」 … 見出し直後に本文が続く (FREE_RE)
+    """
     out = {}
     for m in FIELD_RE.finditer(text):
-        k, v = m.group(1), m.group(2).strip()
+        k, raw = ALIASES.get(m.group(1), m.group(1)), m.group(2)
+        v = clean_value(raw)
         if not v or DEFAULT_CHOICE.match(v):
             continue
-        out[k] = v
+        if raw.strip() != v:
+            CHANGED.append({"項目": k, "変換前": raw.strip(), "変換後": v})
+        if k in out:
+            # 同じ項目が1つのメモに2回書かれることがある(追記・別名の併存)。
+            # 先勝ち/後勝ちのどちらでも片方が消えるので、違う値なら両方残す。
+            # 実例: 保有資格に「普通自動車免許取得後3年以上」と
+            #       「機械操作に弱くない人（goアプリ）」の2行があった。
+            if norm_key(out[k]) != norm_key(v):
+                out[k] = f"{out[k]} / {v}"
+        else:
+            out[k] = v
+    out.update({k: v for k, v in _extract_free(text).items()
+                if k not in out})
     return out
+
+
+def _extract_free(text: str) -> dict:
+    """見出し形式（コロンなし）の項目を拾う。
+
+    本文は見出しと同じ行に続くことも、次の行に来ることもある。
+    HTMLの組み方で変わるので両方見る。
+    """
+    out: dict = {}
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s.startswith("■"):
+            continue
+        head = re.sub(r"^■[ \t　]*", "", s)
+        name = next((h for h in FREE_HEADS if head.startswith(h)), None)
+        if not name:
+            continue
+        rest = re.sub(r"^■[ \t　]*" + re.escape(name) +
+                      r"(?:[（(][^）)]*[）)])?[ \t　]*[:：]?[ \t　]*", "", s)
+        v = clean_value(rest)
+        if not v:                       # 本文が次の行にある形
+            for j in range(i + 1, min(i + 3, len(lines))):
+                nxt = lines[j].strip()
+                if not nxt:
+                    continue
+                if nxt.startswith("■"):
+                    break
+                v = clean_value(nxt)
+                break
+        if v and not DEFAULT_CHOICE.match(v):
+            out.setdefault(name, v)
+    return out
+
+
+def is_empty_value(v: str) -> bool:
+    """「なし」系＝制限が無いことの表明。値としては持つが、並べると読めない。"""
+    s = clean_value(v)
+    return s in EMPTY_VALUES or s.lstrip("→ ").strip() in EMPTY_VALUES
 
 
 def build_rollup_body(entries: list) -> str:
     """集約メモ本文を組み立てる。
 
     entries: [{"job": 求人名, "fields": {項目: 値}}]
-    単一値の項目は「顧客共通」、複数値は「求人別の条件」へ。
+
+    方針 (ユーザー確定 2026-08-06):
+      「全部のメモをそのまま並べる」のではなく**共通部分をまとめる**。
+      - 全求人で同じ値の項目 → 「全求人に共通」へ1行
+      - 値が分かれる項目     → 条件が同じ求人をグループ化して列挙
+        (同じ条件の求人を個別に並べるとメモが無駄に長くなる。実測では
+         16求人が実質2パターンしかない例があった)
+      比較は norm_key で正規化して行い、表記ゆれ(全角半角/区切り/~と〜)を吸収する。
     """
+    if not entries:
+        return ROLLUP_SIGNATURE
     byfield = defaultdict(list)     # 項目 → [(値, 求人名)]
     for e in entries:
         for k, v in e["fields"].items():
             byfield[k].append((v, e["job"]))
-    common, per_job = [], defaultdict(list)
+    n_jobs = len({e["job"] for e in entries})
+    common, varying, none_keys = [], {}, []
     for k in FIELDS:
         vals = byfield.get(k) or []
         if not vals:
             continue
-        uniq = sorted({v for v, _ in vals})
-        if len(uniq) == 1:
-            common.append(f"　{k}: {uniq[0]}")
+        groups = defaultdict(list)      # 正規化キー → [(表示値, 求人名)]
+        for v, job in vals:
+            groups[norm_key(v)].append((v, job))
+        if len(groups) == 1:
+            # 全求人で同じ値 → 共通へ (記入が一部求人のみでも、値が1種なら共通)
+            if is_empty_value(vals[0][0]):
+                # 「なし」は情報だが、26項目ぶん並べると本文が読めなくなる。
+                # 末尾に1行でまとめ、「書いていない」との区別だけ残す。
+                none_keys.append(k)
+            else:
+                common.append((_FIELD_OF_GROUP.get(k, ""), f"　{k}: {vals[0][0]}"))
         else:
-            for v, job in vals:
-                per_job[job].append(f"　　{k}: {v}")
+            varying[k] = groups
     lines = [ROLLUP_SIGNATURE,
-             "この取引に紐づく求人へ自動転記されます。"
-             "求人ごとに違う条件は「求人別の条件」に記載しています。", ""]
+             "この取引に紐づく求人へ自動転記されます。", ""]
     if common:
-        lines += ["■ 全求人に共通"] + common + [""]
-    if per_job:
-        lines.append("■ 求人別の条件")
-        for job, rows in per_job.items():
-            lines.append(f"　【{job}】")
-            lines += sorted(set(rows))
+        lines.append("■ 全求人に共通")
+        last_g = None
+        for g, text in common:
+            if g != last_g:
+                lines.append(f"〔{g}〕")
+                last_g = g
+            lines.append(text)
         lines.append("")
-    lines.append(f"（出典: 求人{len(entries)}件のメモを "
+    if varying:
+        lines.append("■ 求人によって異なる条件")
+        for k, groups in varying.items():
+            lines.append(f"　{k}:")
+            # 求人数が多いグループを先に (代表的な条件が上に来る)
+            for _nk, items in sorted(groups.items(),
+                                     key=lambda x: -len(x[1])):
+                val = items[0][0]
+                jobs = sorted({j for _v, j in items})
+                # 全求人の過半を占めるなら求人名を省いて簡潔に
+                label = ("（上記以外）" if len(jobs) == n_jobs
+                         else "、".join(j[:22] for j in jobs[:4])
+                         + (f" ほか{len(jobs) - 4}件" if len(jobs) > 4 else ""))
+                lines.append(f"　　{val}　← {label}")
+        lines.append("")
+    if none_keys:
+        lines += ["■ 制限・指定なし（全求人共通）",
+                  "　" + " / ".join(none_keys), ""]
+    lines.append(f"（出典: 求人{n_jobs}件のメモを "
                  f"{datetime.now():%Y-%m-%d} に集約）")
     return "\n".join(lines)
 
@@ -183,12 +373,115 @@ def collect(filled_ids: list) -> dict:
     return groups
 
 
+def write_notes(rows: list, out_dir: Path) -> dict:
+    """集約案の行を取引へNoteとして作成する。
+
+    rows: [{"集約先種別","集約先ID","元求人数","メモ本文"}]
+
+    安全策:
+      - 作成したNote IDを必ず記録する (--rollback で消せるようにするため)
+      - 既に集約メモを持つ取引はスキップする。再実行で二重に積まない
+    """
+    # 既存の集約メモを持つ取引を調べる (冪等性)。署名で判別する。
+    have = set()
+    r = _post(f"{BASE}/crm/v3/objects/notes/search",
+              {"filterGroups": [{"filters": [
+                  {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
+                   "value": "暗黙知メモ"}]}],
+               "properties": ["hs_note_body"], "limit": 100})
+    existing_notes = [o["id"] for o in r.get("results", [])]
+    if existing_notes:
+        for i in range(0, len(existing_notes), 100):
+            rr = _post(f"{BASE}/crm/v4/associations/notes/0-3/batch/read",
+                       {"inputs": [{"id": x}
+                                   for x in existing_notes[i:i + 100]]})
+            for res in rr.get("results", []):
+                for t in (res.get("to") or []):
+                    have.add(str(t["toObjectId"]))
+    print(f"既に集約メモを持つ取引: {len(have):,}件 (スキップします)", flush=True)
+
+    created, ok, skip, fail = [], 0, 0, 0
+    targets = [x for x in rows if x["集約先種別"] == "DEAL"]
+    for n, row in enumerate(targets, 1):
+        did = row["集約先ID"]
+        if did in have:
+            skip += 1
+            continue
+        try:
+            res = _post(f"{BASE}/crm/v3/objects/notes",
+                        {"properties": {
+                            "hs_note_body": row["メモ本文"].replace("\n", "<br>"),
+                            "hs_timestamp": datetime.utcnow().strftime(
+                                "%Y-%m-%dT%H:%M:%SZ")},
+                         "associations": [{"to": {"id": did}, "types": [{
+                             "associationCategory": "HUBSPOT_DEFINED",
+                             "associationTypeId": 214}]}]})
+            created.append({"note_id": res.get("id"), "deal_id": did})
+            ok += 1
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            print(f"  ★失敗 deal={did}: {type(e).__name__}: {str(e)[:90]}",
+                  flush=True)
+        if n % 50 == 0:
+            print(f"  {n:,}/{len(targets):,} (作成 {ok:,} / 失敗 {fail:,})",
+                  flush=True)
+        time.sleep(0.1)
+    # ロールバック用の記録は成否にかかわらず必ず残す
+    bk = (_REPO / "data" / "job_application_sync" /
+          f"rollup_notes_{datetime.now():%Y%m%dT%H%M%S}.json")
+    bk.parent.mkdir(parents=True, exist_ok=True)
+    bk.write_text(json.dumps(created, ensure_ascii=False, indent=2),
+                  encoding="utf-8")
+    print(f"\n=== 結果 === 作成 {ok:,} / スキップ {skip:,} / 失敗 {fail:,}")
+    print(f"作成したNoteの記録: {bk.resolve()}")
+    print(f"取り消す場合: python {Path(__file__).name} --rollback {bk}")
+    return {"ok": ok, "skip": skip, "fail": fail, "backup": str(bk)}
+
+
+def rollback(path: str) -> int:
+    """作成したNoteを削除して元に戻す。"""
+    items = json.loads(Path(path).read_text(encoding="utf-8"))
+    print(f"{len(items):,}件のNoteを削除します", flush=True)
+    ok = fail = 0
+    for n, it in enumerate(items, 1):
+        nid = it.get("note_id")
+        if not nid:
+            continue
+        r = requests.delete(f"{BASE}/crm/v3/objects/notes/{nid}",
+                            headers=_h(), timeout=30)
+        if r.status_code in (200, 204, 404):
+            ok += 1
+        else:
+            fail += 1
+            print(f"  ★削除失敗 note={nid}: HTTP {r.status_code}")
+        if n % 50 == 0:
+            print(f"  {n:,}/{len(items):,}", flush=True)
+        time.sleep(0.08)
+    print(f"=== 削除 {ok:,}件 / 失敗 {fail:,}件 ===")
+    return 0 if not fail else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--actual", action="store_true", help="取引へNoteを作成")
+    ap.add_argument("--from-csv", default="",
+                    help="集約案CSVから直接書き込む (HubSpot再取得をしない)")
+    ap.add_argument("--rollback", default="",
+                    help="作成したNoteを削除する (rollup_notes_*.json を指定)")
     ap.add_argument("--out-dir", default="claudedocs")
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args(argv)
+    if a.rollback:
+        return rollback(a.rollback)
+    if a.from_csv:
+        rows = list(csv.DictReader(
+            Path(a.from_csv).open(encoding="utf-8-sig", newline="")))
+        print(f"集約案: {a.from_csv} ({len(rows):,}件)", flush=True)
+        if not a.actual:
+            print("(--actual を付けると書き込みます)")
+            return 0
+        write_notes(rows, Path(a.out_dir))
+        return 0
     scr = Path(os.environ.get("SCRATCH", "")) if os.environ.get("SCRATCH") else None
     src = (_REPO / "data" / "job_application_sync" / "filled_memo_listings.json")
     if not src.exists():
@@ -210,6 +503,20 @@ def main(argv=None):
                                            key=lambda x: -len(x[1])):
             w.writerow([kind, kid, len(entries), build_rollup_body(entries)])
     print(f"集約案(CSV): {p.resolve()}")
+    # 正規化が値を書き換えた全ケースを出す。集約結果だけ見ても元の値は
+    # 分からないので、突き合わせできる形で必ず残す。
+    if CHANGED:
+        uniq = {(c["項目"], c["変換前"], c["変換後"]): 0 for c in CHANGED}
+        for c in CHANGED:
+            uniq[(c["項目"], c["変換前"], c["変換後"])] += 1
+        cp = out / f"メモ正規化の変換一覧_{datetime.now():%Y-%m-%d}.csv"
+        with cp.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["項目", "変換前", "変換後", "件数"])
+            for (k, a, b), n in sorted(uniq.items(), key=lambda x: -x[1]):
+                w.writerow([k, a, b, n])
+        print(f"正規化で値が変わったケース: {len(CHANGED):,}件 "
+              f"({len(uniq):,}種) → {cp.resolve()}")
     big = sorted(groups.items(), key=lambda x: -len(x[1]))[:2]
     for (kind, kid), entries in big:
         print(f"\n===== 例: {kind}={kid} (元求人{len(entries)}件) =====")

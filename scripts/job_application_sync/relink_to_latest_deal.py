@@ -41,6 +41,15 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
 
+# Windowsローカルの既定は cp932。ログ出力の1文字で処理全体が落ちるのは
+# 本末転倒なので明示的に固定する (CIは PYTHONIOENCODING=utf-8 で問題ない)。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
 try:
     from . import deal_series as ds
 except ImportError:  # pragma: no cover — CIはスクリプト直実行
@@ -198,9 +207,14 @@ def apply(targets: list, out_dir: Path) -> dict:
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--actual", action="store_true")
+    # CIは全スクリプトへ共通で --dry-run/--actual を渡すため受け口を用意する
+    # (無いと unrecognized arguments で落ち、他の処理まで巻き添えになる)
+    ap.add_argument("--dry-run", dest="dry_run", action="store_true")
     ap.add_argument("--out-dir", default="data/job_application_sync")
     ap.add_argument("--report-dir", default="claudedocs")
     a = ap.parse_args(argv)
+    if a.dry_run:
+        a.actual = False
     print("取引・関連付けを取得中...", flush=True)
     deals, d2c, d2l = collect()
     print(f"取引 {len(deals):,}件 / 会社紐付き {len(d2c):,}件\n", flush=True)
@@ -212,7 +226,7 @@ def main(argv=None):
     print(f"\n★付け替え対象: {len(targets):,}系列 / 求人 {njobs:,}件")
     print(f"★人手確認が必要: {len(ambiguous):,}系列  (dry_run={not a.actual})")
     for t in targets[:5]:
-        print(f"   例: {t['kind']}/{t['branch'][:22]} → "
+        print(f"   例: {t['kind']}/{t['branch'][:22]} -> "
               f"「{(t['latest_name'] or '')[:30]}」へ求人{len(t['jobs'])}件")
     # 人手確認リストは常にCSV出力
     rep = Path(a.report_dir)

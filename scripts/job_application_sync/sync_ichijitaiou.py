@@ -34,6 +34,17 @@ if _ENV.exists():
     load_dotenv(_ENV)
 
 from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
+from scripts.job_application_sync.hs_paging import (  # noqa: E402
+    list_all, post_retry)
+
+
+# Windowsローカルの既定は cp932。ログ出力の1文字で処理全体が落ちるのは
+# 本末転倒なので明示的に固定する (CIは PYTHONIOENCODING=utf-8 で問題ない)。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 BASE = "https://api.hubapi.com"
 
@@ -66,10 +77,9 @@ def _batch_assoc(listing_ids: list[str]) -> dict:
     m: dict = {}
     for i in range(0, len(listing_ids), 100):
         chunk = listing_ids[i:i + 100]
-        r = requests.post(
-            f"{BASE}/crm/v4/associations/0-420/0-3/batch/read",
-            headers=_h(),
-            json={"inputs": [{"id": x} for x in chunk]}, timeout=30).json()
+        # 347回のbatch/readを走らせるので、1回の瞬断で全体を落とさない
+        r = post_retry(f"{BASE}/crm/v4/associations/0-420/0-3/batch/read",
+                       {"inputs": [{"id": x} for x in chunk]})
         for res in r.get("results", []):
             fid = str(res.get("from", {}).get("id"))
             m[fid] = [str(t.get("toObjectId")) for t in res.get("to", [])]
@@ -83,10 +93,9 @@ def _batch_deal_itijitaiou(deal_ids: list[str]) -> dict:
     ids = sorted(set(deal_ids))
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
-        r = requests.post(
-            f"{BASE}/crm/v3/objects/0-3/batch/read", headers=_h(),
-            json={"properties": ["itijitaiou"],
-                  "inputs": [{"id": x} for x in chunk]}, timeout=30).json()
+        r = post_retry(f"{BASE}/crm/v3/objects/0-3/batch/read",
+                       {"properties": ["itijitaiou"],
+                        "inputs": [{"id": x} for x in chunk]})
         for o in r.get("results", []):
             m[str(o["id"])] = (o.get("properties") or {}).get("itijitaiou")
         time.sleep(0.1)
@@ -130,15 +139,18 @@ def build_login_to_mail() -> dict:
         km = (a.get("manage_mail") or "").strip().lower()
         if lid and km:
             m.setdefault(lid, km)
-    print(f"[sheet] AW login_id→管理用メール索引={len(m)}", flush=True)
+    print(f"[sheet] AW login_id->管理用メール索引={len(m)}", flush=True)
     return m
 
 
 def run(dry_run: bool = True, limit: int | None = None) -> dict:
     # 1) 全LISTING (現状値 + AW判定用 login_id)
-    listings = _search_all(
+    # Search API は10,000件で HTTP 400 になり、素朴な実装だと「もう次が無い」と
+    # 区別できず静かに完走扱いになる。実測では対象34,666件のうち10,000件
+    # (28.8%)しか処理していなかった (2026-08-06 発見)。上限の無い list API へ。
+    listings = list_all(
         "0-420", ["ichijitaiounoumu_deforuto", "airwork_account_login_id"],
-        [{"propertyName": "hs_object_id", "operator": "HAS_PROPERTY"}], limit)
+        limit=limit)
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
     # 2) HR経路: LISTING→Deal 関連(HubSpotの関連付け) + Deal.itijitaiou
@@ -179,11 +191,9 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
     applied = 0
     if not dry_run:
         for i in range(0, len(updates), 100):
-            r = requests.post(f"{BASE}/crm/v3/objects/0-420/batch/update",
-                              headers=_h(),
-                              json={"inputs": updates[i:i + 100]}, timeout=60)
-            if r.status_code in (200, 201, 207):
-                applied += len(updates[i:i + 100])
+            post_retry(f"{BASE}/crm/v3/objects/0-420/batch/update",
+                       {"inputs": updates[i:i + 100]})
+            applied += len(updates[i:i + 100])
             time.sleep(0.15)
     summary = {"listings": len(lids), "hr_matched": hr_matched,
                "aw_matched": aw_matched, "unresolved": unresolved,

@@ -19,13 +19,16 @@ on:
     - cron: "23 1 * * *"    # 10:23 JST
     - cron: "23 5 * * *"    # 14:23 JST
     - cron: "23 9 * * *"    # 18:23 JST
+    # 取引まわりの健全性 (deal_hygiene job)。HR取込の後に別jobで回す。
+    - cron: "40 22 * * *"
   workflow_dispatch:
     inputs:
       phase:
-        description: "フェーズ (hr / aw-create / aw-create-apps / aw-collect / reset-queue)"
+        description: "フェーズ (hr / aw-create / aw-create-apps / aw-collect / deal-hygiene / reset-queue)"
         default: "hr"
         type: choice
-        options: ["hr", "aw-create", "aw-create-apps", "aw-collect", "reset-queue"]
+        options: ["hr", "aw-create", "aw-create-apps", "aw-collect",
+                  "deal-hygiene", "reset-queue"]
       apps_cutoff:
         description: "aw-create-apps の応募日カットオフ (ISO, 空=全件)"
         default: ""
@@ -40,14 +43,22 @@ on:
         type: boolean
         default: true
 
-concurrency:
-  group: job-daily
-  cancel-in-progress: false
+# ※ concurrency は job 単位で宣言する。ワークフロー単位にすると
+#   求人取込(job)と取引まわり(deal_hygiene)が互いを待つ。
 
 jobs:
   job:
+    # 取引まわり専用の cron / 手動フェーズではこの job を動かさない。
+    # GitHub は cron ごとに全 job を評価するため、除外しないと
+    # PHASE決定の `*)` フォールバックで hr が誤爆する。
+    if: >-
+      github.event.schedule != '40 22 * * *' &&
+      inputs.phase != 'deal-hygiene'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: job-daily
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -63,7 +74,11 @@ jobs:
       - name: Install deps + Playwright
         run: |
           python -m pip install --upgrade pip
-          pip install playwright==1.50.0 requests python-dotenv gspread google-auth google-auth-oauthlib openpyxl google-cloud-storage
+          # google-api-python-client: check_sheet_url_drift が顧客管理シートD列の
+          # ハイパーリンクを includeGridData で読むのに googleapiclient を使う。
+          # gspread では取れない。入れ忘れると毎回 ModuleNotFoundError で死ぬ
+          # (applicant_sync.yml には入っている。2026-08-06 検証で発覚)。
+          pip install playwright==1.50.0 requests python-dotenv gspread google-auth google-auth-oauthlib openpyxl google-cloud-storage google-api-python-client
           python -m playwright install --with-deps chromium chromium-headless-shell
       - name: Write SA json
         env:
@@ -121,6 +136,10 @@ jobs:
           case "$PHASE" in
             hr)
               python scripts/job_application_sync/hr_watcher.py $FLAG --skip-aw
+              # ※ 取引まわりの処理(紐付け/一次対応/健全性)は deal_hygiene job へ
+              #   切り出した(2026-08-06)。ここに置くと (1)Playwrightの求人取込が
+              #   落ちた時に後続が丸ごと実行されない (2)同じconcurrency groupの
+              #   aw-collect を待たせる (3)30分のtimeoutに収まらない、の3つが起きる。
               ;;
             aw-create)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
@@ -150,3 +169,87 @@ jobs:
               python -c "import json,pathlib; p=pathlib.Path('data/job_application_sync/aw_pending_queue.json'); old=(len(json.loads(p.read_text(encoding='utf-8'))) if p.exists() else 0); p.parent.mkdir(parents=True,exist_ok=True); p.write_text('{}',encoding='utf-8'); print(f'[reset-queue] aw_pending_queue cleared: {old} -> 0')"
               ;;
           esac
+
+  # ── 取引まわりの健全性 ────────────────────────────────────────────
+  # 求人取込(job)から切り出してある。理由は3つ:
+  #   1. Playwrightの求人取込が落ちても、こちらは走る。hrに相乗りさせると
+  #      `bash -e` により hr_watcher の失敗でこの5本が丸ごと実行されない
+  #   2. concurrency group を分ける。同じgroupだと aw-collect を待たせる
+  #      (cronの名目差は20分だが実着弾の差は12〜15分しかない)
+  #   3. timeout を専用に持てる。この処理は求人34,718件を走査するので
+  #      hrの30分枠には収まらない
+  #
+  # そもそもの発端: deal-assoc と ichijitaiou は applicant_sync.yml のモードと
+  # してしか存在せず、同ファイルに schedule が無いため **GASの時間トリガーだけ**
+  # が起動手段だった。実測で deal-assoc は10日(最終2026-07-27)、ichijitaiou は
+  # 29日(最終2026-07-08) 起動されていなかった。GitHub側の cron で二重化する。
+  deal_hygiene:
+    if: >-
+      github.event.schedule == '40 22 * * *' ||
+      inputs.phase == 'deal-hygiene'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: deal-hygiene
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # Playwrightは不要 (スクレイピングしない)。googleapiclient は
+          # check_sheet_url_drift が顧客管理シートD列のリンクを読むのに要る。
+          pip install requests python-dotenv gspread google-auth \
+            google-auth-oauthlib google-api-python-client
+      - name: Write SA json
+        env:
+          SA_JSON_CONTENT: ${{ secrets.GOOGLE_SA_JSON }}
+        run: printf '%s' "$SA_JSON_CONTENT" > /tmp/sa.json
+      - name: Deal hygiene
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
+          GOOGLE_SA_JSON: /tmp/sa.json
+          SHEETS_AUTH_MODE: sa
+          JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
+          SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          # schedule実行は常に本番。手動dispatchは inputs.dry_run に従う。
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.dry_run }}" = "false" ]; then
+            FLAG="--actual"; SLACKFLAG="--slack"
+          else
+            FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
+          fi
+          RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_DRIFT=0; RC_HEALTH=0
+          # 実行順序は依存関係で決まる:
+          #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記 → 検知
+          python scripts/job_application_sync/sync_deal_association.py $FLAG || RC_ASSOC=$?
+          # 契約更新で新しい取引が作られた際の付け替え。sync_deal_association は
+          # 「既に紐付いている求人」をスキップする設計なので、旧取引にぶら下がった
+          # ままの求人はこちらでしか拾えない。追加のみ・判定不能はSlack通知。
+          python scripts/job_application_sync/relink_to_latest_deal.py $FLAG || RC_RELINK=$?
+          python scripts/job_application_sync/sync_ichijitaiou.py $FLAG || RC_ICHIJI=$?
+          # 顧客管理シートD列の貼り替えにHubSpotが追従しているかの検知。
+          # 検知のみ・自動修正しない(人が編集する場所を機械が上書きしない)。
+          python scripts/job_application_sync/check_sheet_url_drift.py $SLACKFLAG || RC_DRIFT=$?
+          # 健全性チェック: 「動いたか」ではなく「あるべき状態か」を見る。
+          # health_check.py は「チェック自体が失敗したら1を返す」設計なので
+          # `|| true` で捨てない (監視の無音故障を作らないため)。
+          python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
+          echo "[deal_hygiene] rc: assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI drift=$RC_DRIFT health=$RC_HEALTH"
+          # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
+          # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
+          NG=""
+          [ $RC_ASSOC  -ne 0 ] && NG="$NG 求人→取引の紐付け"
+          [ $RC_RELINK -ne 0 ] && NG="$NG 最新取引への付け替え"
+          [ $RC_ICHIJI -ne 0 ] && NG="$NG 一次対応の転記"
+          [ $RC_DRIFT  -ne 0 ] && NG="$NG 顧客シートURL乖離の検知"
+          [ $RC_HEALTH -ne 0 ] && NG="$NG 健全性チェック"
+          if [ -n "$NG" ]; then
+            echo "::error title=取引まわりの日次処理が失敗::失敗した処理:$NG"
+            exit 1
+          fi
