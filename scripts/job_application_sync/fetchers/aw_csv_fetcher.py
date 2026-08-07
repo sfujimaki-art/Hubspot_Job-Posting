@@ -36,6 +36,14 @@ from typing import Optional
 
 
 # Phase 0b 実測 URL
+# ★ビューポートを明示的に大きく固定する (2026-08-07)。
+# AirWorkの応募者一覧はレスポンシブで、画面が狭いと
+# 「応募者一覧をダウンロードする（上限1000件）」ボタンが **DOMごと消える**。
+# 実測: 1280x720=検出OK / 800x600=count 0 で未検出 / 1280x1024=OK / 1920x1080=OK
+# 2026-08-04頃からCIで「ボタン未検出」が多発し、AW応募の取込が
+# 8/03の13〜18件/日 → 2〜4件/日 に落ちた。ヘッドレスの既定サイズ依存を断つ。
+VIEWPORT = {"width": 1600, "height": 1200}
+
 URL_LOGIN = "https://ats.rct.airwork.net/airplf/login"
 URL_DASHBOARDS = "https://ats.rct.airwork.net/dashboards"
 URL_BULK_DOWNLOAD = "https://ats.rct.airwork.net/job_offers/bulk_download"
@@ -192,6 +200,7 @@ async def establish_aw_session(
     # 1) 保存セッション再利用を試みる
     if sp and sp.exists():
         ctx = await browser.new_context(accept_downloads=True,
+                                        viewport=VIEWPORT,
                                         storage_state=str(sp))
         page = await ctx.new_page()
         try:
@@ -204,7 +213,7 @@ async def establish_aw_session(
         await ctx.close()                 # 無効 → 破棄して full login
 
     # 2) full login (初回 or セッション切れ)
-    ctx = await browser.new_context(accept_downloads=True)
+    ctx = await browser.new_context(accept_downloads=True, viewport=VIEWPORT)
     page = await ctx.new_page()
     await page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
     ok_id = await _fill_first_match(page, SSO_ID_SELECTOR_CANDIDATES, login_id)

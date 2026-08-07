@@ -76,7 +76,22 @@ def validate_applicant_csv(path: Path) -> None:
 
 
 async def _click_button_by_partial_text(page, text: str) -> bool:
-    """text 部分一致の button / a を click. locator → JS click fallback."""
+    """text 部分一致の button / a を click. locator → JS click fallback.
+
+    ★AirWorkの応募者一覧はレスポンシブで、**画面が狭いとこのボタンが
+      DOMごと消える**(実測 2026-08-07: 800x600 で count=0)。
+      2026-08-04頃からCIで「ボタン未検出」が多発し、AW応募の取込が
+      13〜18件/日 → 2〜4件/日 に落ちた。
+      根治は new_context の viewport 明示(aw_csv_fetcher.VIEWPORT)だが、
+      ここでも保険として (a)ページ最下部までスクロール (b)明示セレクタ
+      を順に試す。ボタンはフッター内にある。
+    """
+    # 0) 遅延描画・スクロール依存に備えて最下部まで送る
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
     # 1) Playwright locator (has-text は部分一致)
     try:
         loc = page.locator(f"button:has-text('{text}')").first
@@ -85,6 +100,17 @@ async def _click_button_by_partial_text(page, text: str) -> bool:
             return True
     except Exception:
         pass
+    # 1b) 明示セレクタ (2026-08-07 実画面で確認)
+    for sel in ("#footerWrapper section button",
+                "#footerWrapper button",
+                "footer button"):
+        try:
+            loc = page.locator(sel).filter(has_text=text).first
+            if await loc.count():
+                await loc.click()
+                return True
+        except Exception:
+            continue
     # 2) JS click fallback
     try:
         clicked = await page.evaluate(
