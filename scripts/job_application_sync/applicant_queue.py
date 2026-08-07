@@ -151,6 +151,7 @@ class QueueItem:
     columns: dict = field(default_factory=dict)
     sheet_b_id: str = ""
     sheet_row: int = 0          # シート1直読み時の行番号 (処理後F列マーク用。0=queue由来)
+    login_ids: list = field(default_factory=list)  # C列の全メール (突合を1つ目に限定しない)
 
     @property
     def media(self) -> str:
@@ -216,7 +217,21 @@ class AccountResolver:
         # 正規化した会社名 → 行。**同名が複数ある場合は候補を全部持つ**
         # (1つに決められないものを機械が勝手に選ばないため)
         self.idx_comp_norm: dict[str, list] = {}
+        # メールキー → 候補行(全部)。★dictの後勝ちを禁じるため (2026-08-07)
+        #   実測: 顧客管理シート2,017行のうち **59キーが2社以上で共用**。
+        #   例 aXy47Nm+FFv72Xo@gmail.com = 首都圏WMS 名南PC/名古屋PC/所沢PC。
+        #   後勝ちだと「シートの後ろの行」が根拠なく勝ち、所沢PCの応募者が
+        #   名南PCのシートに入る=誤配。候補を全部持ち、会社名で絞れなければ
+        #   突合しない(未突合として人へ回す)。誤配より未突合が安全。
+        self.idx_mail_multi: dict[str, list] = {}
         self.cols: dict = {}
+
+    def _add_mail(self, key: str, row: list) -> None:
+        if not key:
+            return
+        lst = self.idx_mail_multi.setdefault(key, [])
+        if row not in lst:
+            lst.append(row)
 
     def build(self) -> "AccountResolver":
         gc = _sheets_client()
@@ -229,17 +244,38 @@ class AccountResolver:
             for a in _split_multi(g(c["alias"])):
                 if "@" in a:
                     self.idx_alias[_norm(a)] = r
+                    self._add_mail(_norm(a), r)
             for b in _split_multi(g(c["bid"])):
                 self.idx_bid[_norm(b)] = r
+                self._add_mail(_norm(b), r)
             if g(c["aid"]).strip():
                 self.idx_aid[_norm(g(c["aid"]))] = r
+                self._add_mail(_norm(g(c["aid"])), r)
             if g(c["reclog"]).strip():
                 self.idx_reclog[_norm(g(c["reclog"]))] = r
+                self._add_mail(_norm(g(c["reclog"])), r)
             if g(c["comp"]).strip():
                 self.idx_comp[_norm(g(c["comp"]))] = r
                 self.idx_comp_norm.setdefault(
                     _norm_company(g(c["comp"])), []).append(r)
         return self
+
+    def _disambiguate(self, key: str, row: list, item: QueueItem):
+        """共用メールキーなら会社名で1社に絞る。絞れなければ None。
+
+        ★None を返す = 未突合として人へ回す。誤配より未突合が安全。
+          実測 2026-08-07: 顧客管理シート 2,017行のうち59キーが2社以上で共用。
+          例 aXy47Nm+FFv72Xo@gmail.com は首都圏WMSの名南PC/名古屋PC/所沢PC。
+          従来は dict の後勝ちで「名南PC」が根拠なく選ばれていた。
+        """
+        cands = self.idx_mail_multi.get(key) or []
+        if len(cands) <= 1:
+            return row
+        ci = self.cols["comp"]
+        want = _norm_company(item.company)
+        exact = [r for r in cands
+                 if _norm_company(r[ci] if len(r) > ci else "") == want]
+        return exact[0] if len(exact) == 1 else None
 
     def resolve(self, item: QueueItem) -> Optional[ResolvedAccount]:
         """queue項目 → ResolvedAccount。突合できなければ None (=要報告)."""
@@ -252,9 +288,41 @@ class AccountResolver:
             (lid, self.idx_aid, "a_id"),
             (lid, self.idx_bid, "b_id"),
         ):
-            if key and key in idx:
-                row, by = idx[key], name
-                break
+            if not (key and key in idx):
+                continue
+            cand = idx[key]
+            if name != "company_exact":
+                cand = self._disambiguate(key, cand, item)
+                if cand is None:
+                    continue     # 共用キーで絞れず → 次のキーを試す
+            row, by = cand, name
+            break
+        if row is None:
+            # C列の2つ目以降のメールでも引く (2026-08-07)。
+            # ★既存の突合順は動かさない。1つ目で引けなかった時だけ追加で試す。
+            #   C列は「担当者 <実ドメイン>, 担当者 <リクロジのエイリアス>」の形で、
+            #   どちらが先かは行によって違う。1つ目しか見ていなかったため
+            #   会社名だけが頼りになり、事業所を決められず未突合になっていた。
+            #   実測: カタニ産業→群馬支店 / 首都圏WMS→名南PC のように
+            #   **エイリアスは事業所まで一意に決める**。
+            for _extra in (item.login_ids or []):
+                _k = _norm(_extra)
+                if not _k or _k == lid:
+                    continue
+                for _idx, _nm in (
+                    (self.idx_reclog, "リクロジアドレス(2件目以降)"),
+                    (self.idx_alias, "alias(2件目以降)"),
+                    (self.idx_aid, "a_id(2件目以降)"),
+                    (self.idx_bid, "b_id(2件目以降)"),
+                ):
+                    if _k in _idx:
+                        _c = self._disambiguate(_k, _idx[_k], item)
+                        if _c is None:
+                            continue
+                        row, by = _c, _nm
+                        break
+                if row is not None:
+                    break
         if row is None:
             # 最後の砦: 表記の揺れだけを吸収した会社名で一致を試す。
             # **候補が2件以上あるものは触らない**(事業所違いを掴むため)。
@@ -401,6 +469,32 @@ def _first_email(text: str) -> str:
     return m.group(0).strip() if m else ""
 
 
+def _all_emails(text: str) -> list[str]:
+    """C列(顧客)に含まれる全メールアドレスを出現順に返す。
+
+    ★1つ目だけでは足りない (2026-08-07 実測)。C列は
+      「担当者名 <実ドメイン>, 担当者名 <リクロジのエイリアス>」の形で、
+      **どちらが先かは行によって違う**。
+        カタニ産業      1つ目=y-takahashi@katani.co.jp / 2つ目=エイリアス(正解)
+        首都圏WMS       1つ目=d.nishiyama@shutoken.net / 2つ目=エイリアス(正解)
+      1つ目しか見ていなかったため、会社名だけが頼りになり、
+      「カタニ産業株式会社」が群馬支店か東京支店か決められず未突合だった。
+      エイリアスで引けば**事業所まで一意に決まる**(→群馬支店)。
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    for m in re.finditer(r"<\s*([^>]+@\S+?)\s*>", text):
+        v = m.group(1).strip()
+        if v not in out:
+            out.append(v)
+    for m in re.finditer(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text):
+        v = m.group(0).strip()
+        if v not in out:
+            out.append(v)
+    return out
+
+
 def _media_type_from_b(b: str) -> str:
     b = (b or "").strip()
     if b == "admin@hr-hacker.com":
@@ -505,7 +599,8 @@ def read_new_items_from_sheet1(
         ).hexdigest()[:16]
         items.append(QueueItem(
             row_id=rid, media_type=media_type,
-            login_id=_first_email(g("from")), company=company,
+            login_id=_first_email(g("from")),
+            login_ids=_all_emails(g("from")), company=company,
             columns={"A": subj, "B": g("media"), "C": g("from"),
                      "D": date, "G": company},
             sheet_row=i,
