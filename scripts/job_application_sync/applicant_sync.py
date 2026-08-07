@@ -290,10 +290,25 @@ def process_aw_account(
         results = ai.run_import(rows, cli, default_login_id=bid)
         from collections import Counter
         st = Counter(r.status for r in results)
-        result.update(ok=True, login_id=bid, jobs_fetched=jobs_fetched,
+        n_err = st.get("error", 0)
+        # ★ok は「CSVが落ちた」ではなく「取り込めた」を意味させる (2026-08-07)。
+        #   旧実装は無条件に ok=True で、呼び出し側はそれだけを見て
+        #   グループ全件を台帳DONEにしていた。そのため
+        #     - 応募0件のCSV
+        #     - 全行がHubSpotエラーで落ちたCSV
+        #   でも「処理済み」になり、二度と取りに行かなくなる。しかも
+        #   error件数はログにもSlackにも出ず、**全滅しても無音**だった。
+        #   1件でも成功していれば ok、全部エラーなら ok=False で再試行に回す。
+        ok = (len(results) == 0) or (n_err < len(results))
+        result.update(ok=ok, login_id=bid, jobs_fetched=jobs_fetched,
                       linked=st.get("linked", 0),
                       unlinked=st.get("unlinked", 0),
-                      dup=st.get("skip_duplicate", 0), total=len(results))
+                      dup=st.get("skip_duplicate", 0),
+                      error_rows=n_err, total=len(results))
+        if n_err:
+            result["error"] = (f"{bid}: 取込エラー {n_err}/{len(results)}行")
+            print(f"  ⚠️ {company[:18]}: 取込エラー {n_err}/{len(results)}行 "
+                  f"(ok={ok})", flush=True)
         return result
     result["error"] = last_err or "有効なB系IDなし"
     return result
@@ -400,8 +415,34 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             if st in ("DONE", "SKIP"):
                 return True
             if st == "FAILED" and ledger.attempts(rid) >= MAX_ATTEMPTS:
-                return True
+                # ★恒久除外にしない (2026-08-07)。
+                #   5分間隔なので3回失敗＝**15分で永久に見放す**設計だった。
+                #   2026-08-04 に媒体側のレイアウト変更で「DLボタン未検出」が
+                #   全社横断で発生し、フジタ/SKテック/福島明星/ハンダ/
+                #   日産物流富山/オプス の6社が15分で除外された。ボタンを
+                #   直しても**自動では戻らない**(実測: 8/04以降ずっと未処理)。
+                #   媒体側の一時障害と恒久的な設定不備を区別できないので、
+                #   時間を置いて必ず再試行する。
+                return not _retry_due(rid)
             return False
+
+        def _retry_due(rid: str) -> bool:
+            """上限超えの項目を再試行してよいか。最終更新からの経過で判断。
+
+            指数バックオフ: 3回目=1h / 4回目=2h / 5回目=4h … 最大24h。
+            媒体の一時障害は数時間で復旧するので、その頃に自然に戻る。
+            """
+            e = ledger.data.get(rid) or {}
+            ts = e.get("updated")
+            if not ts:
+                return True
+            try:
+                last = datetime.fromisoformat(ts)
+            except ValueError:
+                return True
+            n = max(0, e.get("attempts", MAX_ATTEMPTS) - MAX_ATTEMPTS)
+            wait_h = min(24, 2 ** n)          # 1,2,4,8,16,24h
+            return (datetime.now() - last).total_seconds() >= wait_h * 3600
         # ── 台帳がどれだけ除外しているかを必ず出す ──────────────────
         # なぜ要るか (2026-08-07): CIでは毎回 accounts:0 なのに、ローカルで
         # 同じ集約を回すと49社/145件が対象になる。差は台帳しかないが、台帳は
@@ -488,8 +529,19 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                         m = aq.mark_sheet1_rows(covered_rows)
                         print(f"  シート1 F列マーク: {m}行", flush=True)
                     except Exception as e:  # noqa: BLE001
-                        print(f"  シート1 F列マーク skip(書込権限無し等/台帳で重複防止): "
-                              f"{type(e).__name__}", flush=True)
+                        # ★型名だけ出して黙るのをやめる (2026-08-07)。
+                        #   スコープが readonly で403が返り続けていたが、
+                        #   「skip」としか出ないため**本番で一度も書けて
+                        #   いない事実に誰も気づけなかった**(実測: F列の
+                        #   「受入済」= 0件)。現場はシート1を見ても処理済みか
+                        #   判別できない状態が続いていた。理由を出し、
+                        #   繰り返すならSlackへ上げる。
+                        print(f"  ⚠️ シート1 F列マーク失敗: "
+                              f"{type(e).__name__}: {str(e)[:120]}", flush=True)
+                        slack_notify(dry_run=dry_run, message=
+                            f"⚠️ シート1のF列に処理済みマークを書けません\n"
+                            f"{type(e).__name__}: {str(e)[:150]}\n"
+                            f"→ 現場がシート上で処理状況を判別できません")
                 summary["done"] += covered
                 summary["linked"] += res.get("linked", 0)
                 print(f"  ✅ HR: 応募取込 linked={res.get('linked')} "

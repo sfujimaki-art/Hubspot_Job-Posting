@@ -40,7 +40,17 @@ COL_CLOSED = "クローズ"  # FALSE=アクティブ / TRUE=クローズ済み
 # Deal.kanri_mail_address との結合キー (src A/B 両方に存在, 2026-07-03 実測で確定)。
 COL_MANAGE_MAIL = "_COL8_"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+# ★readonly ではなく書込可にする (2026-08-07)。
+#   応募連携は処理済みの印としてシート1のF列に「受入済」を書くが、
+#   スコープが readonly だったため `values.batchUpdate` が必ず403になり、
+#   **本番で一度も成功していなかった**(実測: F列の「受入済」= 0件、
+#   GASが書いた「キュー済」の最終更新が 2026-06-28)。
+#   失敗は applicant_sync.py 側の except で握られてログに型名が出るだけで、
+#   台帳だけがDONEになる非対称が常態化していた。結果、**現場がシート1を
+#   見ても処理済みかどうか判別できない**。
+#   同リポの customer_sheet_sync.py:52 は最初から書込スコープを持っており、
+#   ここだけが取り残されていた。
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # OAuth トークン既定パス (Phase 2 動作確認 2026-06-29: SA 権限未付与のため OAuth fallback)
 DEFAULT_OAUTH_TOKEN = "credentials/fujimaki_token.json"
