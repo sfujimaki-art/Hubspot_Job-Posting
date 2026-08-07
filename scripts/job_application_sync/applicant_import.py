@@ -65,6 +65,11 @@ from typing import Any, Iterable, Optional, Protocol
 # ---- Association type IDs (Phase 0 実測確定) ------------------------------
 ASSOC_TYPE_ID_APPT_TO_LISTING = 5  # USER_DEFINED 「応募先求人」
 
+# 一次対応の要否を付ける応募日の上限日数 (2026-08-07 追加, 既定7日)。
+# ★これを超える古い応募は登録するが「要否」を設定しない = BPOの未対応キューに入れない。
+ICHIJITAIOU_MAX_AGE_DAYS = int(
+    os.environ.get("JAS_ICHIJITAIOU_MAX_AGE_DAYS", "7"))
+
 # 応募者パイプライン「応募管理」と初期ステージ「応募受付」(2026-07-27 実API取得のID。
 # IDはラベル改名に耐える安定参照。ステージ未設定だとボード表示に現れない)
 APPLICANT_PIPELINE_ID = "t_3c8f8179ebedb62c890f1cf2c73ff9c8"
@@ -931,6 +936,46 @@ def load_applicants_csv(path: Path) -> list[ApplicantRow]:
 # ============================================================================
 # APPOINTMENT プロパティ構築
 # ============================================================================
+def strip_ichijitaiou_if_stale(props: dict, apply_date: str,
+                               today: str = "") -> bool:
+    """応募日が古ければ「一次対応の要否」を落とす。落としたら True。
+
+    ★なぜ必要か (2026-08-07 実測で判明)
+      AWの応募CSVは「その顧客の全応募(最大1000件)」を返す。したがって
+      1社の取得に成功するたび、過去の応募がまとめて取り込まれる。
+      実測: 日本製紙1社で32件・マキタ運輸1社で13件が同時に流入し、
+            そのうち70件(72%)は応募日が8/01より前の過去分だった。
+
+      一方で要否は取引の itijitaiou を**そのまま引き継ぐだけ**で、
+      応募日を一切見ていなかった。itijitaiou=true の顧客を遡って
+      取り込むと、何ヶ月も前の応募が全部「必要」になり、BPOの
+      未対応キューに一気に積み上がる(現場が捌けない)。
+
+      レコードは登録する(記録は残す)。要否だけ付けない=キューに入れない。
+      新しい応募は従来どおり要否が付くので、日常運用は変わらない。
+
+    Args:
+        props: 作成予定のプロパティ(この場で書き換える)
+        apply_date: 応募日 'YYYY-MM-DD'。空/不正な形式なら**落とさない**
+                    (日付が読めないことを理由に対応対象から外さない)
+        today: 判定基準日 'YYYY-MM-DD'。既定は実行日
+    """
+    if "ichijitaiounoumu" not in props:
+        return False
+    if not apply_date or len(apply_date) != 10:
+        return False              # 日付不明 → 従来どおり(安全側=対応対象に残す)
+    try:
+        d = datetime.strptime(apply_date, "%Y-%m-%d").date()
+        base = (datetime.strptime(today, "%Y-%m-%d").date() if today
+                else datetime.now().date())
+    except ValueError:
+        return False              # 形式不正 → 落とさない
+    if (base - d).days <= ICHIJITAIOU_MAX_AGE_DAYS:
+        return False
+    props.pop("ichijitaiounoumu", None)
+    return True
+
+
 def build_appointment_properties(
     row: ApplicantRow, *, linked: bool, ichijitaiou: Optional[str] = None,
     owner_id: Optional[str] = None,
@@ -1089,6 +1134,8 @@ def process_applicant(
         login_id = row.airwork_login_id or default_login_id
         props.update(client.get_oubosaki_props(
             listing_id, row.media, login_id, row.media_job_id))
+    # ★古い応募には一次対応の要否を付けない (build/get_oubosaki の両経路の後で1回)
+    strip_ichijitaiou_if_stale(props, row.apply_date)
     appt_id = client.create_appointment(props)
 
     # 4. Association (求人特定時のみ)

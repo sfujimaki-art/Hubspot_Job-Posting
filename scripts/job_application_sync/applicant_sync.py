@@ -718,9 +718,11 @@ def relink(dry_run: bool = False, limit: int = 1000,
         if not jid:
             return
         media = p.get("oubobaitaimei") or ""
-        targets.append((o["id"], jid, ("HR" in media or "ハッカー" in media)))
+        targets.append((o["id"], jid, ("HR" in media or "ハッカー" in media),
+                        str(p.get("yingmuri") or "")[:10]))
 
-    _PROPS = ["oubokyuujinmemo", "oubobaitaimei", "bikou_hiaringu"]
+    # yingmuri(応募日) は「古い応募に一次対応を付けない」ガードに使う (2026-08-07)
+    _PROPS = ["oubokyuujinmemo", "oubobaitaimei", "bikou_hiaringu", "yingmuri"]
     if target_job_ids:
         ids = sorted({str(j).strip() for j in target_job_ids if str(j).strip()})
         # (a) oubokyuujinmemo に求人IDを持つ対象外 (IN でバッチ検索)
@@ -799,13 +801,13 @@ def relink(dry_run: bool = False, limit: int = 1000,
                     p.get("hubspot_owner_id"))  # 2件目=曖昧
             time.sleep(0.1)
         return m
-    hr_map = _listing_map([j for _, j, ish in targets if ish], "id_hrhakkaa")
-    aw_map = _listing_map([j for _, j, ish in targets if not ish], "id_airwork")
+    hr_map = _listing_map([j for _, j, ish, _d in targets if ish], "id_hrhakkaa")
+    aw_map = _listing_map([j for _, j, ish, _d in targets if not ish], "id_airwork")
 
     # 3) 突合できた対象外だけ Association + 対象外解除 + 一次対応引き継ぎ
     relinked = still = ambiguous = 0
     note_copied = 0
-    for appt_id, jid, is_hr in targets:
+    for appt_id, jid, is_hr, apply_date in targets:
         hit = (hr_map if is_hr else aw_map).get(jid, "__miss__")
         if hit == "__miss__":
             still += 1
@@ -819,6 +821,11 @@ def relink(dry_run: bool = False, limit: int = 1000,
             props = {"kokyakushiitotenkijoukyou": "未転記"}
             if ichijitaiou in ("必要", "不要"):
                 props["ichijitaiounoumu"] = ichijitaiou   # 求人→応募 引き継ぎ
+            # ★古い応募には要否を付けない (作成時と同じガード)。
+            #   このスイープの対象は「求人未特定だった応募」で、CSV一括取込で
+            #   入った過去分が大量に含まれる。ここを塞がないと、求人を習得した
+            #   瞬間に何ヶ月も前の応募が「必要」でBPOの未対応キューへ流れ込む。
+            ai.strip_ichijitaiou_if_stale(props, apply_date)
             if l_owner:
                 props["hubspot_owner_id"] = l_owner       # 担当者も求人から継承
             # 応募先求人情報11項目も引き継ぐ (AWのlogin_idは対象外appt側に無いため
