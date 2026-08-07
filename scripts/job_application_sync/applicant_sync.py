@@ -370,7 +370,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     ledger = Ledger()
     out_dir = _REPO / "scratchpad" / "applicant_sync_csv"
     summary = {"accounts": 0, "done": 0, "failed": 0, "reported": 0,
-               "unresolved": 0, "linked": 0}
+               "unresolved": 0, "out_of_scope": 0, "linked": 0}
     try:
         if source == "sheet1":
             # GAS queue座礁の迂回: シート1を直読み(F列マーカーで未処理判定)。
@@ -403,14 +403,30 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         resolver = aq.AccountResolver().build()
         grouped, unresolved = aq.aggregate_by_account(items, resolver)
 
-        # 未突合 → 報告(放置ゼロ)
-        if unresolved:
-            summary["unresolved"] = len(unresolved)
+        # 未突合 → 報告(放置ゼロ)。ただし**性質の違う2つを分ける**:
+        #   (a) スコープ外の媒体 (アイデム/ジモティー等)
+        #       取り込む実装がそもそも無い。毎回「エラー」で報告しても
+        #       誰も動けず、本当に対処が要る(b)が埋もれる。件数だけ出す。
+        #   (b) AW/HRなのにアカウントを特定できない
+        #       顧客管理シートに会社名の登録が無い等。人が対処できる。
+        # 2026-08-06 実測: (a)94件 / (b)93件。同じ扱いにしていたため
+        # 187件の警告が毎回出て、内訳が誰にも分からなくなっていた。
+        out_of_scope = [u for u in unresolved if u.media == "OTHER"]
+        need_action = [u for u in unresolved if u.media != "OTHER"]
+        summary["unresolved"] = len(need_action)
+        summary["out_of_scope"] = len(out_of_scope)
+        if out_of_scope:
+            media_names = ", ".join(sorted({
+                (u.company or "")[:12] for u in out_of_scope})[:4])
+            print(f"[applicant_sync] スコープ外の媒体 {len(out_of_scope)}件 "
+                  f"(取込対象外。例: {media_names})", flush=True)
+        if need_action:
             samp = ", ".join(f"{u.company[:14]}({u.login_id[:20]})"
-                             for u in unresolved[:5])
+                             for u in need_action[:5])
             slack_notify(dry_run=dry_run, message=
-                f"⚠️ 応募連携: アカウント特定不可 {len(unresolved)}件 "
-                f"(要手動確認) 例: {samp}")
+                f"⚠️ 応募連携: アカウント特定不可 {len(need_action)}件\n"
+                f"顧客管理シートに会社名の登録が無い可能性があります。\n"
+                f"例: {samp}")
 
         # ---- HR: 1マスターで日付範囲一括 (リクロジアドレスで100%突合) ----
         hr_items = grouped.get("HR::master", [])
