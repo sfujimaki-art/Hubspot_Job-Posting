@@ -416,6 +416,8 @@ def read_new_items_from_sheet1(
         return cols.get(name)
 
     items: list[QueueItem] = []
+    # 同一内容の通知が何件目かを数える (row_id の衝突回避。下の生成箇所参照)
+    _dup_seen: dict[str, int] = {}
     import hashlib
     for i, r in enumerate(data, start=2):  # data先頭=シート行2
         def g(name: str) -> str:
@@ -440,9 +442,27 @@ def read_new_items_from_sheet1(
         if cutoff_iso and not _s1_date_recent(date, cutoff_iso):
             continue
         company = re.sub(r"[（(].+?[)）]", "", g("company")).strip()
-        # 安定ID = 内容ハッシュ (行番号非依存=削除に強い)
+        # 安定ID = 内容ハッシュ + 同一内容の出現順 (行番号非依存=削除に強い)
+        #
+        # ★出現順を足す理由 (2026-08-07):
+        #   シート1の通知行は「同じ会社・同じ日」なら**全カラムが完全に一致**
+        #   する。差出人は応募者ではなく顧客担当者のアドレスなので、同一会社
+        #   では常に同じ。そのため内容ハッシュだけでは1つのIDに潰れていた。
+        #   実測: 8/01以降のAW 145行 → 一意ID 111個(34行=23%が衝突)。
+        #   フジタ 8/01の4件、ホリコー 8/02の3件などが1件として扱われ、
+        #   1件処理すれば残りも「処理済み」になって二度と取りに行かなかった。
+        #   HubSpotの実件数が通知数ではなく**一意ID数に張り付いていた**のが
+        #   その証拠(8/01: 通知21/一意15/HubSpot18、8/03: 16/13/13)。
+        #
+        #   行番号は使わない。運用者が行を削除するとズレて、既に処理した行が
+        #   未処理として復活する(この設計を「行削除に強い」と呼んでいた)。
+        #   代わりに「同一内容の何件目か」を足す。行が消えても、残った行の
+        #   相対順序は保たれる。
+        _base = f"{media_type}|{g('from')}|{date}|{subj}|{company}"
+        _seq = _dup_seen.get(_base, 0)
+        _dup_seen[_base] = _seq + 1
         rid = "S1-" + hashlib.md5(
-            f"{media_type}|{g('from')}|{date}|{subj}|{company}".encode("utf-8")
+            f"{_base}|#{_seq}".encode("utf-8")
         ).hexdigest()[:16]
         items.append(QueueItem(
             row_id=rid, media_type=media_type,
