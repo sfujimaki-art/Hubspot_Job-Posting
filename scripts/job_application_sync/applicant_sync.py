@@ -53,6 +53,9 @@ LOCK_STALE_SEC = 15 * 60
 # BAN対策: 1run あたり新規ログインするAWアカウント数の上限。
 # 5分バッチで少しずつ捌く(全106社なら ~9run/~45分に分散)。session再利用で2回目以降は再ログインなし。
 MAX_AW_ACCOUNTS_PER_RUN = int(os.environ.get("JAS_MAX_AW_PER_RUN", "12"))
+# 5分ごとの sync 末尾で拾い直す件数の上限。対象は「対象外」の応募のみで
+# 実測180件のため 500 で十分足りる。増えたら envで調整する。
+RELINK_LIMIT_PER_SYNC = int(os.environ.get("JAS_RELINK_PER_SYNC", "500"))
 _DATA = _REPO / "data" / "job_application_sync"
 SESSION_DIR = Path(os.environ.get("JAS_SESSION_DIR", _DATA / "aw_sessions"))
 LEDGER_PATH = Path(os.environ.get("JAS_LEDGER_PATH", _DATA / "applicant_ledger.json"))
@@ -574,6 +577,31 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                   f"{type(e).__name__}: {str(e)[:100]}", flush=True)
             slack_notify(dry_run=dry_run, message=
                 f"⚠️ 顧客シート転記が全体失敗: {type(e).__name__}")
+    # ── 求人未特定の応募を、この回のうちに拾い直す ──────────────────
+    # なぜ毎回やるか (2026-08-07 ユーザー指示):
+    #   応募の取り込みは5分ごと、求人の取り込みは日3回。**同じ朝でも応募の
+    #   ほうが先に走る**ため、その日に新しく掲載された求人へ来た応募は
+    #   「求人が無い」状態でHubSpotに入る。
+    #   実例: 武田さんの応募 07:47:32 → 求人の作成 07:51:09 (3分37秒差)。
+    #   relink は日1回だったため紐付いたのは22:24で、現場は16:56に
+    #   「求人票が紐づいていない」と報告していた。**約15時間、現場は
+    #   紐づいていない画面を見ていた**。
+    #   処理としては正しく最終的に紐付くが、現場が作業する時間帯に
+    #   間に合っていなかった。設計に「現場がいつ見るか」が無かった。
+    #
+    # 対象は「対象外」の応募のみ(実測180件)なので毎回走らせても軽い。
+    # 本線(応募の取り込み)には影響させない = 失敗しても握って続行する。
+    if not dry_run:
+        try:
+            rl = relink(dry_run=False, limit=RELINK_LIMIT_PER_SYNC)
+            summary["relinked"] = rl.get("relinked", 0)
+            if rl.get("relinked"):
+                print(f"[applicant_sync] 求人未特定だった応募を "
+                      f"{rl['relinked']}件 紐付けました", flush=True)
+        except Exception as e:  # noqa: BLE001
+            # 本線は成功しているので落とさない。ただし黙らせない。
+            print(f"[applicant_sync] relink失敗(本線には影響なし): "
+                  f"{type(e).__name__}: {str(e)[:120]}", flush=True)
     print(f"[applicant_sync-done] {summary}", flush=True)
     return summary
 

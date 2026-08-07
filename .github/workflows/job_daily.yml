@@ -11,16 +11,28 @@ name: Job Daily
 
 on:
   schedule:
-    - cron: "0 22 * * *"    # 毎日 22:00 UTC (= 07:00 JST) HR差分
-    - cron: "20 22 * * *"   # 20分後に AW-collect (create→生成待ち→collect)
+    # ── 求人の取り込みは日3回 (JST 1時 / 12時 / 20時) ──────────────
+    # なぜ3回か: 応募の取り込みは5分ごとなので、求人が日1回だと
+    # **その日に新しく掲載された求人へ来た応募が、求人より先にHubSpotへ入る**。
+    # 実例 2026-08-06: 応募07:47:32 → 求人07:51:09 (3分37秒差)。現場は
+    # 16:56 に「求人票が紐づいていない」と報告し、紐付いたのは22:24だった。
+    # 求人を先回りさせて追い越しの窓を狭める (2026-08-07 ユーザー指示)。
+    # ※ GitHubのcronは名目より遅れて着弾する(実測で数時間ずれる日がある)。
+    #    完全には防げないので、応募側でも毎回 relink して取りこぼしを拾う。
+    - cron: "0 16 * * *"    # JST 01:00  HR差分
+    - cron: "0 3 * * *"     # JST 12:00  HR差分
+    - cron: "0 11 * * *"    # JST 20:00  HR差分
+    # AW-collect は生成待ちがあるので各回の20分後に置く
+    - cron: "20 16 * * *"   # JST 01:20  AW-collect
+    - cron: "20 3 * * *"    # JST 12:20  AW-collect
+    - cron: "20 11 * * *"   # JST 20:20  AW-collect
     # AW応募起点ブートストラップ(導入期): 応募が来た社の求人を最新から遡って習得。
-    # 3社/run × 3回/日 で残アカウントを数日で完走させる。求人が揃ったら停止してよい。
-    # GitHubのscheduleは毎時00分(高負荷)ほど遅延/破棄されやすいのでオフピーク分に置く。
-    - cron: "23 1 * * *"    # 10:23 JST
-    - cron: "23 5 * * *"    # 14:23 JST
-    - cron: "23 9 * * *"    # 18:23 JST
-    # 取引まわりの健全性 (deal_hygiene job)。HR取込の後に別jobで回す。
-    - cron: "40 22 * * *"
+    # 求人が揃ったら停止してよい。毎時00分(高負荷)を避けてオフピーク分に置く。
+    - cron: "23 1 * * *"    # JST 10:23
+    - cron: "23 5 * * *"    # JST 14:23
+    - cron: "23 9 * * *"    # JST 18:23
+    # 取引まわりの健全性 (deal_hygiene job)。求人取込(JST 1時)の後に回す。
+    - cron: "40 16 * * *"   # JST 01:40
   workflow_dispatch:
     inputs:
       phase:
@@ -52,7 +64,7 @@ jobs:
     # GitHub は cron ごとに全 job を評価するため、除外しないと
     # PHASE決定の `*)` フォールバックで hr が誤爆する。
     if: >-
-      github.event.schedule != '40 22 * * *' &&
+      github.event.schedule != '40 16 * * *' &&
       inputs.phase != 'deal-hygiene'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -108,9 +120,14 @@ jobs:
           PHASE="$PHASE_IN"
           if [ -z "$PHASE" ]; then
             case "$SCHEDULE" in
-              "20 22 * * *")                            PHASE="aw-collect" ;;
-              "23 1 * * *"|"23 5 * * *"|"23 9 * * *")   PHASE="aw-create-apps" ;;
-              *)                                     PHASE="hr" ;;
+              # 求人取込(日3回) JST 1/12/20時
+              "0 16 * * *"|"0 3 * * *"|"0 11 * * *")        PHASE="hr" ;;
+              # AW回収は各回の20分後
+              "20 16 * * *"|"20 3 * * *"|"20 11 * * *")     PHASE="aw-collect" ;;
+              "23 1 * * *"|"23 5 * * *"|"23 9 * * *")       PHASE="aw-create-apps" ;;
+              # ★ここに来たら cron を足して case を更新し忘れている。
+              #   黙って hr にすると重いジョブが想定外の時刻に走るので落とす。
+              *) echo "::error::未知のschedule '$SCHEDULE' — caseの更新漏れ"; exit 1 ;;
             esac
           fi
           echo "PHASE=$PHASE (schedule='$SCHEDULE')"
@@ -185,7 +202,7 @@ jobs:
   # 29日(最終2026-07-08) 起動されていなかった。GitHub側の cron で二重化する。
   deal_hygiene:
     if: >-
-      github.event.schedule == '40 22 * * *' ||
+      github.event.schedule == '40 16 * * *' ||
       inputs.phase == 'deal-hygiene'
     runs-on: ubuntu-latest
     timeout-minutes: 60
