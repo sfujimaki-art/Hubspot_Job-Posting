@@ -91,6 +91,32 @@ def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 
+def _norm_company(s: str) -> str:
+    """会社名の突合キー。**表記の揺れだけを吸収し、意味は変えない**。
+
+    2026-08-07 に未突合35件を1社ずつシートと突き合わせて分類した結果、
+    大半が「同じ会社なのに文字列が違うだけ」だった。吸収するのは以下:
+
+      空白の有無      「株式会社ONO plus」   ↔「株式会社ONOplus」
+      全角/半角       「株式会社YAMANAKA 高崎工場」↔「株式会社ＹＡＭＡＮＡＫＡ高崎工場」
+      アンダースコア  「大五ロジスティクス＿宮城」↔「大五ロジスティクス_宮城」
+      運用メモ        「株式会社たかふね工業※解約済」↔「株式会社たかふね工業」
+      長音の揺れ      「SBS三愛ロジスティックス」↔「SBS三愛ロジスティクス」
+
+    **事業所名は落とさない**。落とすと別拠点を掴む。実測で
+    「カタニ産業株式会社」に群馬支店と東京支店の2候補があり、機械では
+    どちらか決められない。そういうものは未突合のまま人へ回す
+    (→[[feedback_jigyousho_unit_sales]] 決裁は事業所単位)。
+    """
+    import unicodedata
+    t = unicodedata.normalize("NFKC", str(s or ""))
+    t = re.sub(r"[※*]\s*.*$", "", t)          # 「※解約済」等の運用メモを落とす
+    t = re.sub(r"[\s　]", "", t)               # 空白(全角含む)
+    t = t.replace("＿", "_")                   # 全角アンダースコア
+    t = re.sub(r"[ｯッ](?=[クキカコ])", "", t)   # ロジスティックス↔ロジスティクス
+    return t.lower()
+
+
 def _split_multi(s: str) -> list[str]:
     """改行/カンマ区切りの複数値を分割. 'ID：xxx' の接頭辞も除去."""
     out = []
@@ -187,6 +213,9 @@ class AccountResolver:
         self.idx_aid: dict[str, list] = {}
         self.idx_reclog: dict[str, list] = {}
         self.idx_comp: dict[str, list] = {}
+        # 正規化した会社名 → 行。**同名が複数ある場合は候補を全部持つ**
+        # (1つに決められないものを機械が勝手に選ばないため)
+        self.idx_comp_norm: dict[str, list] = {}
         self.cols: dict = {}
 
     def build(self) -> "AccountResolver":
@@ -208,6 +237,8 @@ class AccountResolver:
                 self.idx_reclog[_norm(g(c["reclog"]))] = r
             if g(c["comp"]).strip():
                 self.idx_comp[_norm(g(c["comp"]))] = r
+                self.idx_comp_norm.setdefault(
+                    _norm_company(g(c["comp"])), []).append(r)
         return self
 
     def resolve(self, item: QueueItem) -> Optional[ResolvedAccount]:
@@ -224,6 +255,14 @@ class AccountResolver:
             if key and key in idx:
                 row, by = idx[key], name
                 break
+        if row is None:
+            # 最後の砦: 表記の揺れだけを吸収した会社名で一致を試す。
+            # **候補が2件以上あるものは触らない**(事業所違いを掴むため)。
+            # 実測 2026-08-07: 未突合35件のうち22件がこれで繋がる。
+            # 残る11件は事業所が複数あり機械では決められない=人へ回す。
+            cand = self.idx_comp_norm.get(_norm_company(item.company)) or []
+            if len(cand) == 1:
+                row, by = cand[0], "company_normalized"
         if row is None:
             return None
         g = lambda i: row[i] if len(row) > i else ""  # noqa: E731
