@@ -402,7 +402,34 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             if st == "FAILED" and ledger.attempts(rid) >= MAX_ATTEMPTS:
                 return True
             return False
+        # ── 台帳がどれだけ除外しているかを必ず出す ──────────────────
+        # なぜ要るか (2026-08-07): CIでは毎回 accounts:0 なのに、ローカルで
+        # 同じ集約を回すと49社/145件が対象になる。差は台帳しかないが、台帳は
+        # actions/cache の中にあり外から読めないため、**何件をどの理由で
+        # 落としたかが誰にも見えなかった**。落とした事実を必ずログに残す。
+        _before = len(items)
+        _st = {"DONE": 0, "SKIP": 0, "FAILED_OVER": 0, "OTHER": 0}
+        for _it in items:
+            _s = ledger.status(_it.row_id)
+            if _s == "DONE":
+                _st["DONE"] += 1
+            elif _s == "SKIP":
+                _st["SKIP"] += 1
+            elif _s == "FAILED" and ledger.attempts(_it.row_id) >= MAX_ATTEMPTS:
+                _st["FAILED_OVER"] += 1
         items = [it for it in items if not _skip_item(it.row_id)]
+        print(f"[applicant_sync] 台帳による除外: {_before}件 → {len(items)}件 "
+              f"(DONE={_st['DONE']} SKIP={_st['SKIP']} "
+              f"FAILED上限超={_st['FAILED_OVER']}) / 台帳の総記録数="
+              f"{len(ledger.data):,}", flush=True)
+        # セッション再利用が効いているか (BAN対策の本丸。設計書2026-07-07)。
+        # 保存されていなければ毎回フルログイン = PW反復送信 = BANリスク源。
+        try:
+            _sess = list(SESSION_DIR.glob("*.json")) if SESSION_DIR.exists() else []
+            print(f"[applicant_sync] AWセッション保存数: {len(_sess)}件 "
+                  f"({SESSION_DIR})", flush=True)
+        except OSError:
+            pass
         resolver = aq.AccountResolver().build()
         grouped, unresolved = aq.aggregate_by_account(items, resolver)
 
