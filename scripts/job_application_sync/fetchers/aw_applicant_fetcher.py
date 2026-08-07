@@ -166,6 +166,16 @@ async def fetch_aw_applicants(
             # 1) ログインは establish_aw_session で完了済 (セッション再利用/再ログイン)
             # 2) 応募者一覧
             await page.goto(URL_ENTRIES, wait_until="networkidle")
+            # ★ここで認証済みでない画面(例 /interaction)に居たら、そのまま
+            #   進めても button が0個で「ボタン未検出」になるだけ。原因が
+            #   ボタン探索に見えて実体は認証切れ、という誤診を防ぐため明示する
+            #   (2026-08-07: これで丸一日 done=0 を出し続けた)。
+            if not awf._is_authenticated_url(page.url):
+                await awf._dump_debug(page, output_dir, "not_authenticated")
+                raise RuntimeError(
+                    f"応募者一覧に到達できず(認証切れの疑い): url={page.url} "
+                    f"(login_id={login_id})"
+                )
 
             # 3) DLボタン click → download イベント捕捉
             try:

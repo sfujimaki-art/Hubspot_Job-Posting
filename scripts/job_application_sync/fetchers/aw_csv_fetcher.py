@@ -177,6 +177,17 @@ CREATE_DONE = "__create_done__"  # mode="create" 完了マーカー (生成ト�
 URL_DASHBOARD = "https://ats.rct.airwork.net/dashboards"
 
 
+def _is_authenticated_url(url: str) -> bool:
+    """AWで「認証済みの画面にいる」か。ホワイトリスト方式。
+
+    ★除外リスト方式(URLに login/airplf を含まないなら有効)は誤判定する。
+      期限切れセッションの実際の着地先は /interaction
+      (「アカウント登録・ログイン選択」画面) で、どちらの語も含まない。
+    """
+    path = url.split("?")[0].split("#")[0].rstrip("/")
+    return any(path.endswith(p) for p in ("/dashboards", "/entries"))
+
+
 async def establish_aw_session(
     browser,
     login_id: str,
@@ -206,8 +217,19 @@ async def establish_aw_session(
         try:
             await page.goto(URL_DASHBOARD, wait_until="domcontentloaded",
                             timeout=45000)
-            if "login" not in page.url and "airplf" not in page.url:
-                return ctx, page          # 再利用成功 = ログイン画面を通らず
+            # ★「ログイン画面でなければ有効」ではなく「dashboards に着地したか」
+            #   で判定する (2026-08-07 実測で是正)。
+            #   期限切れセッションで /dashboards を開くと AirWork は
+            #     https://ats.rct.airwork.net/interaction
+            #   (「アカウント登録・ログイン選択」画面) へ飛ばす。この URL には
+            #   "login" も "airplf" も含まれないため、旧判定は**有効とみなして
+            #   再ログインせず**先へ進んでいた。その結果 /entries も interaction
+            #   のままとなり button が 0 個 →「応募者一覧をダウンロードボタン
+            #   未検出」として失敗していた。症状がボタン探索の失敗に見えるので、
+            #   セレクタやビューポートをいくら直しても解消しない。
+            #   実測: 期限切れ→/interaction・button=0、正常→/dashboards。
+            if _is_authenticated_url(page.url):
+                return ctx, page          # 再利用成功 = dashboards に着地
         except Exception:  # noqa: BLE001
             pass
         await ctx.close()                 # 無効 → 破棄して full login
