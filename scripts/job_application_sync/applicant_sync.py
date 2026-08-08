@@ -368,9 +368,25 @@ def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
     results = ai.run_import(rows, cli)
     from collections import Counter
     st = Counter(r.status for r in results)
-    result.update(ok=True, linked=st.get("linked", 0),
+    n_err = st.get("error", 0)
+    # ★AW側と同じ判定に揃える (2026-08-08)。
+    #   2026-08-07 に AW(process_aw_account) だけ是正し、HRを直し忘れていた。
+    #   HRは ok=True がハードコードで error 件数を数えてすらいなかったため、
+    #   何行落ちても「✅ HR: 応募取込 linked=0 unlinked=0 dup=0」と出て
+    #   台帳DONE になり、二度と取りに行かなかった。
+    #   実測: 2026-07-06 の32件がこれで11日間誰にも見えないまま消えていた
+    #   (CSVの行index 1105〜1136。直前直後の行は作成成功しているので
+    #    「到達したのに作成されなかった」ことが確定している)。
+    #   1件でも成功していれば ok、全部エラーなら ok=False で再試行に回す。
+    ok = (len(results) == 0) or (n_err < len(results))
+    result.update(ok=ok, linked=st.get("linked", 0),
                   unlinked=st.get("unlinked", 0),
-                  dup=st.get("skip_duplicate", 0), total=len(results))
+                  dup=st.get("skip_duplicate", 0),
+                  error_rows=n_err, total=len(results))
+    if n_err:
+        result["error"] = f"HR: 取込エラー {n_err}/{len(results)}行"
+        print(f"  ⚠️ HR: 取込エラー {n_err}/{len(results)}行 (ok={ok})",
+              flush=True)
     return result
 
 
