@@ -697,6 +697,15 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             # 本線は成功しているので落とさない。ただし黙らせない。
             print(f"[applicant_sync] relink失敗(本線には影響なし): "
                   f"{type(e).__name__}: {str(e)[:120]}", flush=True)
+        try:
+            # 求人側に後から入った 一次対応の要否 / 担当者 を応募へ伝播する。
+            # 継承は作成時にしか走らないため、これが無いと永久に空のまま残る。
+            pg = propagate_from_listing(dry_run=False)
+            summary["propagated"] = (pg.get("filled_ichijitaiou", 0)
+                                     + pg.get("filled_owner", 0))
+        except Exception as e:  # noqa: BLE001
+            print(f"[applicant_sync] propagate失敗(本線には影響なし): "
+                  f"{type(e).__name__}: {str(e)[:120]}", flush=True)
     print(f"[applicant_sync-done] {summary}", flush=True)
     return summary
 
@@ -869,6 +878,124 @@ def relink(dry_run: bool = False, limit: int = 1000,
     return summary
 
 
+# 求人→応募 の継承項目を後から埋めるスイープの対象日数と1run上限
+PROPAGATE_DAYS = int(os.environ.get("JAS_PROPAGATE_DAYS", "14"))
+PROPAGATE_LIMIT = int(os.environ.get("JAS_PROPAGATE_LIMIT", "300"))
+
+
+def _propagate_props(appt: dict, listings: list) -> dict:
+    """応募へ書き込むべき継承項目だけを返す純関数（テスト対象）。
+
+    不変条件:
+      - 応募側に既に値があるなら**触らない**(人が入れた値を上書きしない)
+      - 求人側が空なら何もしない
+      - 一次対応の要否は作成時と同じ7日ガードを通す(古い応募をキューに積まない)
+    """
+    props: dict = {}
+    if not (appt.get("ichijitaiounoumu") or "").strip():
+        v = next((x.get("ichijitaiounoumu_deforuto") for x in listings
+                  if (x.get("ichijitaiounoumu_deforuto") or "").strip()), None)
+        if v in ("必要", "不要"):
+            props["ichijitaiounoumu"] = v
+            ai.strip_ichijitaiou_if_stale(
+                props, str(appt.get("yingmuri") or "")[:10])
+    if not (appt.get("hubspot_owner_id") or "").strip():
+        w = next((x.get("hubspot_owner_id") for x in listings
+                  if (x.get("hubspot_owner_id") or "").strip()), None)
+        if w:
+            props["hubspot_owner_id"] = w
+    return props
+
+
+def propagate_from_listing(dry_run: bool = False, days: int = 0,
+                           limit: int = 0) -> dict:
+    """既に求人へ紐付いている応募の、継承項目の空欄を後から埋める。
+
+    ★なぜ要るか (2026-08-08 実測)
+      継承(一次対応の要否・担当者)は**応募の作成時にしか入らない**。
+      応募が先に入り、あとから求人側(LISTING)に値が入っても応募へは伝播しない。
+      relink() は kokyakushiitotenkijoukyou=="対象外" の応募しか拾わないため、
+      既に紐付いている応募は永久に空のままだった。
+
+      実測 (応募日 2026-08-02以降 652件):
+        一次対応の要否が空 179件 → うち **48件** は求人側に値がある
+        担当者が空        151件 → うち **15件** は求人側に値がある
+      残り(131/136件)は求人側も空で、これは取引側の入力マター(別問題)。
+
+    安全側の設計:
+      - **既に値がある応募には触らない**(人が入れた値を上書きしない)
+      - 求人側が空なら何もしない
+      - 一次対応の要否は古い応募に付けない(作成時と同じ7日ガードを通す)
+      - 対象は直近 days 日の応募だけ(過去分は遡らない)
+    """
+    days = days or PROPAGATE_DAYS
+    limit = limit or PROPAGATE_LIMIT
+    token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
+    H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    B = "https://api.hubapi.com"
+    from datetime import date as _date, timedelta as _td, timezone as _tz
+    since = _date.today() - _td(days=days)
+    since_ms = str(int(datetime(since.year, since.month, since.day,
+                                tzinfo=_tz.utc).timestamp() * 1000))
+    def _post(url, body):
+        r = requests.post(url, headers=H, json=body, timeout=30)
+        return r.json() if r.status_code in (200, 207) else {}
+    # 1) 直近の応募で「要否が空」または「担当者が空」のものを集める
+    #    filterGroups は OR。yingmuri の範囲は各群に入れる(群内はAND)。
+    common = [{"propertyName": "yingmuri", "operator": "GTE", "value": since_ms}]
+    body = {"filterGroups": [
+        {"filters": common + [{"propertyName": "ichijitaiounoumu",
+                               "operator": "NOT_HAS_PROPERTY"}]},
+        {"filters": common + [{"propertyName": "hubspot_owner_id",
+                               "operator": "NOT_HAS_PROPERTY"}]}],
+        "properties": ["ichijitaiounoumu", "hubspot_owner_id", "yingmuri"],
+        "limit": 100}
+    targets, after = [], None
+    while len(targets) < limit:
+        if after:
+            body["after"] = after
+        r = _post(f"{B}/crm/v3/objects/0-421/search", body)
+        targets += r.get("results", [])
+        after = (r.get("paging") or {}).get("next", {}).get("after")
+        if not after:
+            break
+    targets = targets[:limit]
+    if not targets:
+        return {"checked": 0, "filled_ichijitaiou": 0, "filled_owner": 0}
+    # 2) 紐付く求人と、その継承元の値
+    a = _post(f"{B}/crm/v4/associations/0-421/0-420/batch/read",
+              {"inputs": [{"id": o["id"]} for o in targets]})
+    assoc = {str(x["from"]["id"]): [str(t["toObjectId"]) for t in (x.get("to") or [])]
+             for x in a.get("results", [])}
+    lids = sorted({x for v in assoc.values() for x in v})
+    lp: dict = {}
+    for i in range(0, len(lids), 100):
+        d = _post(f"{B}/crm/v3/objects/0-420/batch/read",
+                  {"properties": ["ichijitaiounoumu_deforuto", "hubspot_owner_id"],
+                   "inputs": [{"id": x} for x in lids[i:i + 100]]})
+        for res in d.get("results", []):
+            lp[str(res["id"])] = res.get("properties", {})
+    # 3) 空いている項目だけ埋める
+    n_i = n_o = 0
+    for o in targets:
+        p = o.get("properties") or {}
+        L = [lp.get(x, {}) for x in (assoc.get(o["id"]) or [])]
+        props = _propagate_props(p, L)
+        if not props:
+            continue
+        if "ichijitaiounoumu" in props:
+            n_i += 1
+        if "hubspot_owner_id" in props:
+            n_o += 1
+        if not dry_run:
+            requests.patch(f"{B}/crm/v3/objects/0-421/{o['id']}",
+                           headers=H, json={"properties": props}, timeout=20)
+    out = {"checked": len(targets), "filled_ichijitaiou": n_i,
+           "filled_owner": n_o}
+    print(f"[propagate] {out}", flush=True)
+    return out
+
+
 def reconcile(dry_run: bool = False) -> dict:
     """照合スイープ (放置ゼロの最後の砦, 日次想定).
 
@@ -910,6 +1037,8 @@ def _parse_args(argv=None):
                    help="照合スイープ(日次): 詰まった項目を検出しSlack報告")
     p.add_argument("--relink", action="store_true",
                    help="再紐付けスイープ: 対象外応募を後から出来た求人に紐付け")
+    p.add_argument("--propagate", action="store_true",
+                   help="継承スイープ: 求人側の一次対応要否/担当者を応募の空欄へ伝播")
     p.add_argument("--source", choices=["queue", "sheet1"], default="queue",
                    help="応募の入力元。sheet1=GAS queue座礁を迂回しシート1を直読み")
     p.add_argument("--hr-cutoff", default="",
@@ -921,6 +1050,9 @@ if __name__ == "__main__":
     a = _parse_args()
     if a.relink:
         relink(dry_run=a.dry_run)
+        sys.exit(0)
+    if a.propagate:
+        propagate_from_listing(dry_run=a.dry_run)
         sys.exit(0)
     if a.reconcile:
         reconcile(dry_run=a.dry_run)
