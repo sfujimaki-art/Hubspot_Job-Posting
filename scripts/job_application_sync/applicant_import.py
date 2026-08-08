@@ -445,8 +445,21 @@ class RealHubSpotClient:
         - meeruadoresu の EQ フィルタは正常動作 (実ヒット確認済)。
         - denwabangou には format_jp_phone 整形後の値が格納されている。
 
-        照合: oubobaitaimei 必須 + yingmuri (apply_date 非空時。別日の別求人応募を
-        誤dedupしないため) + email優先 / email空なら denwabangou フォールバック。
+        照合キー = (媒体, 媒体求人ID, 応募日, メール or 電話)。
+        要件定義のユニークキー「(媒体, 媒体求人ID, 応募者キー)」に合わせている。
+
+        ★2026-08-08 是正: 媒体求人IDが引数にあるのに検索条件へ入っておらず、
+          かつメールがあると電話を一切見ていなかった。そのため:
+            - 同一人物が**同じ日に別の求人**へ応募 → メールが同じなら誤って重複扱い
+            - 同一人物が**同じ求人**に、indeedemail のエイリアス末尾違い
+              (..._x66@ と ..._f54@) や 実メールとエイリアスの両方で記録
+              → 別人扱いで2レコード作成
+          実測 (応募日2026-07-25以降 1,230件): 同一媒体内の重複 26組/余剰30件。
+          うち9組は求人IDが違う=正しい別応募、14組が同じ求人IDでのメール揺れ。
+          求人IDを条件に入れたうえで email OR phone にすると、両方を正しく捌ける。
+
+        媒体求人IDの充足率は直近100% (2026-07-25以降 1,230/1,230)、全体85%。
+        空の場合は条件に入れない(従来動作にフォールバック)。
         email も phone も空なら dedup不能 → None (作成に進む)。
         """
         em = normalize_email(email)
@@ -454,6 +467,9 @@ class RealHubSpotClient:
         if not em and not ph:
             return None
         filters = [{"propertyName": "oubobaitaimei", "operator": "EQ", "value": media}]
+        if media_job_id:
+            filters.append({"propertyName": "oubokyuujinmemo",
+                            "operator": "EQ", "value": str(media_job_id)})
         if apply_date:
             # date型プロパティのEQは "YYYY-MM-DD" 文字列だと検索400 (既知教訓:
             # saishuu_csv_kenshutsu_bi でも同事象)。UTC深夜0時の epoch millis に変換必須。
@@ -465,13 +481,20 @@ class RealHubSpotClient:
                                 "value": str(ms)})
             except ValueError:
                 pass  # 不正日付はフィルタに含めない (media+email/phone で照合)
+        # メール or 電話 のどちらかが一致すれば重複。filterGroups は OR、
+        # group内の filters は AND なので、共通条件+メール / 共通条件+電話 の2群にする。
+        # 旧実装は「emailがあれば電話を見ない」だったため、同じ求人への応募でも
+        # メール表記が揺れると別レコードになっていた (indeedemail のエイリアス等)。
+        groups = []
         if em:
-            filters.append({"propertyName": "meeruadoresu", "operator": "EQ", "value": em})
-        else:
+            groups.append({"filters": filters + [
+                {"propertyName": "meeruadoresu", "operator": "EQ", "value": em}]})
+        if ph:
             # 格納値は format_jp_phone 整形済のため、dedup検索も同形式で照合
-            filters.append({"propertyName": "denwabangou", "operator": "EQ", "value": ph})
+            groups.append({"filters": filters + [
+                {"propertyName": "denwabangou", "operator": "EQ", "value": ph}]})
         body = {
-            "filterGroups": [{"filters": filters}],
+            "filterGroups": groups,
             "properties": ["hs_object_id"],
             "limit": 2,
         }
@@ -1159,13 +1182,44 @@ def process_applicant(
         )
 
 
+def _dedup_keys_in_run(row: "ApplicantRow") -> list:
+    """同一run内の重複検出キー。(媒体, 求人ID, 応募日, メール|電話) の2本。
+
+    ★HubSpot の search はインデックス反映に数秒かかるため、**同じCSVに同じ人が
+      2行入っていると、2件目の dedup 検索が1件目を見つけられない**。
+      実測 (2026-07-26 瀬下達夫): 同一メール・同一求人IDのレコードが
+      08:03:20 と 08:03:24 の **4秒差** で2件作られていた。
+      APIに聞くのではなく、このrunで既に作ったキーを自分で覚えて弾く。
+    """
+    em = normalize_email(row.email)
+    ph = format_jp_phone(row.phone) if row.phone else ""
+    base = (row.media, str(row.media_job_id or ""), row.apply_date)
+    out = []
+    if em:
+        out.append(base + ("email", em))
+    if ph:
+        out.append(base + ("phone", ph))
+    return out
+
+
 def run_import(
     rows: Iterable[ApplicantRow], client: HubSpotClient, default_login_id: str = ""
 ) -> list[ProcessResult]:
     results = []
+    seen_in_run: set = set()
     for row in rows:
         try:
+            keys = _dedup_keys_in_run(row)
+            if keys and any(k in seen_in_run for k in keys):
+                results.append(ProcessResult(
+                    status="skip_duplicate",
+                    applicant_key=f"L{row.raw_lineno}:{row.name}",
+                    media=row.media, media_job_id=row.media_job_id,
+                    message="同一run内の重複 (HubSpot検索の反映待ちを回避)",
+                ))
+                continue
             results.append(process_applicant(row, client, default_login_id))
+            seen_in_run.update(keys)
         except Exception as e:
             results.append(ProcessResult(
                 status="error",
