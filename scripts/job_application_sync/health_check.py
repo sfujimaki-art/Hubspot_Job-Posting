@@ -173,13 +173,28 @@ def check_recent_listings_linked() -> dict:
         return {"name": f"直近{RECENT_DAYS}日の求人が取引に紐付いているか",
                 "value": 0, "want": 0, "detail": ["対象求人なし"]}
     assoc = _assoc("0-420", "0-3", ids)
-    # 公開終了は紐付いていなくても実害が小さい(既に募集していない)
+    # ★母数は「応募が来ている公開中の求人」に限る (2026-08-09 較正)。
+    #   HRハッカーの求人はリクロジの顧客以外のものも取り込んでいるため、
+    #   直近作成の求人を全部母数にすると**取引に紐付かないのが正常な求人**が
+    #   大量に混ざり、この項目は永久にNGのままになる。
+    #   実測: 直近14日の求人4,996件 → 現行判定で未紐付け189件。
+    #         うち応募が来ている公開中のものは **52件** だけ。
+    #   3項目が恒久NGだと誰も見なくなり、本物の異常が埋もれる(実際そうなっていた)。
+    #   応募が来ている＝リクロジが扱っている求人なので、取引に紐付くべき。
+    #   停止検知の役割は維持される(sync_deal_association が止まれば日々増える)。
+    appt = _assoc("0-420", "0-421", ids)
     unlinked = [o for o in rows
                 if not assoc.get(o["id"])
+                and appt.get(o["id"])          # 応募が来ている求人だけ
                 and (o.get("properties") or {}).get("kyuujin_status") != "公開終了"]
+    n_target = sum(1 for o in rows
+                   if appt.get(o["id"])
+                   and (o.get("properties") or {}).get("kyuujin_status") != "公開終了")
     return {"name": f"直近{RECENT_DAYS}日の求人が取引に紐付いているか",
             "value": len(unlinked), "want": 0,
-            "detail": [f"対象 {len(ids):,}件中 未紐付け {len(unlinked):,}件"]
+            "detail": [f"応募が来ている公開中の求人 {n_target:,}件中 "
+                       f"未紐付け {len(unlinked):,}件 "
+                       f"(作成された求人は {len(ids):,}件。他社求人を含むため母数から除外)"]
                       + [f"  例: {(o.get('properties') or {}).get('hs_name','')[:34]}"
                          for o in unlinked[:3]]}
 
@@ -228,12 +243,19 @@ def check_search_cap() -> dict:
     実測 (2026-08-06): customer_sheet_url 持ちの求人が9,230件で残り770件だった。
     先に気づけるよう、9,000件を超えたクエリを警告する。
     """
+    # ★監視するのは「実際に search でページングしている本番クエリ」だけ。
+    #   2026-08-09 較正: 「顧客シートURL持ちの求人 (drift)」を外した。
+    #   check_sheet_url_drift は既に上限の無い list API (iter_all) へ移行済みで、
+    #   customer_sheet_url を search で全件ページングするコードはもう存在しない
+    #   (customer_sheet_sync は CONTAINS_TOKEN のシート単位検索で数十件)。
+    #   それでも9,644件=96%と警告し続けており、**実在しない危険で3項目中1つを
+    #   恒久的にNGにしていた**。誤警報は本物の異常を埋もれさせるので落とす。
+    #   残す2つは今も search でページングしている:
+    #     relink_to_latest_deal.py の 0-3 search / sync_ichijitaiou の _search_all
     queries = [
-        ("納品管理PLの取引 (relink)", "0-3",
+        ("納品管理PLの取引 (relink_to_latest_deal)", "0-3",
          [{"propertyName": "pipeline", "operator": "EQ", "value": "21596025"}]),
-        ("顧客シートURL持ちの求人 (drift)", "0-420",
-         [{"propertyName": "customer_sheet_url", "operator": "HAS_PROPERTY"}]),
-        ("管理用メール持ちの取引 (ichijitaiou)", "0-3",
+        ("管理用メール持ちの取引 (sync_ichijitaiou)", "0-3",
          [{"propertyName": "kanri_mail_address", "operator": "HAS_PROPERTY"}]),
     ]
     over, detail = 0, []
@@ -257,11 +279,22 @@ def check_search_cap() -> dict:
 
 
 def check_recent_applications_linked() -> dict:
-    """最近の応募が求人に紐付いているか (紐付かないと転記も一次対応も効かない)。"""
+    """最近の応募が求人に紐付いているか (紐付かないと転記も一次対応も効かない)。
+
+    ★軸は yingmuri(応募日)。hs_createdate(HubSpot登録日) ではない (2026-08-09 較正)。
+
+    登録日で数えると、過去分をまとめて取り込んだ日に**古い応募が大量に母数へ入る**。
+    それらは媒体側で求人が既に削除済みで紐付けようがなく、恒久的にNGになる。
+    実測 (2026-08-08の実行): 登録日基準で「応募882件中155件が未紐付け」と出たが、
+    同じ日を応募日基準で数えると **未紐付け0件**。155件は8/07の復旧で入った
+    2024〜2026年の過去分だった (求人がAirWork側で削除済み=救済不能)。
+
+    知りたいのは「今日来た応募がちゃんと求人に繋がっているか」なので応募日で見る。
+    """
     since = int((datetime.now(timezone.utc)
                  - timedelta(days=3)).timestamp() * 1000)
-    rows = search_all("0-421", ["hs_createdate"],
-                      [{"propertyName": "hs_createdate", "operator": "GTE",
+    rows = search_all("0-421", ["yingmuri"],
+                      [{"propertyName": "yingmuri", "operator": "GTE",
                         "value": str(since)}])
     ids = [o["id"] for o in rows]
     if not ids:
@@ -271,7 +304,8 @@ def check_recent_applications_linked() -> dict:
     unlinked = [i for i in ids if not assoc.get(i)]
     return {"name": "直近3日の応募が求人に紐付いているか", "value": len(unlinked),
             "want": 0,
-            "detail": [f"応募 {len(ids):,}件中 求人未紐付け {len(unlinked):,}件"]}
+            "detail": [f"応募 {len(ids):,}件中 求人未紐付け {len(unlinked):,}件 "
+                       f"(応募日基準。登録日ではない)"]}
 
 
 CHECKS = [check_stage_consistency, check_recent_listings_linked,
