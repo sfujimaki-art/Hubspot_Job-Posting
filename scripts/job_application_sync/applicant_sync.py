@@ -697,15 +697,17 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             # 本線は成功しているので落とさない。ただし黙らせない。
             print(f"[applicant_sync] relink失敗(本線には影響なし): "
                   f"{type(e).__name__}: {str(e)[:120]}", flush=True)
-        try:
-            # 求人側に後から入った 一次対応の要否 / 担当者 を応募へ伝播する。
-            # 継承は作成時にしか走らないため、これが無いと永久に空のまま残る。
-            pg = propagate_from_listing(dry_run=False)
-            summary["propagated"] = (pg.get("filled_ichijitaiou", 0)
-                                     + pg.get("filled_owner", 0))
-        except Exception as e:  # noqa: BLE001
-            print(f"[applicant_sync] propagate失敗(本線には影響なし): "
-                  f"{type(e).__name__}: {str(e)[:120]}", flush=True)
+        # ★定期実行から外した (2026-08-09)。
+        #   実測で埋まった件数が 0〜2件で、効果を実証できなかった。
+        #   原因は伝播元が空なこと: 直近7日で要否が空の応募139件に対し、
+        #   紐付く求人側に値があるのは0件だった(求人81件中1件のみ)。
+        #   「48件埋まる」と見積もったが、あれは7日ガードを適用せずに
+        #   数えた値で、ガードを入れた実装での実効値ではなかった。
+        #   実績ゼロのまま5分ごとにAPIを3回叩くのは、今日さんざん問題に
+        #   なった「効いていないのに動いているように見えるもの」そのもの。
+        #   関数と --propagate は残してあるので、伝播元(求人側の要否既定)が
+        #   埋まるようになったら戻せる。
+        #   propagate_from_listing(dry_run=False)
     print(f"[applicant_sync-done] {summary}", flush=True)
     return summary
 
