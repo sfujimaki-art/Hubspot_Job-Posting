@@ -91,9 +91,15 @@ def build_mail_to_deal() -> dict:
         [{"propertyName": "kanri_mail_address", "operator": "HAS_PROPERTY"}])
     m = {}
     for d in deals:
-        km = ((d.get("properties") or {}).get("kanri_mail_address") or "").strip().lower()
-        if km:
-            m.setdefault(km, d["id"])
+        raw = ((d.get("properties") or {}).get("kanri_mail_address") or "")
+        # ★1取引に複数アドレスが入る (";" or "," 区切り)。丸ごと1キーにすると
+        #   個別アドレスで引けない (2026-08-10 実測: 複数持ちの取引27件=全体の1%、
+        #   分割しないことで引けなくなるキーが15個)。sync_ichijitaiou は
+        #   既に分割しており、こちらだけ揃っていなかった。
+        for km in raw.replace(",", ";").split(";"):
+            km = km.strip().lower()
+            if km:
+                m.setdefault(km, d["id"])
     print(f"[deal] 管理メール索引={len(m)}", flush=True)
     return m
 

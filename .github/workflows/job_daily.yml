@@ -153,6 +153,15 @@ jobs:
           case "$PHASE" in
             hr)
               python scripts/job_application_sync/hr_watcher.py $FLAG --skip-aw
+              # ★取引側の店舗ID(hrhacker_shop_ids)をその日のCSVで補完する。
+              #   ここに置く理由: hr_watcher が scratchpad/csv_fetched/hr へ
+              #   落とした**最新CSVが同じジョブ内にある**ため受け渡しが要らない。
+              #   これが無いと新しい店舗の取引に鍵が入らず、
+              #   sync_deal_association(deal_hygiene 01:40) が引けない。
+              #   実測(2026-08-10): 未紐付け求人の店舗ID31種のうち、2026-07-03の
+              #   固定CSVでは8種しか載っておらず残りは永久に補完できなかった。
+              #   和集合マージなので既存値は消えない。冪等。
+              python scripts/job_application_sync/backfill_deal_shop_id_via_email.py                 $FLAG || echo "::warning::店舗ID補完が失敗(本線は継続)"
               # ※ 取引まわりの処理(紐付け/一次対応/健全性)は deal_hygiene job へ
               #   切り出した(2026-08-06)。ここに置くと (1)Playwrightの求人取込が
               #   落ちた時に後続が丸ごと実行されない (2)同じconcurrency groupの
@@ -241,10 +250,14 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
           #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
           #   → メモの転記 → 検知
+          # ★先に取引側の鍵(管理用メール)を埋める。紐付けはこれを引くので順序が重要。
+          #   顧客管理シートを直読みするので常に最新。既存値は触らない設計。
+          #   これまで一度も定期実行されておらず、新規顧客の取引が空のままだった。
+          python scripts/job_application_sync/backfill_deal_rpo_mail.py $FLAG || RC_RPO=$?
           python scripts/job_application_sync/sync_deal_association.py $FLAG || RC_ASSOC=$?
           # 契約更新で新しい取引が作られた際の付け替え。sync_deal_association は
           # 「既に紐付いている求人」をスキップする設計なので、旧取引にぶら下がった
@@ -264,7 +277,7 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
           NG=""
