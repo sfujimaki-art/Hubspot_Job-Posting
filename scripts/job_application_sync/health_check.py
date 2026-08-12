@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -157,6 +158,57 @@ def check_stage_consistency() -> dict:
             "want": 0, "detail": detail}
 
 
+def _company_hint() -> dict:
+    """識別子 → 会社名 の索引を作る (best-effort)。
+
+    ★「どの取引に入れるのか」が分からないと現場は動けない。
+      しかし LISTING に会社名の列は無く、応募側の応募先取引名も
+      **取引に紐付いていないから空**という循環になっている。
+      そこで外側から引く:
+        AW: airwork_account_login_id → 顧客管理シートの会社名
+        HR: 店舗id → HR求人CSVの連絡先メール → シートのリクロジアドレス → 会社名
+      監視スクリプトを重くしたくないので**失敗しても握って空を返す**
+      (会社名が出ないだけで、件数と店舗ID/ログインIDは従来どおり出る)。
+    """
+    idx: dict = {}
+    try:
+        import csv as _csv
+        import glob as _glob
+        from scripts.job_application_sync import applicant_queue as _aq
+        os.environ.setdefault("SHEETS_AUTH_MODE", "sa")
+        r = _aq.AccountResolver().build()
+        c = r.cols
+        # AW: login_id / エイリアス / リクロジアドレス → 会社名
+        for key_idx in ("bid", "aid", "reclog", "alias"):
+            for k, row in {"bid": r.idx_bid, "aid": r.idx_aid,
+                           "reclog": r.idx_reclog, "alias": r.idx_alias}[key_idx].items():
+                comp = row[c["comp"]] if len(row) > c["comp"] else ""
+                if k and comp:
+                    idx.setdefault(k, comp)
+        # HR: 店舗id → 連絡先メール → (上の索引で) 会社名
+        cs = sorted(_glob.glob(str(_REPO / "scratchpad" / "csv_fetched" / "hr"
+                                   / "hr_offers_all_*.csv")))
+        if cs:
+            for enc in ("cp932", "utf-8-sig"):
+                try:
+                    with open(cs[-1], encoding=enc) as f:
+                        rd = _csv.reader(f)
+                        hdr = next(rd)
+                        si, mi = hdr.index("店舗id"), hdr.index("連絡先メールアドレス")
+                        for row in rd:
+                            if len(row) <= max(si, mi):
+                                continue
+                            sid, mail = row[si].strip(), row[mi].strip().lower()
+                            if sid and mail and idx.get(mail):
+                                idx.setdefault(f"shop:{sid}", idx[mail])
+                    break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+    except Exception as e:  # noqa: BLE001
+        print(f"      (会社名の索引を作れませんでした: {type(e).__name__})", flush=True)
+    return idx
+
+
 def check_recent_listings_linked() -> dict:
     """最近作られた求人が取引に紐付いているか。
 
@@ -165,7 +217,9 @@ def check_recent_listings_linked() -> dict:
     """
     since = int((datetime.now(timezone.utc)
                  - timedelta(days=RECENT_DAYS)).timestamp() * 1000)
-    rows = search_all("0-420", ["hs_name", "kyuujin_status", "hs_createdate"],
+    rows = search_all("0-420", ["hs_name", "kyuujin_status", "hs_createdate",
+                                "id_hrhakkaa", "id_airwork",
+                                "airwork_account_login_id", "id_shop_hrhakkaa"],
                       [{"propertyName": "hs_createdate", "operator": "GTE",
                         "value": str(since)}])
     ids = [o["id"] for o in rows]
@@ -190,8 +244,36 @@ def check_recent_listings_linked() -> dict:
     n_target = sum(1 for o in rows
                    if appt.get(o["id"])
                    and (o.get("properties") or {}).get("kyuujin_status") != "公開終了")
+    # ★件数だけでは誰も動けない。**何をどこに入れれば直るか**を明細で返す
+    #   (2026-08-12)。health_check が5項目中3項目を恒久NGにしたまま誰にも
+    #   見られていなかったのは、件数しか出していなかったことも一因。
+    hint = _company_hint() if unlinked else {}
+    items = []
+    for o in unlinked:
+        p_ = o.get("properties") or {}
+        is_hr = bool((p_.get("id_hrhakkaa") or "").strip())
+        items.append({
+            "会社名(候補)": (hint.get(f"shop:{(p_.get('id_shop_hrhakkaa') or '').strip()}")
+                             or hint.get((p_.get("airwork_account_login_id") or "").strip().lower())
+                             or ""),
+            "求人ID": o["id"],
+            "求人名": (p_.get("hs_name") or "")[:60],
+            "媒体": "HRハッカー" if is_hr else "AirWork",
+            "媒体求人ID": (p_.get("id_hrhakkaa") or p_.get("id_airwork") or ""),
+            "HR店舗ID": (p_.get("id_shop_hrhakkaa") or ""),
+            "AWログインID": (p_.get("airwork_account_login_id") or ""),
+            "入れる場所": ("取引の「HRハッカー店舗ID（複数可・;区切り）」に "
+                          f"{(p_.get('id_shop_hrhakkaa') or '(店舗ID不明)')} を ; で追記"
+                          if is_hr else
+                          "取引の「管理用メールアドレス（rpo.medica+／複数可・;区切り）」に "
+                          "顧客管理シートのリクロジアドレスを入れる"),
+        })
     return {"name": f"直近{RECENT_DAYS}日の求人が取引に紐付いているか",
             "value": len(unlinked), "want": 0,
+            "items": items,
+            "action": "この求人が属する取引(納品管理PL)を開き、下の列に値を入れる。"
+                      "取引は必ず存在する — 見つからない場合は突合ロジックの不具合として調査する",
+            "impact": "この求人への応募は 一次対応の要否・担当者・応募先取引名 が空のまま入る",
             "detail": [f"応募が来ている公開中の求人 {n_target:,}件中 "
                        f"未紐付け {len(unlinked):,}件 "
                        f"(作成された求人は {len(ids):,}件。他社求人を含むため母数から除外)"]
@@ -343,13 +425,42 @@ def main(argv=None):
         json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"\n=== {len(results) - len(bad)}/{len(results)} 項目が正常 ===")
+    # ★明細をCSVに落とす。件数だけ通知しても誰も動けない (2026-08-12)。
+    #   health_check が5項目中3項目を恒久NGにしたまま誰にも見られていなかった
+    #   のは、較正ミスに加えて「件数しか出していなかった」ことも一因。
+    #   通知は「誰が・何を・どこに入れるか」が分かる形にする。
+    csv_paths = {}
+    for r in results:
+        items = r.get("items") or []
+        if not items:
+            continue
+        fn = out / f"要対応_{r['name'][:40]}_{datetime.now():%Y-%m-%d}.csv"
+        try:
+            with open(fn, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=list(items[0].keys()))
+                w.writeheader()
+                w.writerows(items)
+            csv_paths[r["name"]] = str(fn.resolve())
+            print(f"      要対応リスト: {fn.resolve()}")
+        except OSError as e:  # noqa: BLE001
+            print(f"      ⚠️ 要対応リストの書き出し失敗: {e}")
+
     if a.slack and bad:
         msg = ["⚠️ 求人・応募データの健全性チェックで異常を検知しました"]
         for r in bad:
-            msg.append(f"・{r['name']}: {r['value']:,} (あるべき値 {r['want']})")
+            msg.append(f"\n*{r['name']}: {r['value']:,}件* (あるべき値 {r['want']})")
             for d in r["detail"][:3]:
-                msg.append(f"　　{d}")
-        msg.append("※ このチェックは「処理が動いたか」ではなく"
+                msg.append(f"　{d}")
+            if r.get("action"):
+                msg.append(f"　▶ やること: {r['action']}")
+            if r.get("impact"):
+                msg.append(f"　▶ 放置すると: {r['impact']}")
+            if csv_paths.get(r["name"]):
+                msg.append(f"　▶ 対象一覧: {csv_paths[r['name']]}")
+            for it in (r.get("items") or [])[:3]:
+                msg.append("　　- " + " / ".join(
+                    f"{k}={v}" for k, v in list(it.items())[:4] if v))
+        msg.append("\n※ このチェックは「処理が動いたか」ではなく"
                    "「結果があるべき状態か」を見ています")
         slack_notify("\n".join(msg))
     # チェック自体が失敗したらCIを赤くする (監視の無音故障を作らない)

@@ -72,6 +72,20 @@ def _h() -> dict:
             "Content-Type": "application/json"}
 
 
+def slack_notify(message: str) -> bool:
+    """機械で決められない件を人へ回す。件数だけでなく行動と影響も書く。"""
+    url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
+    if not url:
+        print(f"[slack未設定] {message[:300]}", flush=True)
+        return False
+    try:
+        return requests.post(url, json={"text": message},
+                             timeout=15).status_code == 200
+    except requests.RequestException as e:  # noqa: BLE001
+        print(f"[slack送信失敗] {e}", flush=True)
+        return False
+
+
 def norm(s: str) -> str:
     """会社名+拠点名の比較キー。**拠点名は落とさない**。
 
@@ -218,6 +232,24 @@ def main(argv=None):
             w.writeheader()
             w.writerows(ambiguous)
         print(f"要確認(CSV): {q.resolve()}")
+        # ★CSVに出すだけでは誰も気づかない (2026-08-12 是正)。
+        #   実測で13件が滞留していた。機械が決められない=人にしか直せないので、
+        #   件数ではなく「どの取引に何を入れるか」まで書いてSlackへ出す。
+        if a.actual:
+            lines = [f"⚠️ RPOアドレス(管理用メール)を機械で決められない取引 "
+                     f"{len(ambiguous):,}件"]
+            lines.append("▶ やること: 下の取引を開き「管理用メールアドレス"
+                         "（rpo.medica+／複数可・;区切り）」に正しい値を入れる")
+            lines.append("▶ 放置すると: この顧客の求人が取引に紐付かず、"
+                         "応募の一次対応の要否・担当者・応募先取引名が空のまま入る")
+            lines.append(f"▶ 対象一覧: {q.resolve()}")
+            for x in ambiguous[:5]:
+                lines.append(f"　- {x.get('取引名','')[:30]} "
+                             f"／理由={x.get('理由','')}"
+                             f"／候補={str(x.get('候補',''))[:60]}")
+            if len(ambiguous) > 5:
+                lines.append(f"　…ほか {len(ambiguous)-5:,}件")
+            slack_notify("\n".join(lines))
     if not a.actual:
         print("\n(--actual で書き込みます)")
         return 0

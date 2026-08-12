@@ -171,6 +171,39 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def _slack(message: str) -> bool:
+    url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
+    if not url:
+        print(f"[slack未設定] {message[:300]}", flush=True)
+        return False
+    try:
+        return requests.post(url, json={"text": message},
+                             timeout=15).status_code == 200
+    except requests.RequestException as e:  # noqa: BLE001
+        print(f"[slack送信失敗] {e}", flush=True)
+        return False
+
+
 if __name__ == "__main__":
     a = parse_args()
-    main(dry_run=not a.actual, limit=a.limit, hr_csv=a.hr_csv)
+    # ★失敗を握り潰さない (2026-08-12 是正)。
+    #   CI側は `|| echo "::warning::..."` で継続する作りにしてあるが、
+    #   ::warning:: はSlackに飛ばないので**誰も気づかない**。
+    #   この補完が止まると取引に店舗IDが入らず、求人が取引に紐付かなくなり、
+    #   応募の一次対応の要否・担当者が空のまま積み上がる。必ず人へ届ける。
+    try:
+        if not a.hr_csv:
+            raise RuntimeError(
+                "HR求人CSVが見つかりません "
+                "(scratchpad/csv_fetched/hr/hr_offers_all_*.csv)。"
+                "hr_watcher が先に走っている必要があります")
+        main(dry_run=not a.actual, limit=a.limit, hr_csv=a.hr_csv)
+    except Exception as e:  # noqa: BLE001
+        _slack(
+            "⚠️ 取引の店舗ID補完が失敗しました\n"
+            f"　理由: {type(e).__name__}: {str(e)[:200]}\n"
+            "　▶ 放置すると: 新しい店舗の取引に鍵が入らず、求人が取引に紐付かない。"
+            "その求人への応募は一次対応の要否・担当者が空のまま入る\n"
+            "　▶ 確認: Job Daily の hr フェーズのログ "
+            "(backfill_deal_shop_id_via_email)")
+        raise
