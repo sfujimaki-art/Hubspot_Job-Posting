@@ -86,7 +86,7 @@ def read_master_links() -> dict:
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     svc = build("sheets", "v4", credentials=cred)
     gc = aq._sheets_client()
-    av = gc.open_by_key(al.SHEET_ID).sheet1.get_all_values()
+    av = al.sheet_retry(lambda: gc.open_by_key(al.SHEET_ID).sheet1.get_all_values())
     cols = aq._resolve_account_columns(av[0], av[1:])
     ci = cols["comp"]
     meta = svc.spreadsheets().get(spreadsheetId=al.SHEET_ID,

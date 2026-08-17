@@ -170,7 +170,7 @@ def read_new_items(sheet_id: str = "") -> list[QueueItem]:
     if not sid:
         raise RuntimeError("JAS_APPLICANT_QUEUE_SHEET_ID 未設定")
     gc = _sheets_client()
-    vals = gc.open_by_key(sid).worksheet(QUEUE_TAB).get_all_values()
+    vals = al.sheet_retry(lambda: gc.open_by_key(sid).worksheet(QUEUE_TAB).get_all_values())
     items: list[QueueItem] = []
     for r in vals[1:]:
         if len(r) <= Q_ROUTE or r[Q_STATUS] != "NEW":
@@ -235,7 +235,7 @@ class AccountResolver:
 
     def build(self) -> "AccountResolver":
         gc = _sheets_client()
-        av = gc.open_by_key(al.SHEET_ID).sheet1.get_all_values()
+        av = al.sheet_retry(lambda: gc.open_by_key(al.SHEET_ID).sheet1.get_all_values())
         # 列はヘッダ名+内容で動的解決 (位置ハードコード禁止。列挿入に耐える)
         self.cols = _resolve_account_columns(av[0] if av else [], av[1:])
         c = self.cols
@@ -529,9 +529,9 @@ def read_new_items_from_sheet1(
     if not sid:
         raise RuntimeError("JAS_APPLICANT_QUEUE_SHEET_ID 未設定")
     gc = _sheets_client()
-    ws = gc.open_by_key(sid).worksheet(SHEET1_TAB)
+    ws = al.sheet_retry(lambda: gc.open_by_key(sid).worksheet(SHEET1_TAB))
     # header + data を A:Q で取得(列挿入headroom)。全列get_all_valuesは52k行で重い。
-    vals = ws.get(_S1_READ_RANGE)  # 既定=FORMATTED_VALUE
+    vals = al.sheet_retry(ws.get, _S1_READ_RANGE)  # 既定=FORMATTED_VALUE
     if not vals:
         return []
     header, data = vals[0], vals[1:]
@@ -621,12 +621,12 @@ def mark_sheet1_rows(rows: list[int], *, sheet_id: str = "",
         return 0
     sid = sheet_id or QUEUE_SHEET_ID
     gc = _sheets_client()
-    ws = gc.open_by_key(sid).worksheet(SHEET1_TAB)
+    ws = al.sheet_retry(lambda: gc.open_by_key(sid).worksheet(SHEET1_TAB))
     # マーカー列を特定(ヘッダ空のためデータ内容='キュー済'から引く)。
-    probe = ws.get(_S1_READ_RANGE + "1000")  # 先頭~1000行で列特定(52k全読み回避)
+    probe = al.sheet_retry(ws.get, _S1_READ_RANGE + "1000")  # 先頭~1000行で列特定(52k全読み回避)
     header = probe[0] if probe else []
     mcol = _resolve_s1_columns(header, probe[1:] if probe else []).get("marker")
     letter = _col_letter(mcol) if mcol is not None else "F"  # 不明時のみ従来F
     data = [{"range": f"{letter}{r}", "values": [[marker]]} for r in rows]
-    ws.batch_update(data)
+    al.sheet_retry(ws.batch_update, data)
     return len(rows)

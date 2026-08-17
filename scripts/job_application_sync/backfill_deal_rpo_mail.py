@@ -115,7 +115,7 @@ def load_sheet_index() -> dict:
     from scripts.job_application_sync import applicant_queue as aq
     from scripts.job_application_sync.fetchers import account_loader as al
     gc = aq._sheets_client()
-    av = gc.open_by_key(al.SHEET_ID).sheet1.get_all_values()
+    av = al.sheet_retry(lambda: gc.open_by_key(al.SHEET_ID).sheet1.get_all_values())
     cols = aq._resolve_account_columns(av[0], av[1:])
     idx = defaultdict(set)
     for r in av[1:]:

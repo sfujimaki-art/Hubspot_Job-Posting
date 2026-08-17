@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Iterator, Optional
+import time
+from typing import Any, Callable, Iterator, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials as SACredentials
@@ -54,6 +55,47 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # OAuth トークン既定パス (Phase 2 動作確認 2026-06-29: SA 権限未付与のため OAuth fallback)
 DEFAULT_OAUTH_TOKEN = "credentials/fujimaki_token.json"
+
+
+def sheet_retry(fn: "Callable[..., Any]", *a, retries: int = 5, **kw) -> "Any":
+    """Sheets API の一時障害で落ちないように呼び出しを包む。
+
+    ★なぜ要るか (2026-08-17)
+      シートを**読む**呼び出しに再試行が無く、Googleが 502/503 を返すと
+      その回の応募取込が丸ごと落ちていた。クライアント取得側
+      (applicant_queue._sheets_client) には既に再試行があったが、
+      データ取得の .get() / .get_all_values() には無かった。
+
+      実測: 本番リポジトリの失敗99件中 86件が Applicant Sync。
+            8/16 だけで15件。ログはいずれも
+            `gspread.exceptions.APIError: [503] The service is currently unavailable.`
+            5分毎に走るので1回の瞬断がそのまま1回分の取りこぼしになる。
+
+      **5xx と 429 だけ再試行する。** 403/404 は権限やIDの設定ミスで、
+      何度やっても直らない。再試行すると原因が見えなくなるので即座に上げる。
+    """
+    delay = 2.0
+    last = None
+    for i in range(retries + 1):
+        try:
+            return fn(*a, **kw)
+        except gspread.exceptions.APIError as e:
+            code = 0
+            try:
+                code = int(getattr(e, "response", None).status_code)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if code and not (code >= 500 or code == 429):
+                raise                      # 設定ミスは握らない
+            last = e
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last = e                       # DNS断・コネクション切れ
+        if i < retries:
+            print(f"    [sheets retry {i+1}/{retries}] {type(last).__name__}: "
+                  f"{delay:.0f}秒待って再試行", flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    raise RuntimeError(f"Sheets 呼び出しがリトライ上限で失敗: {last}")
 
 
 def get_sheets_client(auth_mode: Optional[str] = None) -> gspread.Client:
@@ -223,10 +265,10 @@ def _load_sheet_records() -> list[dict]:
     if _SHEET_RECORDS_CACHE is not None:
         return _SHEET_RECORDS_CACHE
     gc = get_sheets_client()
-    sh = gc.open_by_key(SHEET_ID)
-    ws = sh.worksheet(SHEET_TAB)
+    sh = sheet_retry(gc.open_by_key, SHEET_ID)
+    ws = sheet_retry(sh.worksheet, SHEET_TAB)
     # get_all_records はヘッダ空文字重複で失敗するため get_all_values で自前マッピング
-    all_values = ws.get_all_values()
+    all_values = sheet_retry(ws.get_all_values)
     records: list[dict] = []
     if all_values:
         # ヘッダ名キー + 位置キー(_COL{i}_) を両方付与 (col8='s'等の不適切ヘッダに堅牢)
