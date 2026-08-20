@@ -250,13 +250,18 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_CODE=0; RC_ROLLUP=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
           #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
           #   → メモの転記 → 検知
           # ★先に取引側の鍵(管理用メール)を埋める。紐付けはこれを引くので順序が重要。
           #   顧客管理シートを直読みするので常に最新。既存値は触らない設計。
           #   これまで一度も定期実行されておらず、新規顧客の取引が空のままだった。
+          # ★取引先コード(契約単位の安定キー)を最初に埋める。取引は契約更新の
+          #   たびに作り替えられIDが変わるため、これが無いと前の取引に溜めた
+          #   求人メモを新しい取引へ引き継げない。作成時点では計上がまだ無い
+          #   (当日にあるのは41%)ので、未解決を毎晩ぜんぶ再挑戦する。
+          python scripts/job_application_sync/backfill_deal_code_of_customer.py $FLAG $SLACKFLAG || RC_CODE=$?
           python scripts/job_application_sync/backfill_deal_rpo_mail.py $FLAG || RC_RPO=$?
           python scripts/job_application_sync/sync_deal_association.py $FLAG || RC_ASSOC=$?
           # 契約更新で新しい取引が作られた際の付け替え。sync_deal_association は
@@ -269,6 +274,10 @@ jobs:
           # ここが無いと、取引でメモを直しても現場が見る求人には届かない。
           # 内容ハッシュで冪等: 同じ内容なら貼らない/変わったら貼り直す。
           # 紐付けが正しくなった後に走らせる(①②の後)。
+          # ★求人メモ→取引への集約。転記(次行)より前に置く。逆にするとその晩に
+          #   集約した内容が求人へ流れるのが翌日になる。作り直さず既存へ積み上げる
+          #   (作り直すと求人の出し直しで失われたメモを毎晩取り込む)。
+          python scripts/job_application_sync/rollup_memo_to_deal.py $FLAG || RC_ROLLUP=$?
           python scripts/job_application_sync/sync_deal_memo_to_listing.py $FLAG || RC_MEMO=$?
           # 顧客管理シートD列の貼り替えにHubSpotが追従しているかの検知。
           # 検知のみ・自動修正しない(人が編集する場所を機械が上書きしない)。
@@ -277,10 +286,12 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
           NG=""
+          [ $RC_CODE   -ne 0 ] && NG="$NG 取引先コードの補完"
+          [ $RC_ROLLUP -ne 0 ] && NG="$NG 求人メモの取引への集約"
           [ $RC_ASSOC  -ne 0 ] && NG="$NG 求人→取引の紐付け"
           [ $RC_RELINK -ne 0 ] && NG="$NG 最新取引への付け替え"
           [ $RC_ICHIJI -ne 0 ] && NG="$NG 一次対応の転記"

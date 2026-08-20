@@ -98,6 +98,18 @@ TEMPLATE_BODY = """<h2>📋 暗黙知入力テンプレート（求人ごと）<
 # コンサルが記入してもこの見出しは残る前提。
 TEMPLATE_SIGNATURE = "暗黙知入力テンプレート"
 
+# ★暗黙知メモの署名は**ここが唯一の定義**。
+#   以前は ROLLUP_SIGNATURE が rollup_memo_to_deal.py と
+#   sync_deal_memo_to_listing.py に二重定義されていた。片方を直すともう片方が
+#   黙って一致しなくなる状態だったので、低レイヤのここへ集約する。
+#
+#   3種類ある理由:
+#     TEMPLATE_SIGNATURE … 現場が求人に直接書いた旧来のメモ (求人単位)
+#     ROLLUP_SIGNATURE   … それを取引へ集約したメモ (取引が正)
+#     TRANSFER_SIGNATURE … 取引から求人へ転記したメモ (現場に届ける実体)
+ROLLUP_SIGNATURE = "📋 暗黙知メモ（取引単位・配下求人を網羅）"
+TRANSFER_SIGNATURE = "📎 取引から転記された暗黙知メモ"
+
 # ②複製Noteの識別マーカー。既存ワークフローが新規応募に別テンプレNote
 # (「応募者対応メモテンプレート」)を自動付与するため、「Noteが1件でもあるか」
 # では二重コピー判定できない。自分の複製だけをこのマーカーで見分ける。
@@ -144,11 +156,15 @@ def _send(method: str, url: str, *, token: Optional[str] = None,
 
 
 def create_note(body: str, *, token: Optional[str] = None,
-                timeout: int = 30) -> Optional[str]:
-    """Note作成 (関連付けなし)。note_id or None。"""
+                timeout: int = 30, timestamp_ms: Optional[int] = None) -> Optional[str]:
+    """Note作成 (関連付けなし)。note_id or None。
+
+    timestamp_ms: タイムライン上の日時(epochミリ秒)。省略時は現在時刻。
+      商談メモのように「出来事の起きた日時」で並べたいときに渡す(2026-08-20 追加)。
+    """
     r = _send("POST", f"{BASE}/crm/v3/objects/notes", token=token,
               json_body={"properties": {"hs_note_body": body,
-                                        "hs_timestamp": str(_utc_now_ms())}},
+                                        "hs_timestamp": str(timestamp_ms or _utc_now_ms())}},
               timeout=timeout)
     if r is not None and r.status_code in (200, 201):
         return r.json()["id"]
@@ -222,15 +238,30 @@ def get_listing_template_note_body(listing_id: str, *,
                                    timeout: int = 30) -> Optional[str]:
     """LISTINGの「暗黙知テンプレ署名を含むNote」本文を返す (無ければ None)。
 
-    pin留めが署名を含めばそれを、そうでなければ関連Noteを走査して署名一致を採用。
     署名で限定することで無関係なNoteを誤って応募へ複製しない (F4)。dangling pin
     (削除済Noteを指すpin)は本文取得に失敗するため自然に関連Noteへフォールバック(F3)。
+
+    ★取引から転記されたメモ(TRANSFER_SIGNATURE)を最優先する (2026-08-18 是正)。
+
+      それまでは TEMPLATE_SIGNATURE しか見ておらず、**転記メモが応募へ1件も
+      届いていなかった**。実測: 転記メモ1,875件のうち求人に紐付くもの1,875件、
+      応募に紐付くもの **0件**。転記済み求人12件でこの関数を呼ぶと10件が None を
+      返し、残り2件は求人に直接書かれた旧メモを返していた。
+
+      後者のほうが害が大きい。求人側の転記メモには「修正は取引側で行ってください」
+      と書いてあるのに、応募には旧メモが届き続け、取引で直した内容は永久に
+      反映されないことになる。だから旧メモは**転記が無いときの代替**に降格する。
     """
+    fallback = None
     for nid in _listing_note_ids(listing_id, token=token, timeout=timeout):
         body = _note_body(nid, token=token, timeout=timeout)
-        if body and TEMPLATE_SIGNATURE in body:
-            return body
-    return None
+        if not body:
+            continue
+        if TRANSFER_SIGNATURE in body:
+            return body          # 取引が正。見つけ次第これを使う
+        if TEMPLATE_SIGNATURE in body and fallback is None:
+            fallback = body      # 旧メモ。転記が無いときだけ使う
+    return fallback
 
 
 def listing_has_template_note(listing_id: str, *, token: Optional[str] = None,

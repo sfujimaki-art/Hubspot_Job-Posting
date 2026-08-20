@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
 import json
 import os
@@ -54,7 +55,15 @@ for _s in (sys.stdout, sys.stderr):
 
 BASE = "https://api.hubapi.com"
 # 集約メモの署名 (求人側テンプレと区別し、再実行時の冪等判定に使う)
-ROLLUP_SIGNATURE = "📋 暗黙知メモ（取引単位・配下求人を網羅）"
+try:  # script実行/パッケージ両対応の二重import
+    from scripts.job_application_sync.rollup_merge import (  # noqa: E402
+        merge_bodies)
+    from scripts.job_application_sync.notes import (      # noqa: E402
+        ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE, TRANSFER_SIGNATURE)
+except ImportError:  # pragma: no cover
+    from rollup_merge import merge_bodies  # type: ignore
+    from notes import (ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE,  # type: ignore
+                       TRANSFER_SIGNATURE)
 
 # 抽出対象の項目。**現場の入力テンプレート実物に合わせてある**。
 # 2026-08-06 の逆証明で、当初の11項目では記入率99%の「急ぎ度」「採用優先順位」が
@@ -118,6 +127,63 @@ def _post(url: str, body: dict, retries: int = 4):
     raise RuntimeError("retry exhausted")
 
 
+# 本文末尾の出典行。日付を含むので**ハッシュからは外す**。
+_SRC_LINE = re.compile(r"^（出典: 求人\d+件のメモを .+ に集約）$", re.M)
+
+
+def rollup_body_hash(text: str) -> str:
+    """集約本文の内容ハッシュ。日次実行で更新が必要か判定する。
+
+    ★出典行(日付入り)を除いてハッシュする (2026-08-20 是正)。
+      本文には「（出典: 求人13件のメモを 2026-08-20 に集約）」が入る。
+      これを含めてハッシュすると**中身が同じでも日付が変わるだけで
+      別物と判定**され、毎晩すべての集約Noteを書き換えることになる。
+      実測(2026-08-20): 452件中 same=0 / update=451。つまり全件が
+      毎晩無意味に書き換えられる状態だった。日次化の目的は「変わった
+      ものだけ貼り直す」なので、日付は比較対象から外す。
+    """
+    core = _SRC_LINE.sub("", text).rstrip()
+    return hashlib.sha256(core.encode("utf-8")).hexdigest()[:12]
+
+
+def plan_rollup_writes(rows: list, existing: dict,
+                       today: str = "") -> tuple[list, dict]:
+    """集約案と既存Noteの状態から、作成・更新が必要な行だけを返す。
+
+    existing は {deal_id: {"note_id", "hash", "body"}}。同じ本文は操作せず、
+    変わった既存Noteだけを更新対象にするため、日次実行でも二重に積まない。
+
+    today: 未更新マーカーに使う日付 (YYYY-MM-DD)。テストから固定できるよう
+           引数にしている。省略時は実行日。
+    """
+    today = today or f"{datetime.now():%Y-%m-%d}"
+    todo = []
+    summary = {"create": 0, "update": 0, "same": 0, "skip": 0}
+    for row in rows:
+        if row.get("集約先種別") != "DEAL":
+            summary["skip"] += 1
+            continue
+        current = existing.get(str(row["集約先ID"]))
+        if not current:
+            todo.append({**row, "operation": "create"})
+            summary["create"] += 1
+            continue
+        # ★作り直さず積み上げる (2026-08-20)。
+        #   求人はクローズ→出し直しでメモを失う。今回ぶんだけで置き換えると
+        #   その喪失を取引側へ毎晩取り込む (実測 1,267字→200字)。既存の内容へ
+        #   マージし、値が変われば新を採って旧は履歴へ、今回出てこない項目は
+        #   残して未更新の印を付ける。
+        merged = merge_bodies(current.get("body") or "", row["メモ本文"], today)
+        row = {**row, "メモ本文": merged}
+        if current.get("hash") == rollup_body_hash(merged):
+            summary["same"] += 1
+        else:
+            todo.append({**row, "operation": "update",
+                         "note_id": current["note_id"]})
+            summary["update"] += 1
+    return todo, summary
+
+
 def strip_html(s: str) -> str:
     """HubSpotのリッチテキスト → 平文。**行の切れ目を必ず復元する**。
 
@@ -136,6 +202,109 @@ def strip_html(s: str) -> str:
     # (実測: 451件中135件=30%で発生していた 2026-08-06)。
     # unescape で &nbsp; → U+00A0 になり、後段の NFKC が半角空白へ畳む。
     return html.unescape(t)
+
+
+def existing_rollup_state() -> dict:
+    """既存の集約Noteを全ページから取得し、取引IDごとの内容ハッシュを返す。
+
+    Note検索は一度に100件しか返さない。ページングを省くと先頭以外の既存Noteを
+    見落とし、日次実行で同じ取引へ集約Noteを重ねるため、終端まで必ず取得する。
+    """
+    notes, after = [], None
+    while True:
+        body = {"filterGroups": [{"filters": [{
+            "propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
+            "value": "暗黙知メモ"}]}],
+            "properties": ["hs_note_body"], "limit": 100}
+        if after:
+            body["after"] = after
+        result = _post(f"{BASE}/crm/v3/objects/notes/search", body)
+        notes.extend(result.get("results") or [])
+        after = (result.get("paging") or {}).get("next", {}).get("after")
+        if not after:
+            break
+        time.sleep(0.1)
+
+    notes = [note for note in notes if ROLLUP_SIGNATURE in (
+        (note.get("properties") or {}).get("hs_note_body") or "")]
+    state = {}
+    for i in range(0, len(notes), 100):
+        chunk = notes[i:i + 100]
+        linked = _post(f"{BASE}/crm/v4/associations/notes/0-3/batch/read",
+                       {"inputs": [{"id": note["id"]} for note in chunk]})
+        note_by_id = {str(note["id"]): note for note in chunk}
+        for result in linked.get("results", []):
+            note = note_by_id.get(str(result["from"]["id"]))
+            targets = result.get("to") or []
+            if not note or not targets:
+                continue
+            deal_id = str(targets[0]["toObjectId"])
+            body = strip_html((note.get("properties") or {}).get(
+                "hs_note_body") or "")
+            state.setdefault(deal_id, {"note_id": str(note["id"]),
+                                       "hash": rollup_body_hash(body),
+                                       "body": body})
+        time.sleep(0.1)
+    return state
+
+
+def _patch_note(note_id: str, body: str, retries: int = 4) -> None:
+    """既存の集約Noteを更新する。関連付けを保つため作り直さない。"""
+    payload = {"properties": {
+        "hs_note_body": body.replace("\n", "<br>"),
+        "hs_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }}
+    for i in range(retries + 1):
+        try:
+            response = requests.patch(
+                f"{BASE}/crm/v3/objects/notes/{note_id}", headers=_h(),
+                json=payload, timeout=90)
+        except requests.RequestException:
+            if i < retries:
+                time.sleep(2 ** i)
+                continue
+            raise
+        if response.status_code == 200:
+            return
+        if response.status_code in (429, 500, 502, 503, 504) and i < retries:
+            time.sleep(2 ** i * 2)
+            continue
+        raise RuntimeError(f"PATCH Note HTTP {response.status_code}: "
+                           f"{response.text[:160]}")
+    raise RuntimeError("PATCH Note retry exhausted")
+
+
+def apply_rollup_writes(todo: list) -> dict:
+    """集約案を作成または既存Note更新として反映する。"""
+    created = updated = failed = 0
+    created_notes = []
+    for row in todo:
+        try:
+            if row["operation"] == "update":
+                _patch_note(row["note_id"], row["メモ本文"])
+                updated += 1
+            else:
+                result = _post(f"{BASE}/crm/v3/objects/notes", {
+                    "properties": {
+                        "hs_note_body": row["メモ本文"].replace("\n", "<br>"),
+                        "hs_timestamp": datetime.utcnow().strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                    "associations": [{"to": {"id": row["集約先ID"]}, "types": [{
+                        "associationCategory": "HUBSPOT_DEFINED",
+                        "associationTypeId": 214,
+                    }]}],
+                })
+                created_notes.append({"note_id": result.get("id"),
+                                      "deal_id": row["集約先ID"]})
+                created += 1
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            print(f"  ★失敗 deal={row['集約先ID']}: {type(exc).__name__}: "
+                  f"{str(exc)[:90]}", flush=True)
+        time.sleep(0.1)
+    return {"created": created, "updated": updated, "failed": failed,
+            "created_notes": created_notes}
 
 
 def clean_value(v: str) -> str:
@@ -322,6 +491,48 @@ def build_rollup_body(entries: list) -> str:
     return "\n".join(lines)
 
 
+def discover_filled_listings() -> list:
+    """暗黙知テンプレNoteを持つ求人IDを HubSpot から直接見つける。
+
+    ★静的スナップショットを読むのをやめた (2026-08-20 是正)。
+      それまでは data/job_application_sync/filled_memo_listings.json
+      (2026-08-06 時点・求人6,145件) を毎回読んでいた。このファイルを
+      更新する仕組みはどこにも無く、**8/06以降に現場が書いたメモは
+      永久に集約されない**状態だった。実測では 8/06 より後に作成・更新
+      された元メモが 2,270件ある。日次化する以上、対象は毎晩数え直す。
+
+      実測(2026-08-18): テンプレ署名を持つNote 8,265件 → 求人 5,134件。
+    """
+    notes, after = [], None
+    while True:
+        body = {"filterGroups": [{"filters": [
+            {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
+             "value": "暗黙知入力テンプレート"}]}],
+            "properties": ["hs_note_body"], "limit": 100}
+        if after:
+            body["after"] = after
+        j = _post(f"{BASE}/crm/v3/objects/notes/search", body)
+        notes += j.get("results") or []
+        after = (j.get("paging") or {}).get("next", {}).get("after")
+        if not after:
+            break
+        time.sleep(0.08)
+    # 署名で確定する。CONTAINS_TOKEN は語単位なので拾いすぎがある。
+    ids = [n["id"] for n in notes
+           if TEMPLATE_SIGNATURE in ((n.get("properties") or {}).get(
+               "hs_note_body") or "")]
+    out = set()
+    for i in range(0, len(ids), 100):   # ★100件ずつ (全件一度だと空が返る)
+        r = _post(f"{BASE}/crm/v4/associations/notes/0-420/batch/read",
+                  {"inputs": [{"id": x} for x in ids[i:i + 100]]})
+        for res in r.get("results", []):
+            for to in (res.get("to") or []):
+                out.add(str(to["toObjectId"]))
+        time.sleep(0.03)
+    print(f"テンプレNote {len(ids):,}件 → 求人 {len(out):,}件 が対象",
+          flush=True)
+    return sorted(out)
+
 def collect(filled_ids: list) -> dict:
     """求人ID群 → 集約先ごとの entries。"""
     props, l2d, l2n = {}, {}, defaultdict(list)
@@ -374,68 +585,30 @@ def collect(filled_ids: list) -> dict:
 
 
 def write_notes(rows: list, out_dir: Path) -> dict:
-    """集約案の行を取引へNoteとして作成する。
+    """集約案を取引の既存Noteへ差分反映する。
 
     rows: [{"集約先種別","集約先ID","元求人数","メモ本文"}]
 
     安全策:
-      - 作成したNote IDを必ず記録する (--rollback で消せるようにするため)
-      - 既に集約メモを持つ取引はスキップする。再実行で二重に積まない
+      - 全ページの既存集約Noteを突合し、同一本文は何もしない
+      - 本文が変わった取引は既存Noteを更新し、別Noteを積まない
+      - 新規作成したNote IDだけ記録し、--rollback で削除できるようにする
     """
-    # 既存の集約メモを持つ取引を調べる (冪等性)。署名で判別する。
-    have = set()
-    r = _post(f"{BASE}/crm/v3/objects/notes/search",
-              {"filterGroups": [{"filters": [
-                  {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
-                   "value": "暗黙知メモ"}]}],
-               "properties": ["hs_note_body"], "limit": 100})
-    existing_notes = [o["id"] for o in r.get("results", [])]
-    if existing_notes:
-        for i in range(0, len(existing_notes), 100):
-            rr = _post(f"{BASE}/crm/v4/associations/notes/0-3/batch/read",
-                       {"inputs": [{"id": x}
-                                   for x in existing_notes[i:i + 100]]})
-            for res in rr.get("results", []):
-                for t in (res.get("to") or []):
-                    have.add(str(t["toObjectId"]))
-    print(f"既に集約メモを持つ取引: {len(have):,}件 (スキップします)", flush=True)
-
-    created, ok, skip, fail = [], 0, 0, 0
-    targets = [x for x in rows if x["集約先種別"] == "DEAL"]
-    for n, row in enumerate(targets, 1):
-        did = row["集約先ID"]
-        if did in have:
-            skip += 1
-            continue
-        try:
-            res = _post(f"{BASE}/crm/v3/objects/notes",
-                        {"properties": {
-                            "hs_note_body": row["メモ本文"].replace("\n", "<br>"),
-                            "hs_timestamp": datetime.utcnow().strftime(
-                                "%Y-%m-%dT%H:%M:%SZ")},
-                         "associations": [{"to": {"id": did}, "types": [{
-                             "associationCategory": "HUBSPOT_DEFINED",
-                             "associationTypeId": 214}]}]})
-            created.append({"note_id": res.get("id"), "deal_id": did})
-            ok += 1
-        except Exception as e:  # noqa: BLE001
-            fail += 1
-            print(f"  ★失敗 deal={did}: {type(e).__name__}: {str(e)[:90]}",
-                  flush=True)
-        if n % 50 == 0:
-            print(f"  {n:,}/{len(targets):,} (作成 {ok:,} / 失敗 {fail:,})",
-                  flush=True)
-        time.sleep(0.1)
-    # ロールバック用の記録は成否にかかわらず必ず残す
+    todo, plan = plan_rollup_writes(rows, existing_rollup_state())
+    print("\n=== 集約メモの内訳 ===", flush=True)
+    print(f"  新規作成: {plan['create']:,}件 / 更新: {plan['update']:,}件 / "
+          f"同一: {plan['same']:,}件 / 取引なし: {plan['skip']:,}件", flush=True)
+    result = apply_rollup_writes(todo)
     bk = (_REPO / "data" / "job_application_sync" /
           f"rollup_notes_{datetime.now():%Y%m%dT%H%M%S}.json")
     bk.parent.mkdir(parents=True, exist_ok=True)
-    bk.write_text(json.dumps(created, ensure_ascii=False, indent=2),
+    bk.write_text(json.dumps(result["created_notes"], ensure_ascii=False, indent=2),
                   encoding="utf-8")
-    print(f"\n=== 結果 === 作成 {ok:,} / スキップ {skip:,} / 失敗 {fail:,}")
+    print(f"\n=== 結果 === 作成 {result['created']:,} / 更新 {result['updated']:,} / "
+          f"同一 {plan['same']:,} / 失敗 {result['failed']:,}")
     print(f"作成したNoteの記録: {bk.resolve()}")
     print(f"取り消す場合: python {Path(__file__).name} --rollback {bk}")
-    return {"ok": ok, "skip": skip, "fail": fail, "backup": str(bk)}
+    return {**result, **plan, "backup": str(bk)}
 
 
 def rollback(path: str) -> int:
@@ -470,6 +643,9 @@ def main(argv=None):
                     help="作成したNoteを削除する (rollup_notes_*.json を指定)")
     ap.add_argument("--out-dir", default="claudedocs")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--from-snapshot", action="store_true",
+                    help="対象求人を毎回数え直さず前回の一覧を使う"
+                         "(再現用。日次実行では使わない)")
     a = ap.parse_args(argv)
     if a.rollback:
         return rollback(a.rollback)
@@ -484,10 +660,17 @@ def main(argv=None):
         return 0
     scr = Path(os.environ.get("SCRATCH", "")) if os.environ.get("SCRATCH") else None
     src = (_REPO / "data" / "job_application_sync" / "filled_memo_listings.json")
-    if not src.exists():
-        raise SystemExit(f"事前調査の結果が必要です: {src}\n"
-                         "(記入済みメモを持つ求人IDの一覧)")
-    filled = json.loads(src.read_text(encoding="utf-8"))["filled"]
+    if a.from_snapshot:
+        if not src.exists():
+            raise SystemExit(f"スナップショットがありません: {src}")
+        filled = json.loads(src.read_text(encoding="utf-8"))["filled"]
+        print(f"(スナップショット {src.name} を使用)", flush=True)
+    else:
+        filled = discover_filled_listings()
+        # 何を対象にしたかを残す。後から件数の変化を追えるようにする。
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text(json.dumps({"filled": filled}, ensure_ascii=False),
+                       encoding="utf-8")
     if a.limit:
         filled = filled[:a.limit]
     print(f"記入済みメモを持つ求人 {len(filled):,}件 を集約します", flush=True)
@@ -513,8 +696,12 @@ def main(argv=None):
         with cp.open("w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             w.writerow(["項目", "変換前", "変換後", "件数"])
-            for (k, a, b), n in sorted(uniq.items(), key=lambda x: -x[1]):
-                w.writerow([k, a, b, n])
+            # ★ループ変数に a を使わない。argparse の名前空間(a)を潰し、
+            #   後段の `a.actual` が AttributeError になる (2026-08-20 実行時に発覚)。
+            #   CHANGED が空でないときだけ落ちるためテストでは出なかった。
+            for (item, before, after), cnt in sorted(uniq.items(),
+                                                     key=lambda x: -x[1]):
+                w.writerow([item, before, after, cnt])
         print(f"正規化で値が変わったケース: {len(CHANGED):,}件 "
               f"({len(uniq):,}種) → {cp.resolve()}")
     big = sorted(groups.items(), key=lambda x: -len(x[1]))[:2]
@@ -524,29 +711,13 @@ def main(argv=None):
     if not a.actual:
         print("\n(既定はCSV出力のみ。--actual で取引へNote作成)")
         return
-    # 本番: 取引へNote作成 (DEALのみ。UNITは取引が無いので対象外)
-    ok = skip = fail = 0
-    for (kind, kid), entries in groups.items():
-        if kind != "DEAL":
-            skip += 1
-            continue
-        try:
-            _post(f"{BASE}/crm/v3/objects/notes",
-                  {"properties": {
-                      "hs_note_body": build_rollup_body(entries).replace("\n", "<br>"),
-                      "hs_timestamp": datetime.utcnow().strftime(
-                          "%Y-%m-%dT%H:%M:%SZ")},
-                   "associations": [{"to": {"id": kid}, "types": [{
-                       "associationCategory": "HUBSPOT_DEFINED",
-                       "associationTypeId": 214}]}]})
-            ok += 1
-        except Exception as e:  # noqa: BLE001
-            fail += 1
-            print(f"  ★失敗 deal={kid}: {type(e).__name__}: {str(e)[:90]}",
-                  flush=True)
-        time.sleep(0.12)
-    print(f"\n=== 結果 === 作成 {ok:,}件 / 失敗 {fail:,}件 / "
-          f"取引なしでスキップ {skip:,}件")
+    rows = [
+        {"集約先種別": kind, "集約先ID": kid, "元求人数": len(entries),
+         "メモ本文": build_rollup_body(entries)}
+        for (kind, kid), entries in groups.items()
+    ]
+    result = write_notes(rows, out)
+    return 1 if result["failed"] else 0
 
 
 if __name__ == "__main__":

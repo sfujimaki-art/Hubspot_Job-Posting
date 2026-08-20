@@ -69,10 +69,13 @@ BASE = "https://api.hubapi.com"
 LISTING = "0-420"
 DEAL = "0-3"
 # 集約メモの署名 (rollup_memo_to_deal.py と一致させること)
-ROLLUP_SIGNATURE = "📋 暗黙知メモ（取引単位・配下求人を網羅）"
+try:  # script実行/パッケージ両対応の二重import
+    from scripts.job_application_sync.notes import (      # noqa: E402
+        ROLLUP_SIGNATURE, TRANSFER_SIGNATURE)
+except ImportError:  # pragma: no cover
+    from notes import ROLLUP_SIGNATURE, TRANSFER_SIGNATURE  # type: ignore
 # 転記メモの署名。人が書いたメモと区別し、貼り直しの冪等判定に使う。
 # 本文にハッシュを埋めるので、取引メモが変わったことも検出できる。
-TRANSFER_SIGNATURE = "📎 取引から転記された暗黙知メモ"
 HASH_RE = re.compile(r"<!--memo:([0-9a-f]{12})-->")
 # 応募が来ない求人には転記しない (既定)
 SKIP_STATUS = ("公開終了",)
