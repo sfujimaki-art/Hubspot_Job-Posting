@@ -81,7 +81,7 @@ SSO_ID_SELECTOR_CANDIDATES = (
     "input[name='loginId']",
     "input[type='text'][autocomplete='username']",
     "input[type='email']",
-    "input[type='text']:visible",  # Phase 2 動作確認 2026-06-29 実測: 札幌三信運輸 SSOで命中
+    "input[type='text']:visible",  # Phase 2 動作確認 2026-06-29 実測: 旭川三信運輸 SSOで命中
 )
 SSO_PW_SELECTOR_CANDIDATES = (
     "input[name='password']",

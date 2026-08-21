@@ -12,8 +12,8 @@
 
 1. **同じ求人にメール表記違いで2レコード**（14組）
    indeedemail のエイリアス末尾違い `..._x66@` と `..._f54@`、
-   あるいは実メール `kenji19640503@gmail.com` と
-   エイリアス `kenji1964050395k73_gwv@indeedemail.com`。
+   あるいは実メール `sample.user@example.com` と
+   エイリアス `sample1234567_abc@indeedemail.com`。
    メール優先で電話を見ないので別人扱いになる。
 
 2. **同一run内の重複**（3組）

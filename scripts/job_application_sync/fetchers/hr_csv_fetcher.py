@@ -13,7 +13,7 @@
     6. 「処理終了日時」が埋まり download-csv リンクが現れたらクリックして DL
 
 認証情報 (環境変数必須、.env に追加):
-    HRHACKER_USER : 例 rpo.medica@gmail.com
+    HRHACKER_USER : 例 rpo.sample@example.com
     HRHACKER_PASS : ログインパスワード
 
 使い方:

@@ -6,12 +6,12 @@
    C列は「担当者 <実ドメイン>, 担当者 <リクロジのエイリアス>」の形で、
    どちらが先かは行によって違う。1つ目しか見ていなかったため、
    会社名だけが頼りになり事業所を決められず未突合になっていた。
-   実測: 未突合35件 → 13件が新たに突合 (カタニ産業→群馬支店 等)。
+   実測: 未突合35件 → 13件が新たに突合 (ササカタニ産業→栃木支店 等)。
 
 2. **共用メールキーでは勝手に1社を選ばない**
    顧客管理シート 2,017行のうち59キーが2社以上で共用されている。
    従来は dict の後勝ちで「シートの後ろの行」が根拠なく勝っていた。
-   例 aXy47Nm+FFv72Xo@gmail.com = 首都圏WMS 名南PC/名古屋PC/所沢PC。
+   例 cZq81Kp+AAa11Bb@example.com = 東日本WMS 西部PC/中部PC/東部PC。
    会社名で1社に絞れなければ突合しない (未突合として人へ回す)。
    誤配より未突合が安全。うち14キーは解約済と稼働中が混在しており、
    後勝ちで解約済が勝つと稼働中の顧客の応募が恒久SKIPされる。
@@ -78,9 +78,9 @@ def _item(company: str, emails: list[str]) -> QueueItem:
 # 1. C列の全メール抽出
 # --------------------------------------------------------------------------
 def test_all_emails_出現順に全部拾う():
-    s = "高橋 <y-takahashi@katani.co.jp>, 高橋 <aXy47Nm+A6P4X9B7@gmail.com>"
+    s = "高橋 <y-takahashi@katani.co.jp>, 高橋 <cZq81Kp+CCc22Dd@example.com>"
     assert _all_emails(s) == [
-        "y-takahashi@katani.co.jp", "aXy47Nm+A6P4X9B7@gmail.com"]
+        "y-takahashi@katani.co.jp", "cZq81Kp+CCc22Dd@example.com"]
 
 
 def test_all_emails_重複は1つに畳む():
@@ -101,18 +101,18 @@ def test_all_emails_空なら空リスト():
 # 2. 2つ目以降のメールで突合できる
 # --------------------------------------------------------------------------
 def test_2つ目のエイリアスで事業所まで決まる():
-    """カタニ産業の実例。1つ目=実ドメイン(シートに無い)、2つ目=エイリアス。
+    """ササカタニ産業の実例。1つ目=実ドメイン(シートに無い)、2つ目=エイリアス。
 
-    会社名「カタニ産業株式会社」だけでは群馬支店か決められないが、
-    エイリアスが群馬支店の行にしか無いので一意に決まる。
+    会社名「ササカタニ産業株式会社」だけでは栃木支店か決められないが、
+    エイリアスが栃木支店の行にしか無いので一意に決まる。
     """
-    rows = [_row("カタニ産業株式会社　群馬支店",
-                 alias="aXy47Nm+A6P4X9B7@gmail.com")]
+    rows = [_row("ササカタニ産業株式会社　栃木支店",
+                 alias="cZq81Kp+CCc22Dd@example.com")]
     acc = _resolver(rows).resolve(
-        _item("カタニ産業株式会社",
-              ["y-takahashi@katani.co.jp", "aXy47Nm+A6P4X9B7@gmail.com"]))
+        _item("ササカタニ産業株式会社",
+              ["y-takahashi@katani.co.jp", "cZq81Kp+CCc22Dd@example.com"]))
     assert acc is not None
-    assert acc.company == "カタニ産業株式会社　群馬支店"
+    assert acc.company == "ササカタニ産業株式会社　栃木支店"
     assert "2件目以降" in acc.matched_by
 
 
@@ -136,26 +136,26 @@ def test_どのメールでも引けなければ未突合():
 # 3. 共用キーで勝手に1社を選ばない (誤配防止)
 # --------------------------------------------------------------------------
 def test_共用キーは会社名で絞れなければ突合しない():
-    """首都圏WMSの実例。同じエイリアスが3事業所にぶら下がっている。
+    """東日本WMSの実例。同じエイリアスが3事業所にぶら下がっている。
 
-    会社名「株式会社首都圏WMS」はどの事業所とも一致しないので、
+    会社名「株式会社東日本WMS」はどの事業所とも一致しないので、
     機械では決められない → None (人へ回す)。
-    従来は dict の後勝ちで名南PCが根拠なく選ばれていた。
+    従来は dict の後勝ちで西部PCが根拠なく選ばれていた。
     """
-    shared = "aXy47Nm+FFv72Xo@gmail.com"
-    rows = [_row("株式会社首都圏WMS所沢PC", alias=shared),
-            _row("株式会社首都圏WMS名古屋PC", alias=shared),
-            _row("株式会社首都圏WMS名南PC", alias=shared)]
+    shared = "cZq81Kp+AAa11Bb@example.com"
+    rows = [_row("株式会社東日本WMS東部PC", alias=shared),
+            _row("株式会社東日本WMS中部PC", alias=shared),
+            _row("株式会社東日本WMS西部PC", alias=shared)]
     assert _resolver(rows).resolve(
-        _item("株式会社首都圏WMS", [shared])) is None
+        _item("株式会社東日本WMS", [shared])) is None
 
 
 def test_共用キーでも会社名が完全一致すれば決まる():
     shared = "shared@example.com"
-    rows = [_row("株式会社首都圏WMS所沢PC", alias=shared),
-            _row("株式会社首都圏WMS名南PC", alias=shared)]
-    acc = _resolver(rows).resolve(_item("株式会社首都圏WMS名南PC", [shared]))
-    assert acc is not None and acc.company == "株式会社首都圏WMS名南PC"
+    rows = [_row("株式会社東日本WMS東部PC", alias=shared),
+            _row("株式会社東日本WMS西部PC", alias=shared)]
+    acc = _resolver(rows).resolve(_item("株式会社東日本WMS西部PC", [shared]))
+    assert acc is not None and acc.company == "株式会社東日本WMS西部PC"
 
 
 def test_共用キーで解約済が後勝ちしない():
@@ -166,7 +166,7 @@ def test_共用キーで解約済が後勝ちしない():
     """
     shared = "marukyo@example.com"
     rows = [_row("丸協運輸株式会社 東京営業所", alias=shared, closed=False),
-            _row("丸協運輸株式会社大阪センター", alias=shared, closed=True)]
+            _row("丸協運輸株式会社堺センター", alias=shared, closed=True)]
     acc = _resolver(rows).resolve(_item("丸協運輸株式会社", [shared]))
     assert acc is None, "絞れないのに解約済を掴んではいけない"
 

@@ -262,7 +262,7 @@ def test_duplicate_backfill_protects_existing_values(aw_row):
     """dup補完は空欄のみ埋める (2026-08-05 既存値保護に是正)。
 
     HR通知メール経路とAW xlsx経路で住所の分割精度が異なり、後着の雑な分割が
-    良い値を上書きした実害(ダイセキ2件)の再発防止。値が入っている項目は不変。
+    良い値を上書きした実害(ダイリク2件)の再発防止。値が入っている項目は不変。
     """
     import dataclasses
     row = dataclasses.replace(aw_row, gender="女", pref="東京都",

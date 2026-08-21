@@ -91,10 +91,10 @@ def test_会社名の候補が付く(monkeypatch):
     """どの取引を開けばよいか分かるように会社名を添える。"""
     rows = [_listing("A", hr_shop="1519030"), _listing("B", aw_login="x@y.jp")]
     _setup(monkeypatch, rows, {}, {"A": ["P1"], "B": ["P2"]},
-           hint={"shop:1519030": "エア・ウォーター株式会社", "x@y.jp": "渡部容器株式会社"})
+           hint={"shop:1519030": "スカイ・ウォーター株式会社", "x@y.jp": "渡辺容器株式会社"})
     items = {i["求人ID"]: i for i in hc.check_recent_listings_linked()["items"]}
-    assert items["A"]["会社名(候補)"] == "エア・ウォーター株式会社"
-    assert items["B"]["会社名(候補)"] == "渡部容器株式会社"
+    assert items["A"]["会社名(候補)"] == "スカイ・ウォーター株式会社"
+    assert items["B"]["会社名(候補)"] == "渡辺容器株式会社"
 
 
 def test_会社名が引けなくても明細は出る(monkeypatch):

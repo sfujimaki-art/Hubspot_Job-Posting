@@ -8,7 +8,7 @@
 - 参照ベース: scripts/job_application_sync/hrhacker_import.py (A-1)
 
 ================================================================================
-Phase 0b 確定事項 (2026-06-26 株式会社坂本 client_code=1453036 実測)
+Phase 0b 確定事項 (2026-06-26 株式会社山口 client_code=9999999 実測)
 ================================================================================
 - AW出力形式は **XLSX (Excel)** であり CSV ではない (ZIP圧縮で配布される)
 - 265列 / 1シート ("Sheet1") / 1行目ヘッダ
@@ -184,7 +184,7 @@ AW_CSV_ENCODING = "utf-8-sig"
 # ----------------------------------------------------------------------------
 # RL_DETECT_COLUMN:
 #   None        → 【RL】判定を完全 disable (常に False = 全件 未判定)
-#                  Phase 0b 2026-06-26 株式会社坂本 XLSX 実測で
+#                  Phase 0b 2026-06-26 株式会社山口 XLSX 実測で
 #                  「【RL】はまだない」とユーザー報告
 #   文字列キー  → 内部キー (AW_*_COLUMNS の値側) を指定して contains/exact 判定
 #                  (旧 CSV 経路で "rl_flag" を有効にしたい場合などに使用)
@@ -291,7 +291,7 @@ def _check_client_code_consistency(rows: list[dict], login_id: str,
     """各行の client_code が CLI --login-id と一致するか検証.
 
     顧客ループ運用の前提:
-        CLI で --login-id 1453036 を渡したのに、XLSX に他の client_code が
+        CLI で --login-id 9999999 を渡したのに、XLSX に他の client_code が
         混入していた場合 = 顧客取り違え事故。strict=True なら即停止。
 
     Returns:
