@@ -53,11 +53,16 @@ STALE_RE = re.compile(r"（(\d{4}-\d{2}-\d{2}) 以降 未更新）\s*$")
 
 HISTORY_HEAD = "■ 過去の値（人が確認して整理してください）"
 HISTORY_LINE = "　{field}: {value}　← {label}（{date} まで）"
+UNPARSED_HEAD = "■ 書式が違って解析できなかった行（消さずに残しています）"
+
 HISTORY_RE = re.compile(
     r"^　(?P<field>[^:]+): (?P<value>.*?)　← (?P<label>.*?)（(?P<date>\d{4}-\d{2}-\d{2}) まで）$")
 
-# 1項目あたりに残す履歴の上限。増え続けると本文が読めなくなる。
-HISTORY_MAX = 3
+# ★履歴は打ち切らない (2026-08-21 ユーザー確定「メモはとりあえず全部残し。
+#   漏れなくは遵守、ダブりは許容する。後で人間が確認する」)。
+#   以前は項目あたり3件で打ち切っていたが、それは「漏れ」にあたる。
+#   本文が長くなるのは許容し、整理は人が行う。
+HISTORY_MAX = 0          # 0 = 無制限
 
 SRC_RE = re.compile(r"^（出典: 求人\d+件のメモを (\d{4}-\d{2}-\d{2}) に集約）", re.M)
 
@@ -79,7 +84,7 @@ def parse_body(body: str) -> dict:
     body = (body or "").replace("<br>", "\n").replace("\r\n", "\n")
     body = re.sub(r"<[^>]+>", "", body)
     out = {"common": OrderedDict(), "varying": OrderedDict(),
-           "none": [], "history": [], "asof": ""}
+           "none": [], "history": [], "unparsed": [], "asof": ""}
     m = SRC_RE.search(body)
     if m:
         out["asof"] = m.group(1)
@@ -89,6 +94,10 @@ def parse_body(body: str) -> dict:
     for raw in body.split("\n"):
         line = raw.rstrip()
         if not line:
+            continue
+        if line.startswith("（出典:"):
+            # 出典行は asof として別に拾う。ここで「拾えなかった行」として
+            # 積むと、書き戻しのたびに二重化して毎晩本文が膨らむ。
             continue
         if line.startswith("■ 全求人に共通"):
             section, group = "common", ""
@@ -102,6 +111,9 @@ def parse_body(body: str) -> dict:
         if line.startswith(HISTORY_HEAD):
             section = "history"
             continue
+        if line.startswith(UNPARSED_HEAD):
+            section = "unparsed"
+            continue
         if line.startswith("■"):
             section = None
             continue
@@ -113,6 +125,8 @@ def parse_body(body: str) -> dict:
                 k, v = line[1:].split(": ", 1)
                 v, stale = _split_stale(v)
                 out["common"][(group, k.strip())] = (v.strip(), stale)
+            else:
+                out["unparsed"].append(line)   # ★捨てない
             continue
         if section == "varying":
             if line.startswith("　　") and "　← " in line:
@@ -123,6 +137,8 @@ def parse_body(body: str) -> dict:
             elif line.startswith("　") and line.rstrip().endswith(":"):
                 field = line.strip().rstrip(":")
                 out["varying"].setdefault(field, [])
+            else:
+                out["unparsed"].append(line)   # ★捨てない
             continue
         if section == "none":
             out["none"] += [x.strip() for x in line.strip().split(" / ")
@@ -132,6 +148,11 @@ def parse_body(body: str) -> dict:
             hm = HISTORY_RE.match(line)
             if hm:
                 out["history"].append(hm.groupdict())
+            else:
+                out["unparsed"].append(line)   # ★捨てない
+            continue
+        if section == "unparsed":
+            out["unparsed"].append(line)
     return out
 
 
@@ -197,7 +218,8 @@ def merge_bodies(old_body: str, new_body: str, today: str) -> str:
     none_keys = [k for k in none_keys if k not in live]
 
     hist = _dedup_history(hist)
-    return _render(common, varying, none_keys, hist, new_body)
+    keep = list(dict.fromkeys(old["unparsed"] + new["unparsed"]))
+    return _render(common, varying, none_keys, hist, new_body, keep)
 
 
 def _dedup_history(hist: list) -> list:
@@ -212,14 +234,15 @@ def _dedup_history(hist: list) -> list:
     for h in sorted(seen.values(), key=lambda x: (x["field"], x["date"]),
                     reverse=True):
         n = per.get(h["field"], 0)
-        if n >= HISTORY_MAX:
+        if HISTORY_MAX and n >= HISTORY_MAX:
             continue
         per[h["field"]] = n + 1
         out.append(h)
     return sorted(out, key=lambda x: (x["field"], x["date"]))
 
 
-def _render(common, varying, none_keys, hist, new_body: str) -> str:
+def _render(common, varying, none_keys, hist, new_body: str,
+            unparsed=None) -> str:
     """マージ結果を本文へ戻す。見出しと出典行は new_body のものを流用."""
     head = []
     for line in new_body.replace("<br>", "\n").split("\n"):
@@ -255,6 +278,12 @@ def _render(common, varying, none_keys, hist, new_body: str) -> str:
         lines.append(HISTORY_HEAD)
         for h in hist:
             lines.append(HISTORY_LINE.format(**h))
+        lines.append("")
+    if unparsed:
+        # ★解析できなかった行を必ず書き戻す。捨てると「漏れ」になる
+        #   (2026-08-21 ユーザー確定「漏れなくは遵守、ダブりは許容」)。
+        lines.append(UNPARSED_HEAD)
+        lines += list(dict.fromkeys(unparsed))
         lines.append("")
     src = SRC_RE.search(new_body.replace("<br>", "\n"))
     lines.append(src.group(0) if src else "")
@@ -310,7 +339,12 @@ def merge_group(sources: list, today: str) -> str:
     if not parsed:
         return ""
     if len(parsed) == 1:
-        return parsed[0][1] and sources[0]["body"]
+        # ★sources[0] ではなく**中身のあった方**を返す。空の本文を持つ取引が
+        #   先頭にいると、まとめた結果が空になって全部消える。
+        for s in sources:
+            if (s.get("body") or "").strip():
+                return s["body"]
+        return ""
 
     # --- 全求人に共通 ---------------------------------------------------
     seen_common = OrderedDict()      # (group, field) -> {value: [(stale, name)]}
@@ -351,14 +385,16 @@ def merge_group(sources: list, today: str) -> str:
         varying[field] = items + varying[field]
 
     # --- 制限・指定なし / 履歴 -------------------------------------------
-    none_keys, hist = [], []
+    none_keys, hist, keep = [], [], []
     for _name, p in parsed:
         none_keys += p["none"]
         hist += p["history"]
+        keep += p["unparsed"]
     none_keys = list(dict.fromkeys(none_keys))
     live = {k for _g, k in common} | set(varying)
     none_keys = [k for k in none_keys if k not in live]
 
     base = max((s["body"] for s in sources if (s.get("body") or "").strip()),
                key=len)
-    return _render(common, varying, none_keys, _dedup_history(hist), base)
+    return _render(common, varying, none_keys, _dedup_history(hist), base,
+                   list(dict.fromkeys(keep)))

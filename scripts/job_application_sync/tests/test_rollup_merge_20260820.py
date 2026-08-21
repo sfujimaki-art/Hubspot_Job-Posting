@@ -169,15 +169,17 @@ def test_同じ値なら履歴に積まない():
     assert not M.parse_body(M.merge_bodies(b, b, TODAY))["history"]
 
 
-def test_履歴は項目ごとに上限で打ち切る():
-    """増え続けると本文が読めなくなる。読み手は一次対応中の担当者."""
+def test_履歴は打ち切らず全部残す():
+    """★2026-08-21 ユーザー確定「メモはとりあえず全部残し。漏れなくは遵守、
+    ダブりは許容する。後で人間が確認する」。以前は3件で打ち切っていたが、
+    それは『漏れ』にあたる。本文が長くなるのは許容する."""
     cur = body(varying=[("年齢上限", [("~50歳", "A職")])])
     for i, v in enumerate(["~51歳", "~52歳", "~53歳", "~54歳", "~55歳"]):
         cur = M.merge_bodies(
             cur, body(varying=[("年齢上限", [(v, "A職")])]),
             f"2026-09-0{i + 1}")
     h = [x for x in M.parse_body(cur)["history"] if x["field"] == "年齢上限"]
-    assert len(h) <= M.HISTORY_MAX
+    assert len(h) >= 4, f"履歴が打ち切られている: {len(h)}件"
 
 
 def test_別ラベルは別物として両方残す():
@@ -250,3 +252,95 @@ def test_実データの縮小事故が再現しない():
         assert keep in out, f"消えてはいけない値が消えた: {keep}"
     assert "履歴書 / 職務経歴書" in out and "3つほど回収" in out
     assert len(out) > len(new), "マージ後が今回ぶんより短いのはおかしい"
+
+
+# --------------------------------------------------------------------------
+# 6. 漏れなく残す (2026-08-21 ユーザー確定)
+#
+# 「メモはとりあえず全部残しでOK、後で人間が確認する。
+#   なので漏れなくは遵守、ダブりは許容する」
+#
+# 情報が落ちうる箇所を潰したことを固定する。
+# --------------------------------------------------------------------------
+def test_書式に合わない行を捨てない():
+    """★人が手で書き足した行や、書式を変えた過去の本文が黙って消えていた。
+    解析できなかった行は専用の見出しの下に必ず書き戻す."""
+    old = (body(varying=[("年齢上限", [("~55歳", "A職")])])
+           .replace("　　~55歳　← A職",
+                    "　　~55歳　← A職\n　　※社長判断で例外あり（手書き）"))
+    out = M.merge_bodies(old, body(), TODAY)
+    assert "※社長判断で例外あり（手書き）" in out
+    assert M.UNPARSED_HEAD in out
+
+
+def test_捨てない行も二度流すと増えない():
+    """漏れなく残すが、毎晩積み増してはいけない."""
+    old = (body(varying=[("年齢上限", [("~55歳", "A職")])])
+           .replace("　　~55歳　← A職",
+                    "　　~55歳　← A職\n　　※手書きメモ"))
+    d1 = M.merge_bodies(old, body(), TODAY)
+    d2 = M.merge_bodies(d1, body(), "2026-09-01")
+    assert d2.count("※手書きメモ") == 1
+
+
+def test_出典行は解析できない行に混ぜない():
+    """★出典行を「拾えなかった行」として積むと、書き戻しのたびに二重化して
+    毎晩本文が膨らむ (2026-08-21 に実際に発生)."""
+    p = M.parse_body(body(varying=[("年齢上限", [("~55歳", "A職")])]))
+    assert not any("出典" in x for x in p["unparsed"])
+    out = M.merge_bodies(body(varying=[("年齢上限", [("~55歳", "A職")])]),
+                         body(), TODAY)
+    assert out.count("（出典:") == 1
+
+
+def test_グループのまとめでも捨てない():
+    a = (body(varying=[("年齢上限", [("~55歳", "A職")])])
+         .replace("　　~55歳　← A職", "　　~55歳　← A職\n　　※Aの手書き"))
+    b = (body(varying=[("必須資格", [("大型免許", "B職")])])
+         .replace("　　大型免許　← B職", "　　大型免許　← B職\n　　※Bの手書き"))
+    out = M.merge_group([{"name": "取引A", "body": a},
+                         {"name": "取引B", "body": b}], TODAY)
+    assert "※Aの手書き" in out and "※Bの手書き" in out
+
+
+def test_まとめは先頭が空でも中身のある方を返す():
+    """★sources[0] が空だと、まとめた結果が空になって全部消えるバグがあった."""
+    out = M.merge_group(
+        [{"name": "空の取引", "body": ""},
+         {"name": "取引B", "body": body(varying=[("年齢上限", [("~55歳", "A職")])])}],
+        TODAY)
+    assert "~55歳" in out
+
+
+def test_全部空なら空を返す():
+    assert M.merge_group([{"name": "A", "body": ""},
+                          {"name": "B", "body": "  "}], TODAY) == ""
+
+
+def test_グループのまとめは食い違いを両方残す():
+    """★片方だけ更新され、もう片方は未更新という状態が普通に起きる."""
+    a = body(varying=[("年齢上限", [("~60歳", "トレーラー")])])
+    b = body(varying=[("年齢上限", [("~50歳", "トレーラー")])])
+    out = M.merge_group([{"name": "本体", "body": a},
+                         {"name": "オプション", "body": b}], TODAY)
+    assert "~60歳" in out and "~50歳" in out
+
+
+def test_グループのまとめも二度流して増えない():
+    a = body(varying=[("年齢上限", [("~60歳", "トレーラー")])])
+    b = body(varying=[("年齢上限", [("~50歳", "トレーラー")])])
+    once = M.merge_group([{"name": "本体", "body": a},
+                          {"name": "オプション", "body": b}], TODAY)
+    twice = M.merge_group([{"name": "本体", "body": once},
+                           {"name": "オプション", "body": once}], "2026-09-01")
+    assert M.parse_body(once) == M.parse_body(twice)
+
+
+def test_共通欄の食い違いも両方残る():
+    """共通欄は項目あたり1行しか持てないので、異なる条件欄へ回して両方残す."""
+    a = body(common=[("優先順位", "急ぎ度", "急ぎ")])
+    b = body(common=[("優先順位", "急ぎ度", "通常")])
+    out = M.merge_group([{"name": "本体", "body": a},
+                         {"name": "オプション", "body": b}], TODAY)
+    assert "急ぎ" in out and "通常" in out
+    assert "取引:" in out, "どちらの取引由来かが分かること"
