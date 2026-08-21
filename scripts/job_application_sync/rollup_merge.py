@@ -259,3 +259,106 @@ def _render(common, varying, none_keys, hist, new_body: str) -> str:
     src = SRC_RE.search(new_body.replace("<br>", "\n"))
     lines.append(src.group(0) if src else "")
     return "\n".join(x for x in lines if x is not None).rstrip() + "\n"
+
+
+# ==========================================================================
+# 契約グループ(取引先コード)単位のマージ (2026-08-21)
+# ==========================================================================
+# ★1対1のマージ(merge_bodies)と何が違うか
+#
+#   merge_bodies は「古い ← 新しい」の関係が決まっている場合の合流。
+#   同じ項目で値が違えば新を採り、旧は履歴へ落とす。
+#
+#   ところが同じ契約に生きている取引が複数あるとき(本体＋オプション等)、
+#   どちらが新しいかは決まらない。**片方だけ更新されて、もう片方は
+#   いじられていない**ことも普通に起きる。ここで片方を履歴へ落とすと、
+#   現場が見る本文からその条件が消える。
+#
+#   だから契約グループのマージでは**値が食い違っても両方を残す**。
+#   どの取引に由来するかを添えて、人が見て判断できる形にする
+#   (ユーザー指示 2026-08-21「省略せずにまとめること」)。
+#
+# ★どこへ書くか
+#   食い違った項目は「全求人に共通」ではなく「求人によって異なる条件」へ
+#   出す。共通欄は項目ごとに1行しか持てず、2つ目を書くと1つ目を潰すため。
+#   異なる条件欄はラベル別に複数行を持てるので、ラベルへ取引名を添える。
+
+SRC_FMT = "（取引: {name}）"
+
+
+def _pick_stale(marks: list):
+    """同じ値が複数の取引に出てくるときの未更新マーカーを決める。
+
+    どこか1つでも現役(印なし)なら印を付けない。全部が未更新なら、
+    いちばん新しい確認日を採る(古い方を採ると実態より古く見える)。
+    """
+    if any(m is None for m in marks):
+        return None
+    return max(marks) if marks else None
+
+
+def merge_group(sources: list, today: str) -> str:
+    """契約グループ内の集約メモを1本にまとめる。
+
+    sources: [{"name": 取引名, "body": 本文}, ...] 順序は問わない。
+    戻り: まとめた本文。グループ内の生きている取引すべてに同じものを貼る。
+
+    ★省略しない。値が食い違えば両方を残し、由来の取引名を添える。
+    """
+    parsed = [(s.get("name") or "", parse_body(s.get("body") or ""))
+              for s in sources if (s.get("body") or "").strip()]
+    if not parsed:
+        return ""
+    if len(parsed) == 1:
+        return parsed[0][1] and sources[0]["body"]
+
+    # --- 全求人に共通 ---------------------------------------------------
+    seen_common = OrderedDict()      # (group, field) -> {value: [(stale, name)]}
+    for name, p in parsed:
+        for key, (val, stale) in p["common"].items():
+            seen_common.setdefault(key, OrderedDict()).setdefault(
+                val, []).append((stale, name))
+    common, conflicts = OrderedDict(), OrderedDict()
+    for key, vals in seen_common.items():
+        if len(vals) == 1:
+            val, marks = next(iter(vals.items()))
+            common[key] = (val, _pick_stale([m for m, _n in marks]))
+        else:
+            # ★食い違い。共通欄は1行しか持てないので異なる条件欄へ回す。
+            conflicts[key[1]] = [
+                (val, SRC_FMT.format(name=marks[0][1]),
+                 _pick_stale([m for m, _n in marks]))
+                for val, marks in vals.items()]
+
+    # --- 求人によって異なる条件 ------------------------------------------
+    varying = OrderedDict()
+    for name, p in parsed:
+        for field, items in p["varying"].items():
+            cur = varying.setdefault(field, [])
+            for val, label, stale in items:
+                same = [i for i, (v, l, _s) in enumerate(cur)
+                        if v == val and l == label]
+                if same:
+                    i = same[0]
+                    cur[i] = (val, label, _pick_stale([cur[i][2], stale]))
+                    continue
+                # 同じラベルで値が違う → **どちらも残す**。由来を添える。
+                if any(l == label for _v, l, _s in cur):
+                    label = f"{label}{SRC_FMT.format(name=name)}"
+                cur.append((val, label, stale))
+    for field, items in conflicts.items():
+        varying.setdefault(field, [])
+        varying[field] = items + varying[field]
+
+    # --- 制限・指定なし / 履歴 -------------------------------------------
+    none_keys, hist = [], []
+    for _name, p in parsed:
+        none_keys += p["none"]
+        hist += p["history"]
+    none_keys = list(dict.fromkeys(none_keys))
+    live = {k for _g, k in common} | set(varying)
+    none_keys = [k for k in none_keys if k not in live]
+
+    base = max((s["body"] for s in sources if (s.get("body") or "").strip()),
+               key=len)
+    return _render(common, varying, none_keys, _dedup_history(hist), base)

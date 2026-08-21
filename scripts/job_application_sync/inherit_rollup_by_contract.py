@@ -26,24 +26,29 @@
 
     取引↔取引の関連 16% / 管理用メール 40% / 会社レコード 36% / 媒体アカウント 11%
 
-## 対象と、いま対象にしないもの
+## 対象
 
 実測(2026-08-21、契約グループ1,301):
 
     対象外(メモ無し or 生存無し)      959
-    既に生存側にある(マージのみ)       182
-    ★継承する(生存1件)               101   ← このスクリプトが扱う
-    イレギュラー(生存が複数)           59   ← **扱わない**。一覧に出して人へ回す
+    既に生存側にある                  182
+    継承する                          160   ← 生存が複数のグループも含む
 
-生存が複数のグループ(本体＋オプション等)は「どれに貼るか」「全部に貼るか」が
-決まっていない。機械が勝手に決めず、一覧に出して判断を仰ぐ
-(ユーザー指示 2026-08-21「イレギュラー対応は一旦置いて」)。
+**生存が複数のグループ(本体＋オプション等)も貼る**。求人はどの取引にもぶら下がり
+うるので、片方だけだとその求人経由の応募にメモが届かない。同じ本文を生きている
+取引すべてへ貼る (ユーザー指示 2026-08-21「継承して欲しい」)。
 
 ## やること
 
-グループ内のメモを **rollup_merge でマージ** して生きている取引へ貼る。
-単純コピーにしないのは、生存側にも独自のメモがありうるため。マージなら
-値が違えば新しい方を採り、古い方は履歴へ残る。今回出てこない項目も消えない。
+グループ内のメモを **rollup_merge.merge_group でまとめて**、生きている取引
+すべてへ同じ本文を貼る。単純コピーにしないのは、生存側にも独自のメモが
+ありうるため。
+
+★**値が食い違っても省略せず両方を残す** (ユーザー指示 2026-08-21)。
+  同じ契約に生きている取引が複数あるとき、どちらが新しいかは決まらない。
+  **片方だけ更新されて、もう片方はいじられていない**ことが普通に起きるので、
+  片方を履歴へ落とすと現場が見る本文からその条件が消える。両方を残し、
+  どの取引に由来するかを添えて、人が見て判断できる形にする。
 
 跡地側のメモは**消さない**。跡地は誰も見ないので害が小さく、消す方は
 引き継ぎに失敗していたときに情報が消える。
@@ -76,7 +81,7 @@ load_dotenv(_REPO / ".env")
 from scripts.job_application_sync import deal_stages as DS       # noqa: E402
 from scripts.job_application_sync.hs_paging import post_retry    # noqa: E402
 from scripts.job_application_sync.rollup_merge import (          # noqa: E402
-    merge_bodies)
+    merge_group)
 from scripts.job_application_sync.rollup_memo_to_deal import (   # noqa: E402
     existing_rollup_state, _patch_note)
 
@@ -146,43 +151,35 @@ def plan_inherit(deals: dict, state: dict, today: str = "") -> dict:
         donors = [i for i in srcs if i not in tgts]
         if not donors:
             continue                       # 生存側にしか無い = 引き継ぐものが無い
-        if len(tgts) > 1:
-            # ★機械が貼り先を決めない。人へ回す (2026-08-21 ユーザー指示)。
-            deferred.append({
+        # ★契約グループ内の全メモを1本にまとめ、生きている取引すべてへ貼る。
+        #   生存が複数(本体＋オプション等)でも貼り先を選ばない。求人はどの取引に
+        #   もぶら下がりうるので、片方だけだとその求人経由の応募にメモが届かない。
+        #   値が食い違っても**省略せず両方を残す** (2026-08-21 ユーザー指示。
+        #   片方だけ更新されもう片方は未更新、という状態が普通に起きるため)。
+        merged = merge_group(
+            [{"name": deals[i].get("dealname", "") or i,
+              "body": state[i]["body"]} for i in srcs], today)
+        if not merged.strip():
+            continue
+        for tgt in tgts:
+            cur = (state.get(tgt) or {}).get("body") or ""
+            if merged.strip() == cur.strip():
+                nochange += 1
+                continue
+            write.append({
                 "取引先コード": code,
-                "メモがある取引": [{"id": i, "取引名": deals[i].get("dealname", "")}
-                                   for i in donors],
-                "生きている取引": [
-                    {"id": i, "取引名": deals[i].get("dealname", ""),
-                     "ステージ": DS.label(deals[i].get("dealstage"))}
-                    for i in tgts],
-                "理由": "生きている取引が複数あり、どれに貼るか決められない",
+                "deal_id": tgt,
+                "取引名": deals[tgt].get("dealname", ""),
+                "ステージ": DS.label(deals[tgt].get("dealstage")),
+                "引継元": donors,
+                "同時に貼る生存取引": tgts,
+                "note_id": (state.get(tgt) or {}).get("note_id", ""),
+                "before_len": len(cur),
+                # ★実行前の本文をそのまま残す。長さだけではロールバック
+                #   できず、戻せない変更を本番へ入れることになる。
+                "before_body": cur,
+                "body": merged,
             })
-            continue
-        tgt = tgts[0]
-        merged = (state.get(tgt) or {}).get("body") or ""
-        for d in donors:
-            # 生存側を土台に、跡地のメモを積み上げる。生存側が空なら跡地がそのまま
-            # 土台になる。値が違えば新(生存側)を採り、旧は履歴へ残る。
-            merged = (merge_bodies(state[d]["body"], merged, today) if merged
-                      else state[d]["body"])
-        cur = (state.get(tgt) or {}).get("body") or ""
-        if merged.strip() == cur.strip():
-            nochange += 1
-            continue
-        write.append({
-            "取引先コード": code,
-            "deal_id": tgt,
-            "取引名": deals[tgt].get("dealname", ""),
-            "ステージ": DS.label(deals[tgt].get("dealstage")),
-            "引継元": donors,
-            "note_id": (state.get(tgt) or {}).get("note_id", ""),
-            "before_len": len(cur),
-            # ★実行前の本文をそのまま残す。長さだけではロールバック
-            #   できず、戻せない変更を本番へ入れることになる。
-            "before_body": cur,
-            "body": merged,
-        })
     return {"write": write, "deferred": deferred, "nochange": nochange,
             "groups": len(groups)}
 
