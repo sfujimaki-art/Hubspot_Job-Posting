@@ -250,7 +250,7 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_CODE=0; RC_ROLLUP=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
           #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
           #   → メモの転記 → 検知
@@ -278,6 +278,10 @@ jobs:
           #   集約した内容が求人へ流れるのが翌日になる。作り直さず既存へ積み上げる
           #   (作り直すと求人の出し直しで失われたメモを毎晩取り込む)。
           python scripts/job_application_sync/rollup_memo_to_deal.py $FLAG || RC_ROLLUP=$?
+          # ★契約をまたぐ引き継ぎ。集約の後・転記の前に置く。取引は契約更新で
+          #   作り替えられIDが変わるため、取引先コードで束ねて旧取引のメモを
+          #   生きている取引へ渡す。生存が複数のグループは貼らずに人へ回す。
+          python scripts/job_application_sync/inherit_rollup_by_contract.py $FLAG $SLACKFLAG || RC_INHERIT=$?
           python scripts/job_application_sync/sync_deal_memo_to_listing.py $FLAG || RC_MEMO=$?
           # 顧客管理シートD列の貼り替えにHubSpotが追従しているかの検知。
           # 検知のみ・自動修正しない(人が編集する場所を機械が上書きしない)。
@@ -286,12 +290,13 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
           NG=""
           [ $RC_CODE   -ne 0 ] && NG="$NG 取引先コードの補完"
           [ $RC_ROLLUP -ne 0 ] && NG="$NG 求人メモの取引への集約"
+          [ $RC_INHERIT -ne 0 ] && NG="$NG 契約をまたぐメモの引き継ぎ"
           [ $RC_ASSOC  -ne 0 ] && NG="$NG 求人→取引の紐付け"
           [ $RC_RELINK -ne 0 ] && NG="$NG 最新取引への付け替え"
           [ $RC_ICHIJI -ne 0 ] && NG="$NG 一次対応の転記"
