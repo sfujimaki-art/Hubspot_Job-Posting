@@ -48,6 +48,8 @@ _A_HDR = {                     # ヘッダ名で引く列 (正規化=空白/改�
     "alias": ("エイリアスアドレス",),
 }
 _A_COMP_PAT = re.compile(r"株式会社|有限会社|合同会社|協同組合")
+# 会社名列のヘッダ候補。「HS名」は HubSpot 側の名前で別物なので入れない。
+_A_COMP_HDR = ("企業名", "会社名", "企業名称", "顧客名")
 
 
 def _resolve_account_columns(header: list, rows: list) -> dict:
@@ -66,19 +68,29 @@ def _resolve_account_columns(header: list, rows: list) -> dict:
     cols: dict = {}
     for name, names in _A_HDR.items():
         cols[name] = next((hmap[_nh(n)] for n in names if _nh(n) in hmap), None)
-    # 会社名: ヘッダ名で引けない(ヘッダ空)ため、ヘッダ空の列のうち
-    # 社名パターン最多の列を採用 (HS名等の別名付き列を誤って拾わない)。
+    # 会社名列を決める。
+    # ★以前は「ヘッダが空の列」しか候補にしていなかった。2026-08-24 に現場が
+    #   C列へ「企業名」というヘッダを付けたところ、その瞬間に候補から外れて
+    #   応募取込が5分毎に落ち続けた(本番停止)。ヘッダ名が付くかどうかは現場の
+    #   都合で変わるので、**ヘッダ名でも中身でも引ける**ようにする。
     taken = {v for v in cols.values() if v is not None}
-    ncol = max((len(r) for r in rows), default=0)
-    best, best_hits = None, 0
-    for ci in range(ncol):
-        if ci in taken or _nh(header[ci] if ci < len(header) else ""):
-            continue  # ヘッダ名のある列は対象外
-        hits = sum(1 for r in rows
-                   if len(r) > ci and _A_COMP_PAT.search(str(r[ci])))
-        if hits > best_hits:
-            best, best_hits = ci, hits
-    cols["comp"] = best
+    ci = next((hmap[_nh(n)] for n in _A_COMP_HDR if _nh(n) in hmap
+               and hmap[_nh(n)] not in taken), None)
+    if ci is not None:
+        cols["comp"] = ci
+    else:
+        # ヘッダ名で引けなければ中身で決める。ヘッダの有無は問わない。
+        # 既に他の用途で使う列(taken)は除く。
+        ncol = max((len(r) for r in rows), default=0)
+        best, best_hits = None, 0
+        for ci in range(ncol):
+            if ci in taken:
+                continue
+            hits = sum(1 for r in rows
+                       if len(r) > ci and _A_COMP_PAT.search(str(r[ci])))
+            if hits > best_hits:
+                best, best_hits = ci, hits
+        cols["comp"] = best
     missing = [k for k, v in cols.items() if v is None]
     if missing:
         raise RuntimeError(
@@ -104,7 +116,7 @@ def _norm_company(s: str) -> str:
       長音の揺れ      「SBS三愛ロジスティックス」↔「SBS三愛ロジスティクス」
 
     **事業所名は落とさない**。落とすと別拠点を掴む。実測で
-    「ササカタニ産業株式会社」に栃木支店と千葉支店の2候補があり、機械では
+    「ヒノデ産業株式会社」に栃木支店と千葉支店の2候補があり、機械では
     どちらか決められない。そういうものは未突合のまま人へ回す
     (→[[feedback_jigyousho_unit_sales]] 決裁は事業所単位)。
     """
@@ -303,7 +315,7 @@ class AccountResolver:
             #   C列は「担当者 <実ドメイン>, 担当者 <リクロジのエイリアス>」の形で、
             #   どちらが先かは行によって違う。1つ目しか見ていなかったため
             #   会社名だけが頼りになり、事業所を決められず未突合になっていた。
-            #   実測: ササカタニ産業→栃木支店 / 東日本WMS→西部PC のように
+            #   実測: ヒノデ産業→栃木支店 / 東日本WMS→西部PC のように
             #   **エイリアスは事業所まで一意に決める**。
             for _extra in (item.login_ids or []):
                 _k = _norm(_extra)
@@ -475,10 +487,10 @@ def _all_emails(text: str) -> list[str]:
     ★1つ目だけでは足りない (2026-08-07 実測)。C列は
       「担当者名 <実ドメイン>, 担当者名 <リクロジのエイリアス>」の形で、
       **どちらが先かは行によって違う**。
-        ササカタニ産業      1つ目=y-takahashi@katani.co.jp / 2つ目=エイリアス(正解)
+        ヒノデ産業      1つ目=y-takahashi@example.co.jp / 2つ目=エイリアス(正解)
         東日本WMS       1つ目=d.nishiyama@shutoken.net / 2つ目=エイリアス(正解)
       1つ目しか見ていなかったため、会社名だけが頼りになり、
-      「ササカタニ産業株式会社」が栃木支店か千葉支店か決められず未突合だった。
+      「ヒノデ産業株式会社」が栃木支店か千葉支店か決められず未突合だった。
       エイリアスで引けば**事業所まで一意に決まる**(→栃木支店)。
     """
     if not text:

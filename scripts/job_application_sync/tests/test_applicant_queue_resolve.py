@@ -6,7 +6,7 @@
    C列は「担当者 <実ドメイン>, 担当者 <リクロジのエイリアス>」の形で、
    どちらが先かは行によって違う。1つ目しか見ていなかったため、
    会社名だけが頼りになり事業所を決められず未突合になっていた。
-   実測: 未突合35件 → 13件が新たに突合 (ササカタニ産業→栃木支店 等)。
+   実測: 未突合35件 → 13件が新たに突合 (ヒノデ産業→栃木支店 等)。
 
 2. **共用メールキーでは勝手に1社を選ばない**
    顧客管理シート 2,017行のうち59キーが2社以上で共用されている。
@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import pytest
+
+from scripts.job_application_sync import applicant_queue as aq
 
 from scripts.job_application_sync.applicant_queue import (
     AccountResolver,
@@ -78,9 +80,9 @@ def _item(company: str, emails: list[str]) -> QueueItem:
 # 1. C列の全メール抽出
 # --------------------------------------------------------------------------
 def test_all_emails_出現順に全部拾う():
-    s = "高橋 <y-takahashi@katani.co.jp>, 高橋 <cZq81Kp+CCc22Dd@example.com>"
+    s = "高橋 <y-takahashi@example.co.jp>, 高橋 <cZq81Kp+CCc22Dd@example.com>"
     assert _all_emails(s) == [
-        "y-takahashi@katani.co.jp", "cZq81Kp+CCc22Dd@example.com"]
+        "y-takahashi@example.co.jp", "cZq81Kp+CCc22Dd@example.com"]
 
 
 def test_all_emails_重複は1つに畳む():
@@ -101,18 +103,18 @@ def test_all_emails_空なら空リスト():
 # 2. 2つ目以降のメールで突合できる
 # --------------------------------------------------------------------------
 def test_2つ目のエイリアスで事業所まで決まる():
-    """ササカタニ産業の実例。1つ目=実ドメイン(シートに無い)、2つ目=エイリアス。
+    """ヒノデ産業の実例。1つ目=実ドメイン(シートに無い)、2つ目=エイリアス。
 
-    会社名「ササカタニ産業株式会社」だけでは栃木支店か決められないが、
+    会社名「ヒノデ産業株式会社」だけでは栃木支店か決められないが、
     エイリアスが栃木支店の行にしか無いので一意に決まる。
     """
-    rows = [_row("ササカタニ産業株式会社　栃木支店",
+    rows = [_row("ヒノデ産業株式会社　栃木支店",
                  alias="cZq81Kp+CCc22Dd@example.com")]
     acc = _resolver(rows).resolve(
-        _item("ササカタニ産業株式会社",
-              ["y-takahashi@katani.co.jp", "cZq81Kp+CCc22Dd@example.com"]))
+        _item("ヒノデ産業株式会社",
+              ["y-takahashi@example.co.jp", "cZq81Kp+CCc22Dd@example.com"]))
     assert acc is not None
-    assert acc.company == "ササカタニ産業株式会社　栃木支店"
+    assert acc.company == "ヒノデ産業株式会社　栃木支店"
     assert "2件目以降" in acc.matched_by
 
 
@@ -193,3 +195,76 @@ def test_共用数が何社でも絞れなければNone(n_shared):
     shared = "many@example.com"
     rows = [_row(f"共用{i}社", alias=shared) for i in range(n_shared)]
     assert _resolver(rows).resolve(_item("どれでもない会社", [shared])) is None
+
+
+# --------------------------------------------------------------------------
+# 会社名列の特定 (2026-08-24 本番停止の再発防止)
+#
+# ★現場がシートのC列へ「企業名」というヘッダを付けたところ、応募取込が
+#   5分毎に落ち続けた。列判定が「ヘッダが空の列」しか候補にしていなかったため。
+#   ヘッダ名が付くかどうかは現場の都合で変わる。名前でも中身でも引けること。
+# --------------------------------------------------------------------------
+def _hdr_real():
+    """2026-08-24 実測のヘッダ (C列に「企業名」が付いた後)."""
+    return ["", "企業番号", "権限共有", "企業名", "HS名", "担当コンサル",
+            "engage\nアカウント", "クローズ", "リクロジアドレス", "PW",
+            "AirWork ID", "AirワークPW", "Airワーク\n会社情報変更",
+            "Airワーク\nアドレス変更", "", "企業AirWork ID", "企業Airwork PW",
+            "エイリアス\nアドレス\n", "エイリアス\nパス", "engage ID"]
+
+
+def _row_real(comp="株式会社サンプル", mail="rpo.sample@example.com"):
+    r = [""] * 20
+    r[3] = comp
+    r[8] = mail
+    return r
+
+
+def test_企業名ヘッダがあれば会社名列を引ける():
+    """★これが本番停止の直接原因。ヘッダが付いた瞬間に候補から外れていた."""
+    cols = aq._resolve_account_columns(_hdr_real(), [_row_real()])
+    assert cols["comp"] == 3
+
+
+def test_ヘッダが空でも中身で引ける():
+    """従来どおりヘッダ無しでも動くこと (現場が名前を消しても壊れない)."""
+    h = _hdr_real()
+    h[3] = ""
+    cols = aq._resolve_account_columns(h, [_row_real() for _ in range(3)])
+    assert cols["comp"] == 3
+
+
+def test_HS名を会社名と取り違えない():
+    """HS名はHubSpot側の名前で別物。ヘッダ候補に入れてはいけない."""
+    h = _hdr_real()
+    h[3] = ""                      # 企業名ヘッダを外す
+    rows = []
+    for _ in range(5):
+        r = _row_real()
+        r[4] = "株式会社サンプル(HS)"   # HS名にも社名が入る
+        rows.append(r)
+    cols = aq._resolve_account_columns(h, rows)
+    assert cols["comp"] == 3, "内容が同数なら先に出る方(企業名列)を採る"
+
+
+def test_会社名列が無ければ明示エラー():
+    """位置依存へ黙って落とさない。落ちれば原因がログに出る."""
+    h = _hdr_real()
+    h[3] = ""
+    r = [""] * 20
+    r[8] = "rpo.sample@example.com"
+    with pytest.raises(RuntimeError, match="列を特定できず"):
+        aq._resolve_account_columns(h, [r])
+
+
+def test_他の用途の列を会社名にしない():
+    """リクロジアドレス列等が社名を含んでも、そちらを会社名にしない."""
+    h = _hdr_real()
+    h[3] = ""
+    rows = []
+    for _ in range(3):
+        r = _row_real()
+        r[8] = "株式会社まぎらわしい@example.com"
+        rows.append(r)
+    cols = aq._resolve_account_columns(h, rows)
+    assert cols["comp"] == 3 and cols["reclog"] == 8
