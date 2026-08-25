@@ -1,0 +1,65 @@
+# 顧客シートへ「読めるか」だけを確かめる (2026-08-26)
+#
+# 目的: 転記の許可リスト(CUSTOMER_SHEET_ALLOW)をやめて
+#       「サービスアカウントに共有された時点で許可」へ移せるかを判断する。
+#       そのために、候補の顧客シートのうち何社が既に共有済みかを数える。
+#
+# 安全:
+#   - 読み取りのみ。書き込み・タブ作成は一切しない
+#   - このリポジトリは public であり Actions のログも public になるため、
+#     顧客名・シートID・URLは出力しない (件数と割合だけ)
+#   - 対象は Secrets でなく HubSpot の customer_sheet_url から組み立てる
+#
+# 手で回すときだけ動く。定期実行はしない。
+
+name: Sheet Access Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_status:
+        description: "公開中でない求人のシートも対象にする"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sheet-access-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dotenv google-auth google-api-python-client
+
+      - name: Write SA json
+        env:
+          SHEET_SA_CONTENT: ${{ secrets.CUSTOMER_SHEET_SA_JSON }}
+        run: |
+          # env経由で書く (複数行secretをシェル展開で壊さない)
+          if [ -z "$SHEET_SA_CONTENT" ]; then
+            echo "CUSTOMER_SHEET_SA_JSON が未設定です。転記に使うSAでないと測る意味がありません"
+            exit 1
+          fi
+          printf '%s' "$SHEET_SA_CONTENT" > /tmp/sheet_sa.json
+
+      - name: Probe
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+          CUSTOMER_SHEET_SA_JSON: /tmp/sheet_sa.json
+          PYTHONIOENCODING: utf-8
+          ALL_STATUS: ${{ inputs.all_status }}
+        run: |
+          ARGS=""
+          if [ "$ALL_STATUS" = "true" ]; then ARGS="--all-status"; fi
+          python scripts/job_application_sync/probe_customer_sheet_access.py $ARGS
