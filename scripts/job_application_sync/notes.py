@@ -121,6 +121,71 @@ def _headers(token: Optional[str] = None) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
+def patch_note(note_id: str, body: str, *, token: Optional[str] = None,
+               retries: int = 4) -> None:
+    """既存Noteの本文を更新する。関連付けを保つため作り直さない。
+
+    ★「作り直し(POST+DELETE)」にしないこと (2026-08-31 共通化)。
+      転記側がそれをやって毎晩1,800件のNoteを増やし、削除の戻り値も見て
+      いなかった。更新は集約側 (rollup_memo_to_deal) と転記側
+      (sync_deal_memo_to_listing) の両方がここを使う。
+      失敗は必ず例外にする。黙って成功扱いにしない。
+    """
+    payload = {"properties": {
+        "hs_note_body": body.replace("\n", "<br>"),
+        "hs_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }}
+    for i in range(retries + 1):
+        try:
+            r = requests.patch(f"{BASE}/crm/v3/objects/notes/{note_id}",
+                               headers=_headers(token), json=payload, timeout=90)
+        except RequestException:
+            if i < retries:
+                time.sleep(2 ** i)
+                continue
+            raise
+        if r.status_code == 200:
+            return
+        if r.status_code in (429, 500, 502, 503, 504) and i < retries:
+            time.sleep(2 ** i * 2)
+            continue
+        raise RuntimeError(f"PATCH Note {note_id} HTTP {r.status_code}: {r.text[:160]}")
+    raise RuntimeError(f"PATCH Note {note_id} retry exhausted")
+
+
+def human_edited(note_id: str, *, token: Optional[str] = None,
+                 retries: int = 3) -> bool:
+    """このNoteを人が画面から編集した版があるか (変更履歴で見る)。
+
+    ★hs_object_source_label / hs_created_by_user_id は**作成時**の情報しか
+      持たない。作成後に人が直した痕跡は propertiesWithHistory にしか出ない
+      (2026-08-31 実測: 転記Note 5,117件は作成時プロパティ100% INTEGRATION
+      だったが、履歴を見ると CRM_UI の版を持つものがあった)。
+      上書き・削除の前に呼び、True なら止めて報告する。
+      履歴が取れないときは例外にする (分からないまま消さない)。
+    """
+    for i in range(retries + 1):
+        try:
+            r = requests.get(f"{BASE}/crm/v3/objects/notes/{note_id}",
+                             headers=_headers(token),
+                             params={"propertiesWithHistory": "hs_note_body"},
+                             timeout=30)
+        except RequestException:
+            if i < retries:
+                time.sleep(2 ** i)
+                continue
+            raise
+        if r.status_code == 200:
+            hist = ((r.json().get("propertiesWithHistory") or {})
+                    .get("hs_note_body") or [])
+            return any((v.get("sourceType") or "").upper() == "CRM_UI" for v in hist)
+        if r.status_code in (429, 500, 502, 503, 504) and i < retries:
+            time.sleep(2 ** i * 2)
+            continue
+        raise RuntimeError(f"履歴取得 Note {note_id} HTTP {r.status_code}: {r.text[:160]}")
+    raise RuntimeError(f"履歴取得 Note {note_id} retry exhausted")
+
+
 def _utc_now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 

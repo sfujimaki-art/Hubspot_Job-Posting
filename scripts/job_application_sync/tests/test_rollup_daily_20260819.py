@@ -50,30 +50,34 @@ def test_既存集約メモが無い取引だけを新規作成対象にする()
 
 
 def test_既存集約メモは検索の全ページから取引ごとに取得する(monkeypatch):
-    """先頭100件だけ見て既存を見落とし、同じ取引へ二重作成してはならない。"""
+    """★2026-08-31: after 方式 (10,000件で HTTP 400) をやめ、hs_object_id カーソルの
+    search_all_by_id へ移した。ページング自体は test_hs_paging_by_id_20260831 が守る。
+    ここでは「検索結果のうち集約署名を持つものだけを、取引IDごとに束ねる」ことを守る。
+    ★検索を差し替えないと本物の API を叩く (旧版のこのテストがそうなっていた)."""
     calls = []
-    responses = iter([
-        {
-            "results": [{"id": "N1", "properties": {
-                "hs_note_body": rollup.ROLLUP_SIGNATURE + "\n本文A"}}],
-            "paging": {"next": {"after": "next-page"}},
-        },
-        {
-            "results": [{"id": "N2", "properties": {
-                "hs_note_body": rollup.ROLLUP_SIGNATURE + "\n本文B"}}],
-        },
-        {
-            "results": [
-                {"from": {"id": "N1"}, "to": [{"toObjectId": "D1"}]},
-                {"from": {"id": "N2"}, "to": [{"toObjectId": "D2"}]},
-            ]
-        },
-    ])
+    searched = [
+        {"id": "N1", "properties": {
+            "hs_note_body": rollup.ROLLUP_SIGNATURE + "\n本文A"}},
+        {"id": "N2", "properties": {
+            "hs_note_body": rollup.ROLLUP_SIGNATURE + "\n本文B"}},
+        # CONTAINS_TOKEN は語単位で当たるので偽陽性が混ざる。署名で落とす
+        {"id": "N9", "properties": {
+            "hs_note_body": "暗黙知メモの件で相談された、という人のメモ"}},
+    ]
+
+    def fake_search(obj_type, props, filters, **_kwargs):
+        calls.append(("search", obj_type, filters))
+        return list(searched)
 
     def fake_post(url, body, **_kwargs):
-        calls.append((url, body))
-        return next(responses)
+        calls.append(("post", url, body))
+        assert [i["id"] for i in body["inputs"]] == ["N1", "N2"],             "署名の無い偽陽性は関連取得に回さない"
+        return {"results": [
+            {"from": {"id": "N1"}, "to": [{"toObjectId": "D1"}]},
+            {"from": {"id": "N2"}, "to": [{"toObjectId": "D2"}]},
+        ]}
 
+    monkeypatch.setattr(rollup, "search_all_by_id", fake_search)
     monkeypatch.setattr(rollup, "_post", fake_post)
     monkeypatch.setattr(rollup.time, "sleep", lambda _seconds: None)
 
@@ -87,9 +91,9 @@ def test_既存集約メモは検索の全ページから取引ごとに取得�
         assert state[did]["note_id"] == note_id
         assert state[did]["hash"] == rollup.rollup_body_hash(body_text)
         assert state[did]["body"] == body_text, "マージ用に本文を保持する"
-    assert calls[0][1]["limit"] == 100
-    assert "after" not in calls[0][1]
-    assert calls[1][1]["after"] == "next-page"
+    assert calls[0][:2] == ("search", "notes")
+    assert calls[0][2][0]["operator"] == "CONTAINS_TOKEN"
+    assert [c[0] for c in calls] == ["search", "post"], "関連取得は100件ごとに1回"
 
 
 def test_差分は既存Noteを更新し新規対象だけを作成する(monkeypatch):

@@ -166,6 +166,8 @@ def test_転記メモは集約メモの署名を含まない():
     """②は本文から ROLLUP_SIGNATURE を除去して貼る。両方を含むと
     取引側の集約メモを数えるコードが求人側の転記まで数えてしまう."""
     from scripts.job_application_sync import sync_deal_memo_to_listing as S
-    body = S.transfer_body(f"{N.ROLLUP_SIGNATURE}\n本文", "取引A", "abc123")
+    # ★2026-08-31: 印 (<!--memo:hash-->) は HubSpot が保存時に消すので埋めなくなった。
+    #   引数は (取引メモ, 出典) の2つ。
+    body = S.transfer_body(f"{N.ROLLUP_SIGNATURE}\n本文", "取引A")
     assert N.ROLLUP_SIGNATURE not in body
     assert N.TRANSFER_SIGNATURE in body

@@ -59,12 +59,12 @@ try:  # script実行/パッケージ両対応の二重import
     from scripts.job_application_sync.rollup_merge import (  # noqa: E402
         merge_bodies)
     from scripts.job_application_sync.notes import (      # noqa: E402
-        ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE, TRANSFER_SIGNATURE)
+        ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE, TRANSFER_SIGNATURE, patch_note)
     from scripts.job_application_sync.hs_paging import search_all_by_id  # noqa: E402
 except ImportError:  # pragma: no cover
     from rollup_merge import merge_bodies  # type: ignore
     from notes import (ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE,  # type: ignore
-                       TRANSFER_SIGNATURE)
+                       TRANSFER_SIGNATURE, patch_note)
     from hs_paging import search_all_by_id  # type: ignore
 
 # 抽出対象の項目。**現場の入力テンプレート実物に合わせてある**。
@@ -246,29 +246,16 @@ def existing_rollup_state() -> dict:
 
 
 def _patch_note(note_id: str, body: str, retries: int = 4) -> None:
-    """既存の集約Noteを更新する。関連付けを保つため作り直さない。"""
-    payload = {"properties": {
-        "hs_note_body": body.replace("\n", "<br>"),
-        "hs_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }}
-    for i in range(retries + 1):
-        try:
-            response = requests.patch(
-                f"{BASE}/crm/v3/objects/notes/{note_id}", headers=_h(),
-                json=payload, timeout=90)
-        except requests.RequestException:
-            if i < retries:
-                time.sleep(2 ** i)
-                continue
-            raise
-        if response.status_code == 200:
-            return
-        if response.status_code in (429, 500, 502, 503, 504) and i < retries:
-            time.sleep(2 ** i * 2)
-            continue
-        raise RuntimeError(f"PATCH Note HTTP {response.status_code}: "
-                           f"{response.text[:160]}")
-    raise RuntimeError("PATCH Note retry exhausted")
+    """既存の集約Noteを更新する。関連付けを保つため作り直さない。
+
+    ★実体は notes.patch_note (2026-08-31 に共通化)。転記側
+      (sync_deal_memo_to_listing) が「作り直し+削除」で毎晩1,800件を増やして
+      いたのは、ここと同じ更新の部品を使っていなかったため。1箇所に寄せる。
+    """
+    # トークンは rollup 側の _h() から渡す。notes 側で env を直接読ませると、
+    # テストで _h を差し替えても env が要る (.env の無い環境で落ちた 2026-08-31)。
+    tok = _h()["Authorization"].split(" ", 1)[1]
+    patch_note(note_id, body, token=tok, retries=retries)
 
 
 def apply_rollup_writes(todo: list) -> dict:
