@@ -160,3 +160,54 @@ def search_all(obj_type: str, props: list, filters: list,
         if not after or (limit and len(out) >= limit):
             return out
         time.sleep(0.1)
+
+
+def search_all_by_id(obj_type: str, props: list, filters: list,
+                     page: int = 100, progress_every: int = 5000) -> list:
+    """Search API を **hs_object_id のカーソル**で全件回す。10,000件上限は無い。
+
+    `after` でページを送ると 10,000件で HTTP 400 になる (search_all の制約)。
+    代わりに「前ページの最後の ID より大きいもの」を hs_object_id 昇順で取る。
+    毎回が独立した検索なので上限に当たらず、速さは search のまま。
+    実測(2026-08-31): 500件 3.7秒。
+
+    iter_all (list API) との使い分け:
+      - 絞り込みが効いて対象が数千〜数万件 → これ。数十秒〜数分
+      - 絞り込みが無く全件 → iter_all。Note は 30万件超で 35分かかる
+
+    filters: 1つの AND グループ。hs_object_id の条件はここで足すので
+             呼び出し側は入れないこと。
+
+    ★カーソルが進まなければ例外にする。黙って同じページを回し続けると
+      無限ループになり、CI のタイムアウトまで気づけない。
+    """
+    out, seen, last, n = [], set(), 0, 0
+    fixed = [f for f in filters if f.get("propertyName") != "hs_object_id"]
+    while True:
+        body = {"filterGroups": [{"filters": fixed + [
+                    {"propertyName": "hs_object_id", "operator": "GT",
+                     "value": str(last)}]}],
+                "properties": props, "limit": page,
+                "sorts": [{"propertyName": "hs_object_id",
+                           "direction": "ASCENDING"}]}
+        j = post_retry(f"{BASE}/crm/v3/objects/{obj_type}/search", body)
+        rs = j.get("results") or []
+        if not rs:
+            return out
+        ids = [int(r["id"]) for r in rs]
+        if ids[-1] <= last:
+            raise RuntimeError(
+                f"search_all_by_id {obj_type}: カーソルが進まない "
+                f"(last={last}, got={ids[0]}..{ids[-1]})")
+        for r in rs:
+            if r["id"] in seen:
+                continue
+            seen.add(r["id"])
+            out.append(r)
+        last = ids[-1]
+        n += len(rs)
+        if progress_every and n % progress_every < page and n >= progress_every:
+            print(f"  [search {obj_type}] {n:,}件", flush=True)
+        if len(rs) < page:
+            return out
+        time.sleep(0.1)

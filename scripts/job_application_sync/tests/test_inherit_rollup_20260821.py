@@ -202,11 +202,47 @@ def test_跡地にメモが無ければ何もしない():
 
 
 def test_生存側にしか無ければ何もしない():
-    """引き継ぐ元が無い。生存側のメモをそのまま貼り直すのは無駄な書き込み."""
+    """引き継ぐ元が無い。生存側のメモをそのまま貼り直すのは無駄な書き込み.
+
+    ★これは生存が**1件**の話。生存が複数なら下のテストのとおり配る。"""
     deals = {"OLD": _deal(KEIZOKU), "NEW": _deal(LIVE)}
     p = IC.plan_inherit(deals, _state(NEW=_memo(("年齢上限", "~55歳", "A職"))),
                         TODAY)
     assert not p["write"]
+
+
+def test_跡地が無くても生存が複数でメモが片方だけなら他方へ配る():
+    """★2026-08-31 是正。旧実装は引き継ぐ元を跡地に限っていたため、
+    本体＋オプションのように生存が複数でメモが片方にしか無いと、
+    もう片方へ永久に届かなかった。実測37契約が全てこれだった。"""
+    deals = {"A": _deal(LIVE, name="本体"), "B": _deal(LIVE2, name="オプション")}
+    p = IC.plan_inherit(deals, _state(A=_memo(("年齢上限", "~55歳", "A職"))),
+                        TODAY)
+    assert {w["deal_id"] for w in p["write"]} == {"B"}, "持っていない方だけに書く"
+    assert "~55歳" in p["write"][0]["body"]
+    assert p["nochange"] == 1, "持っている方は書き直さない"
+    assert list(p["write"][0]["引継元"]) == ["A"], \
+        "跡地が無くても、どの生存から来たかをログに残す"
+
+
+def test_跡地が無く全生存が持っていれば何もしない():
+    """配り終えた翌晩。全員が同じ本文を持っていて跡地も無い = 何もすることがない."""
+    deals = {"A": _deal(LIVE), "B": _deal(LIVE2)}
+    same = _memo(("年齢上限", "~55歳", "A職"))
+    p = IC.plan_inherit(deals, _state(A=same, B=same), TODAY)
+    assert not p["write"]
+
+
+def test_生存同士で配った後は二度流しても増えない():
+    """★配った翌晩に「両方が持っている」状態で再実行しても書き直さない."""
+    deals = {"A": _deal(LIVE), "B": _deal(LIVE2)}
+    st = _state(A=_memo(("年齢上限", "~55歳", "トレーラー")))
+    p1 = IC.plan_inherit(deals, st, TODAY)
+    body1 = p1["write"][0]["body"]
+    st2 = dict(st)
+    st2["B"] = {"note_id": "N2", "hash": "h", "body": body1}
+    p2 = IC.plan_inherit(deals, st2, "2026-09-01")
+    assert not p2["write"], "同じ内容なら書かない"
 
 
 def test_取引先コードが無ければ対象外():

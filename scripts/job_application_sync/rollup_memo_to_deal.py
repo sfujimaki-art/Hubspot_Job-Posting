@@ -60,10 +60,12 @@ try:  # script実行/パッケージ両対応の二重import
         merge_bodies)
     from scripts.job_application_sync.notes import (      # noqa: E402
         ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE, TRANSFER_SIGNATURE)
+    from scripts.job_application_sync.hs_paging import search_all_by_id  # noqa: E402
 except ImportError:  # pragma: no cover
     from rollup_merge import merge_bodies  # type: ignore
     from notes import (ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE,  # type: ignore
                        TRANSFER_SIGNATURE)
+    from hs_paging import search_all_by_id  # type: ignore
 
 # 抽出対象の項目。**現場の入力テンプレート実物に合わせてある**。
 # 2026-08-06 の逆証明で、当初の11項目では記入率99%の「急ぎ度」「採用優先順位」が
@@ -210,23 +212,18 @@ def existing_rollup_state() -> dict:
     Note検索は一度に100件しか返さない。ページングを省くと先頭以外の既存Noteを
     見落とし、日次実行で同じ取引へ集約Noteを重ねるため、終端まで必ず取得する。
     """
-    notes, after = [], None
-    while True:
-        body = {"filterGroups": [{"filters": [{
-            "propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
-            "value": "暗黙知メモ"}]}],
-            "properties": ["hs_note_body"], "limit": 100}
-        if after:
-            body["after"] = after
-        result = _post(f"{BASE}/crm/v3/objects/notes/search", body)
-        notes.extend(result.get("results") or [])
-        after = (result.get("paging") or {}).get("next", {}).get("after")
-        if not after:
-            break
-        time.sleep(0.1)
-
-    notes = [note for note in notes if ROLLUP_SIGNATURE in (
-        (note.get("properties") or {}).get("hs_note_body") or "")]
+    # ★after 方式をやめ、hs_object_id カーソルで search を回す (2026-08-31 是正)。
+    #   after 方式は 10,000件で HTTP 400 になる。「暗黙知メモ」のヒットは
+    #   集約メモ(約650件)に転記メモ(約4,100件・増殖中)が混ざって 6,167件に達し、
+    #   このままだと1週間ほどで上限に当たる見込みだった。
+    #   list API (iter_all) は上限が無いが Note 30万件超で 35分かかり、
+    #   毎晩走る inherit_rollup_by_contract には載せられない (一度載せて撤回)。
+    notes = [note for note in search_all_by_id(
+                 "notes", ["hs_note_body"],
+                 [{"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
+                   "value": "暗黙知メモ"}])
+             if ROLLUP_SIGNATURE in (
+                 (note.get("properties") or {}).get("hs_note_body") or "")]
     state = {}
     for i in range(0, len(notes), 100):
         chunk = notes[i:i + 100]
@@ -503,22 +500,22 @@ def discover_filled_listings() -> list:
 
       実測(2026-08-18): テンプレ署名を持つNote 8,265件 → 求人 5,134件。
     """
-    notes, after = [], None
-    while True:
-        body = {"filterGroups": [{"filters": [
-            {"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
-             "value": "暗黙知入力テンプレート"}]}],
-            "properties": ["hs_note_body"], "limit": 100}
-        if after:
-            body["after"] = after
-        j = _post(f"{BASE}/crm/v3/objects/notes/search", body)
-        notes += j.get("results") or []
-        after = (j.get("paging") or {}).get("next", {}).get("after")
-        if not after:
-            break
-        time.sleep(0.08)
-    # 署名で確定する。CONTAINS_TOKEN は語単位なので拾いすぎがある。
-    ids = [n["id"] for n in notes
+    # ★after 方式をやめ、hs_object_id カーソルで search を回す (2026-08-31 是正)。
+    #   対象が 9,800件に達して after 方式の10,000件上限に当たり、
+    #   2026-08-23 から4晩連続で HTTP 400 でクラッシュしていた (実ログで確認)。
+    #
+    #   しかもその 9,800件のうち 2,159件は偽陽性だった。HubSpotの
+    #   CONTAINS_TOKEN は日本語を語単位で切るため、求人票本文の
+    #   「テンプレートのある文書で…入力」のような無関係な文が
+    #   「入力テンプレート」で引っかかる。**偽陽性が上限を押し上げていた**。
+    #   本物は 7,641件 (2026-08-27 実測)。署名での確定は従来どおり行う。
+    #
+    #   list API (iter_all) も試したが Note 30万件超で 35分かかった。
+    #   カーソル方式なら上限なしで 1〜2分。
+    ids = [n["id"] for n in search_all_by_id(
+               "notes", ["hs_note_body"],
+               [{"propertyName": "hs_note_body", "operator": "CONTAINS_TOKEN",
+                 "value": "暗黙知入力テンプレート"}])
            if TEMPLATE_SIGNATURE in ((n.get("properties") or {}).get(
                "hs_note_body") or "")]
     out = set()

@@ -149,8 +149,17 @@ def plan_inherit(deals: dict, state: dict, today: str = "") -> dict:
         if not srcs or not tgts:
             continue
         donors = [i for i in srcs if i not in tgts]
-        if not donors:
-            continue                       # 生存側にしか無い = 引き継ぐものが無い
+        lacking = [i for i in tgts if i not in srcs]
+        # ★跡地が無くても、メモを持たない生きている取引があれば配る (2026-08-31 是正)。
+        #   旧: `if not donors: continue` — 引き継ぐ元を跡地に限っていたため、
+        #   本体＋オプションのように生存が複数でメモが片方にしか無いと、
+        #   もう片方へ永久に届かなかった。実測37契約が全てこれに該当した
+        #   (跡地メモ0件・生存の一部だけメモあり)。契約更新で旧取引がまだ
+        #   閉じていない間(ヨミ段階)も同じ形になる。
+        #   全ての生存が既に持っていて跡地も無いときだけ、何もしない。
+        #   (生存同士で本文が食い違う場合はここでは触らない。別論点)
+        if not donors and not lacking:
+            continue
         # ★契約グループ内の全メモを1本にまとめ、生きている取引すべてへ貼る。
         #   生存が複数(本体＋オプション等)でも貼り先を選ばない。求人はどの取引に
         #   もぶら下がりうるので、片方だけだとその求人経由の応募にメモが届かない。
@@ -171,7 +180,9 @@ def plan_inherit(deals: dict, state: dict, today: str = "") -> dict:
                 "deal_id": tgt,
                 "取引名": deals[tgt].get("dealname", ""),
                 "ステージ": DS.label(deals[tgt].get("dealstage")),
-                "引継元": donors,
+                # 跡地が無い経路(生存→生存)では donors が空になる。ログで
+                # 「どこから来たか」が消えないよう、その場合はメモ元の生存を残す。
+                "引継元": donors or [i for i in srcs if i != tgt],
                 "同時に貼る生存取引": tgts,
                 "note_id": (state.get(tgt) or {}).get("note_id", ""),
                 "before_len": len(cur),
