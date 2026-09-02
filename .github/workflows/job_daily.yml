@@ -250,7 +250,7 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_APPT=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
           #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
           #   → メモの転記 → 検知
@@ -289,6 +289,11 @@ jobs:
           #   生きている取引へ渡す。生存が複数のグループは貼らずに人へ回す。
           python scripts/job_application_sync/inherit_rollup_by_contract.py $FLAG $SLACKFLAG || RC_INHERIT=$?
           python scripts/job_application_sync/sync_deal_memo_to_listing.py $FLAG || RC_MEMO=$?
+          # ★作成時に求人メモが無かった応募へ、転記の後に埋め直す (2026-09-02)。
+          #   応募は5分毎・メモは夜間にしか届かないので、応募が先に来ると
+          #   作成時1回のコピーでは永久に空のままだった (実測: 到達61%)。
+          #   2026-09-01 以降の応募だけが対象 (過去の空きは救済しない・ユーザー決定)。
+          python scripts/job_application_sync/backfill_appointment_memo.py $FLAG || RC_APPT=$?
           # 顧客管理シートD列の貼り替えにHubSpotが追従しているかの検知。
           # 検知のみ・自動修正しない(人が編集する場所を機械が上書きしない)。
           python scripts/job_application_sync/check_sheet_url_drift.py $SLACKFLAG || RC_DRIFT=$?
@@ -296,7 +301,7 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO appt=$RC_APPT drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
           NG=""
@@ -307,6 +312,7 @@ jobs:
           [ $RC_RELINK -ne 0 ] && NG="$NG 最新取引への付け替え"
           [ $RC_ICHIJI -ne 0 ] && NG="$NG 一次対応の転記"
           [ $RC_MEMO   -ne 0 ] && NG="$NG 暗黙知メモの転記"
+          [ $RC_APPT   -ne 0 ] && NG="$NG 応募メモの穴埋め"
           [ $RC_DRIFT  -ne 0 ] && NG="$NG 顧客シートURL乖離の検知"
           [ $RC_HEALTH -ne 0 ] && NG="$NG 健全性チェック"
           if [ -n "$NG" ]; then
