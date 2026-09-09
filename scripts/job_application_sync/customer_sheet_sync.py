@@ -271,6 +271,46 @@ def build_row(p: dict) -> dict:
     }
 
 
+def _search_ids(obj: str, prop: str, sheet_id: str) -> list:
+    """指定プロパティに sheet_id を含むレコードのID一覧 (全ページ)。"""
+    out, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": prop,
+             "operator": "CONTAINS_TOKEN", "value": sheet_id}]}],
+            "properties": ["hs_object_id"], "limit": 100}
+        if after:
+            b["after"] = after
+        r = _post_hs(f"{BASE}/crm/v3/objects/{obj}/search", b)
+        out += [o["id"] for o in r.get("results", [])]
+        after = r.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            return out
+        time.sleep(0.15)
+
+
+def _listing_ids_direct(sheet_id: str) -> set:
+    """求人票側の customer_sheet_url にこのシートを持つもの (移行前からの経路)。"""
+    return set(_search_ids("0-420", "customer_sheet_url", sheet_id))
+
+
+def _listing_ids_via_deal(sheet_id: str) -> set:
+    """取引側の customer_sheet_url からその配下の求人票を辿る (2026-09-09 新設)。
+
+    こちらが正。求人票にURLが入っていなくても、親の取引に入っていれば転記される。
+    """
+    dids = _search_ids("0-3", "customer_sheet_url", sheet_id)
+    lids = set()
+    for i in range(0, len(dids), 100):
+        r = _post_hs(f"{BASE}/crm/v4/associations/0-3/0-420/batch/read",
+                     {"inputs": [{"id": d} for d in dids[i:i + 100]]})
+        for res in r.get("results", []):
+            for t in (res.get("to") or []):
+                lids.add(str(t["toObjectId"]))
+        time.sleep(0.15)
+    return lids
+
+
 def fetch_applicants(sheet_id: str, cutoff_iso: str, limit: int = 0) -> list:
     """指定シートURLを持つ求人に紐づく応募を、cutoff以降で取得。
 
@@ -295,23 +335,16 @@ def fetch_applicants(sheet_id: str, cutoff_iso: str, limit: int = 0) -> list:
         raise ValueError(
             f"sheet_id が短すぎます({len(sheet_id)}文字)。"
             f"部分一致で別顧客の求人を拾う恐れがあるため停止します")
-    # 1) このシートを customer_sheet_url に持つ LISTING
-    lids, after = [], None
-    while True:
-        b = {"filterGroups": [{"filters": [
-            {"propertyName": "customer_sheet_url",
-             "operator": "CONTAINS_TOKEN", "value": sheet_id}]}],
-            "properties": ["hs_name"], "limit": 100}
-        if after:
-            b["after"] = after
-        r = _post_hs(f"{BASE}/crm/v3/objects/0-420/search", b)
-        lids += [o["id"] for o in r.get("results", [])]
-        after = r.get("paging", {}).get("next", {}).get("after")
-        if not after:
-            break
-        time.sleep(0.15)
+    # 1) このシートを持つ求人票を集める
+    #    ★2026-09-09: シートURLの正を取引へ移した。シートは求人票単位ではなく
+    #      契約単位で存在するため (実測: 99.4%が1契約=1シート)。求人票に置くと
+    #      求人票を足すたびに入れ忘れが起き、その求人票への応募だけ転記されない。
+    #    移行期は両方を見る: 取引から辿った求人票 ∪ 求人票側に直接入っているもの。
+    #    取引側だけに切り替えるのは、求人票側の値を消してからにする。
+    lids = _listing_ids_via_deal(sheet_id) | _listing_ids_direct(sheet_id)
     if not lids:
         return []
+    lids = sorted(lids)
     # 2) LISTING → 応募 (batch)
     aids = set()
     for i in range(0, len(lids), 100):
@@ -522,7 +555,7 @@ def run_all(dry_run: bool = True) -> dict:
     """
     allow = sorted(allowed_sheets())
     if not allow:
-        print("[customer_sheet_sync] 許可リスト空 → 転記スキップ", flush=True)
+        print("[customer_sheet_sync] 許可リスト空 -> 転記スキップ", flush=True)
         return {"sheets": 0, "ok": 0, "fail": 0, "wrote": 0, "errors": []}
     start = os.environ.get("CUSTOMER_SHEET_START", "").strip()
     lookback = (datetime.now(timezone.utc) - timedelta(hours=72)).strftime(
