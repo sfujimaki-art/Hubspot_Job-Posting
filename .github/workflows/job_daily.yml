@@ -234,6 +234,19 @@ jobs:
         env:
           SA_JSON_CONTENT: ${{ secrets.GOOGLE_SA_JSON }}
         run: printf '%s' "$SA_JSON_CONTENT" > /tmp/sa.json
+      # ★前回の健全性スナップショットを持ち越す (2026-09-10 本番へ反映)。
+      #   これが無いと runner のディスクごと捨てられ、health_check は毎晩
+      #   「同じ件数」を初めて見たかのように通知する。新規/継続/解消が出せず、
+      #   現場が直した分が効いているのかどうかも分からない
+      #   (実測 2026-09-05〜09: 5日とも前回比の行が1つも出ていなかった)。
+      #   restore-keys で常に直近のものを拾い、key に run_id を入れて毎回保存する。
+      - name: Restore 前回の健全性スナップショット
+        uses: actions/cache@v4
+        with:
+          path: data/job_application_sync/health_check_latest.json
+          key: health-snapshot-${{ github.run_id }}
+          restore-keys: |
+            health-snapshot-
       - name: Deal hygiene
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
@@ -242,6 +255,10 @@ jobs:
           SHEETS_AUTH_MODE: sa
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+          # ★Slackの「対象一覧」がアーティファクトのURLを名乗ってよいのは、
+          #   下の Upload ステップが実在するときだけ。health_check.py は
+          #   この env が在るときだけ実行ページURLを案内する。
+          HEALTH_ARTIFACT_NAME: 要対応リスト
           PYTHONIOENCODING: utf-8
         run: |
           # schedule実行は常に本番。手動dispatchは inputs.dry_run に従う。
@@ -319,3 +336,18 @@ jobs:
             echo "::error title=取引まわりの日次処理が失敗::失敗した処理:$NG"
             exit 1
           fi
+      # health_check が出す「要対応リスト」を成果物として残す。
+      # ★これが無いとSlackの「対象一覧」が runner の使い捨てパスを指すだけで
+      #   **誰も開けない**。通知を見た人がその場で対象を取れる状態にする。
+      #   if: always() — 上のステップが失敗しても、そこまでに出たリストは要る。
+      #   name は Deal hygiene の HEALTH_ARTIFACT_NAME と一致させること。
+      - name: Upload 要対応リスト
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 要対応リスト
+          path: |
+            data/job_application_sync/要対応_*.csv
+            data/job_application_sync/RPOアドレス*.csv
+          if-no-files-found: ignore
+          retention-days: 30

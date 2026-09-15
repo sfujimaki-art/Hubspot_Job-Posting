@@ -178,15 +178,21 @@ def main(argv=None):
         for name, sid in unused.items():
             w.writerow(["D列にあるがHubSpot未反映", name, sid, 0])
     print(f"\n一覧: {p.resolve()}")
-    if a.slack and (orphan or unused):
-        msg = [f"⚠️ 顧客シートURLの乖離を検知しました"]
-        if orphan:
-            msg.append(f"・HubSpotが使用中だが顧客管理シートD列に無い: "
-                       f"{len(orphan)}シート(求人{sum(orphan.values())}件)")
-            msg.append("  → D列が貼り替えられた可能性。誤ったシートへ転記され続けます")
-        if unused:
-            msg.append(f"・D列にあるがHubSpot未反映: {len(unused)}件")
-        msg.append(f"一覧: {p.name}")
+    # ★通知するのは orphan だけ (2026-09-10)。
+    #   「D列にあるがHubSpot未反映」は**異常ではない**。顧客管理シートに載って
+    #   いるがまだ求人票を出していない会社が常時1,200件あり、これを鳴らすと
+    #   毎晩ほぼ同じ内容で「⚠️ 乖離を検知」が飛び続けて通知が形骸化する
+    #   (実測 2026-09-05〜09: 5日連続 1,228→1,233件、中身は同じ)。
+    #   orphan (HubSpotが使っているのにD列に無い) は**誤ったシートへ転記され
+    #   続ける**ので鳴らす価値がある。unused はCSVに残すので追える。
+    if a.slack and orphan:
+        msg = ["⚠️ 顧客シートURLの乖離を検知しました",
+               f"・HubSpotが使用中だが顧客管理シートD列に無い: "
+               f"{len(orphan)}シート(求人{sum(orphan.values())}件)",
+               "  → D列が貼り替えられた可能性。誤ったシートへ転記され続けます",
+               f"(D列にあるがHubSpot未反映 {len(unused):,}件は通知しない。"
+               f"まだ求人票を出していない会社ぶんで、異常ではない)",
+               f"一覧: {p.name}"]
         slack_notify("\n".join(msg))
     return {"orphan": len(orphan), "unused": len(unused)}
 
