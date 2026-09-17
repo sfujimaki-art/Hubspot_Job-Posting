@@ -39,7 +39,7 @@ Q_ROUTE = 8
 # チェックボックス(TRUE/FALSE)を会社名として読み company_exact 突合が全滅
 # (解決206→100社/unresolved 188→332 に劣化)。シート1と同じ思想で
 # ヘッダ名+内容から動的解決する。→[[feedback_no_positional_hardcode_sheets]]
-_A_HDR = {                     # ヘッダ名で引く列 (正規化=空白/改行除去)
+_A_HDR = {                     # ヘッダ名で引く列 (正規化=空白/改行/注記除去)
     "closed": ("クローズ",),
     "reclog": ("リクロジアドレス",),
     "aid": ("AirWorkID",),
@@ -47,6 +47,13 @@ _A_HDR = {                     # ヘッダ名で引く列 (正規化=空白/改�
     "bpw": ("企業AirworkPW",),
     "alias": ("エイリアスアドレス",),
 }
+# 無くても動く列。突合は reclog / alias / 社名完全一致 / bid の順で効くので、
+# aid (旧式のAirWorkID) が引けなくても取込は成立する。
+# ★2026-09-17: 現場がヘッダを「AirWorkID（旧式の為入力しない！！）」に
+#   書き換えた瞬間、aid が引けず**応募取込が5分毎に落ち続けた**(19連続失敗・
+#   1時間25分停止)。補助キー1本の欠落で基幹処理を止めるのは釣り合わない。
+#   引けなかったことは黙って捨てず、警告として出す。
+_A_OPTIONAL = frozenset({"aid"})
 _A_COMP_PAT = re.compile(r"株式会社|有限会社|合同会社|協同組合")
 # 会社名列のヘッダ候補。「HS名」は HubSpot 側の名前で別物なので入れない。
 _A_COMP_HDR = ("企業名", "会社名", "企業名称", "顧客名")
@@ -59,7 +66,14 @@ def _resolve_account_columns(header: list, rows: list) -> dict:
     必須列が見つからなければ明示エラー(位置依存へ黙って落とさない)。
     """
     def _nh(h: str) -> str:
-        return re.sub(r"[\s　]", "", str(h or ""))
+        """空白と**括弧の注記**を落とす。
+
+        ★現場はヘッダに注意書きを足す。2026-09-17 の「AirWorkID」→
+          「AirWorkID（旧式の為入力しない！！）」で本番が止まった。
+          注記は運用の都合で増減するので、比較の前に落とす。
+        """
+        s = re.sub(r"[\s　]", "", str(h or ""))
+        return re.sub(r"[（(][^）)]*[）)]", "", s)
     hmap: dict = {}
     for i, h in enumerate(header):
         k = _nh(h)
@@ -67,7 +81,14 @@ def _resolve_account_columns(header: list, rows: list) -> dict:
             hmap[k] = i
     cols: dict = {}
     for name, names in _A_HDR.items():
-        cols[name] = next((hmap[_nh(n)] for n in names if _nh(n) in hmap), None)
+        want = [_nh(n) for n in names]
+        ci = next((hmap[w] for w in want if w in hmap), None)
+        if ci is None:
+            # 完全一致で引けなければ前方一致。「AirWorkID…」は拾い、
+            # 「企業AirWorkID」は拾わない (別列なので前方一致で区別できる)。
+            ci = next((i for w in want for k, i in hmap.items()
+                       if k.startswith(w)), None)
+        cols[name] = ci
     # 会社名列を決める。
     # ★以前は「ヘッダが空の列」しか候補にしていなかった。2026-08-24 に現場が
     #   C列へ「企業名」というヘッダを付けたところ、その瞬間に候補から外れて
@@ -92,9 +113,15 @@ def _resolve_account_columns(header: list, rows: list) -> dict:
                 best, best_hits = ci, hits
         cols["comp"] = best
     missing = [k for k, v in cols.items() if v is None]
-    if missing:
+    optional = [k for k in missing if k in _A_OPTIONAL]
+    required = [k for k in missing if k not in _A_OPTIONAL]
+    if optional:
+        # 止めない。ただし黙らない (どの列が引けていないか運用に見せる)
+        print(f"[warn] 顧客管理シートの任意列が引けません: {optional}"
+              f" — 突合は他のキーで続行します", flush=True)
+    if required:
         raise RuntimeError(
-            f"顧客管理シートの列を特定できず: {missing} "
+            f"顧客管理シートの列を特定できず: {required} "
             f"(header={[_nh(h) for h in header[:20]]})")
     return cols
 
@@ -110,7 +137,7 @@ def _norm_company(s: str) -> str:
     大半が「同じ会社なのに文字列が違うだけ」だった。吸収するのは以下:
 
       空白の有無      「株式会社SAKAI plus」   ↔「株式会社SAKAIplus」
-      全角/半角       「株式会社MINAMIKAWA 前橋工場」↔「株式会社ミナミカワ前橋工場」
+      全角/半角       「株式会社MINAMIKAWA 前橋工場」↔「株式会社ＭＩＮＡＭＩＫＡＷＡ前橋工場」
       アンダースコア  「大五ロジスティクス＿宮城」↔「大五ロジスティクス_宮城」
       運用メモ        「株式会社みなと工業※解約済」↔「株式会社みなと工業」
       長音の揺れ      「SBS三愛ロジスティックス」↔「SBS三愛ロジスティクス」
@@ -252,7 +279,9 @@ class AccountResolver:
         self.cols = _resolve_account_columns(av[0] if av else [], av[1:])
         c = self.cols
         for r in av[1:]:
-            g = lambda i: r[i] if len(r) > i else ""  # noqa: E731
+            # ★index が None (任意列が引けなかった) のときは空文字。
+            #   None を添字に渡すと TypeError になり、任意列にした意味が消える。
+            g = lambda i: (r[i] if i is not None and len(r) > i else "")  # noqa: E731
             for a in _split_multi(g(c["alias"])):
                 if "@" in a:
                     self.idx_alias[_norm(a)] = r
@@ -393,9 +422,13 @@ SHEET1_TAB = "シート1"
 # --- 列位置は「ハードコードしない」(運用者が列を挿入/削除してもズレる, 2026-07-22) ---
 # ヘッダ名で引ける列は名前で、ヘッダ空の列(件名/日付/マーカー)は内容で特定する。
 # 過去、G列(担当CS=人名)を会社名と取り違えてAW突合が全滅した反省(位置依存の罠)。
-_S1_HDR_MEDIA = ("媒体",)               # 媒体 (admin@hr-hacker.com / Airワーク…)
-_S1_HDR_FROM = ("顧客", "差出人")        # 差出人(loginId抽出元)
-_S1_HDR_COMPANY = ("応募管理シート",)    # 会社名(アカウント情報シートと突合する本丸)
+# ★ヘッダ名は現場が変える。実際に2回、名前が変わって全部止まった実績がある。
+#   名前は「当たれば速い手がかり」に留め、外れても**内容で引ける**ようにする。
+#   (2026-08-25 強化。2026-08-24 には顧客管理シートのC列に名前が付いた
+#    だけで応募取込が1時間止まった)
+_S1_HDR_MEDIA = ("媒体", "媒体名", "応募媒体")
+_S1_HDR_FROM = ("顧客", "差出人", "送信元", "From", "メール", "アドレス")
+_S1_HDR_COMPANY = ("応募管理シート", "会社名", "企業名", "顧客名", "取引先")
 # 既存GASマーカー + こちら側マーカー(処理済)。'キュー済'=GASの enqueue 済み印。
 S1_MARKS_DONE = ("キュー済", "済", "受入済")
 S1_MARK_ENQUEUED = "キュー済"   # マーカー列の一意特定に使う(チェック列の"済"と区別)
@@ -468,7 +501,82 @@ def _resolve_s1_columns(header: list, rows: list) -> dict:
                       if re.match(r"\d{4}/\d{1,2}/\d{1,2}", v))
             if hit and hit >= len(col_vals) // 2:
                 cols["date"] = ci
+    # ★ヘッダ名で引けなかった列を**内容**で拾う (2026-08-25)。
+    #   ヘッダ名が変わっても、列が挿入・削除されても、中身は変わらない。
+    #   実測(2026-08-25, 399行): 会社名列は社名率79%で突出、差出人列は
+    #   メール率100%。他の列と明確に分かれるので取り違えない。
+    _fill_s1_by_content(cols, rows)
     return cols
+
+
+_S1_COMP_PAT = re.compile(r"株式会社|有限会社|合同会社|協同組合|\(株\)|（株）")
+_S1_MAIL_PAT = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+")
+# 媒体からの自動送信を見分ける。応募者本人のアドレスには出ない語。
+_S1_AUTOSEND_PAT = re.compile(
+    r"no-?reply|noreply|do-?not-?reply|automail|system@|admin@"
+    r"|airwork|hr-hacker|rct\.airwork|joboplite", re.I)
+# 内容で決めるときの最低ライン。これを下回る列は候補にしない。
+_S1_COMP_MIN = 0.30
+_S1_MAIL_MIN = 0.70
+
+
+def _fill_s1_by_content(cols: dict, rows: list) -> None:
+    """ヘッダ名で引けなかった列を内容から埋める (cols を直接書き換える)。
+
+    ★なぜ必要か
+      ヘッダ名だけに頼ると、現場が名前を1文字変えただけで全部止まる。
+      実際に2回起きている。名前は手がかりに留め、外れたら内容で引く。
+
+    ★取り違えないための決め方
+      「該当率が最も高い列」を採る。閾値を下回る列は候補にしない。
+      同率なら左の列(=先に出てくる方)を採り、実行のたびに結果が
+      変わらないようにする。
+    """
+    taken = {v for v in cols.values() if v is not None}
+    ncol = max((len(r) for r in rows), default=0)
+
+    def best(pat, floor, uniq_min=None, uniq_max=None):
+        """該当率が最も高い列。uniq_* で「値の種類の多さ」も条件にできる."""
+        top, rate = None, 0.0
+        for ci in range(ncol):
+            if ci in taken:
+                continue
+            vals = [str(r[ci]).strip() for r in rows
+                    if len(r) > ci and str(r[ci]).strip()]
+            if not vals:
+                continue
+            uniq = len(set(vals)) / len(vals)
+            if uniq_min is not None and uniq < uniq_min:
+                continue
+            if uniq_max is not None and uniq > uniq_max:
+                continue
+            hit = sum(1 for v in vals if pat.search(v)) / len(vals)
+            if hit > rate:
+                top, rate = ci, hit
+        return top if rate >= floor else None
+
+    # ★媒体列を先に確定させる。媒体も差出人もメールを含むので、先に媒体を
+    #   除かないと差出人が媒体列に化ける (実測: ヘッダを消すと差出人が
+    #   B列=媒体列になった)。
+    #   値の種類の多さでは分けられない (実測: 媒体42.9% / 差出人39.1%)。
+    #   **媒体は自動送信アドレス**なので、そのドメイン・語で見分ける。
+    if cols.get("media") is None:
+        # 閾値は実測で決める(2026-08-25, 399行): 媒体列49.4% / 差出人列0.3%。
+        # 差が大きいので 0.20 で十分に分かれ、媒体の種類が増えても耐える。
+        ci = best(_S1_AUTOSEND_PAT, 0.20)
+        if ci is not None:
+            cols["media"] = ci
+            taken.add(ci)
+    if cols.get("from") is None:
+        ci = best(_S1_MAIL_PAT, _S1_MAIL_MIN)
+        if ci is not None:
+            cols["from"] = ci
+            taken.add(ci)
+    if cols.get("company") is None:
+        ci = best(_S1_COMP_PAT, _S1_COMP_MIN)
+        if ci is not None:
+            cols["company"] = ci
+            taken.add(ci)
 
 
 def _first_email(text: str) -> str:
