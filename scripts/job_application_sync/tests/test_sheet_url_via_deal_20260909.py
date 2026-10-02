@@ -105,6 +105,22 @@ def _fetch(monkeypatch, listings_by_prop, assoc, appts=None):
                                  "to": [{"toObjectId": a}
                                         for a in appts.get(x["id"], [])]}
                                 for x in body["inputs"]]}
+        if "associations/0-420/0-3" in url:
+            # 2026-10-02: 転記先の判定 (取引→求人の逆引き)
+            return {"results": [{"from": {"id": x["id"]},
+                                 "to": [{"toObjectId": d}
+                                        for d, ls in assoc.items()
+                                        if x["id"] in ls]}
+                                for x in body["inputs"]]}
+        if url.endswith("/0-3/batch/read"):
+            urls = set(listings_by_prop.get(("0-3", "customer_sheet_url"), []))
+            return {"results": [{"id": x["id"],
+                                 "properties": {
+                                     "dealstage": "52016156",
+                                     "customer_sheet_url":
+                                         f"https://docs.google.com/spreadsheets/d/{SHEET}"
+                                         if x["id"] in urls else ""}}
+                                for x in body["inputs"]]}
         if url.endswith("/0-421/batch/read"):
             return {"results": [{"id": x["id"],
                                  "properties": {"hs_object_id": x["id"],

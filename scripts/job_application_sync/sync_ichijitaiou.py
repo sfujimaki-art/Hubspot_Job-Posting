@@ -8,8 +8,14 @@ ichijitaiounoumu_deforuto(一次対応の有無_デフォルト 必要/不要) �
   LISTING(0-420) と Deal(0-3) は **直接の Association** で連携済み
   (実HR求人は Deal に関連あり)。本スクリプトはこの association を辿る。
 
-マッピング: 関連Dealの itijitaiou に true があれば 必要 / false のみなら 不要 /
-           設定なしなら 触らない(unset維持)。
+マッピング (2026-10-02 改): 求人に紐付く取引 **と同じ取引先コードの取引** の
+  うち、生きている取引の最新 (deal_master.latest_live) の itijitaiou に合わせる。
+  true → 必要 / false → 不要 / 空 → 触らない(unset維持)。
+
+  旧: 紐付く取引のどれか1件が true なら必要 (true優先)。
+      求人を同じ取引先コードの取引すべてに紐付ける方針 (2026-10-01 定例MTG)
+      にすると、旧契約が「必要」・新契約が「不要」でも必要のまま残る
+      (2026-10-01 実測: 33コードで発生)。今の契約の値だけを見る。
 
 CLI:
   python sync_ichijitaiou.py [--dry-run|--actual] [--limit N]
@@ -35,7 +41,8 @@ if _ENV.exists():
 
 from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
 from scripts.job_application_sync.hs_paging import (  # noqa: E402
-    list_all, post_retry)
+    list_all, post_retry, search_all_by_id)
+from scripts.job_application_sync import deal_master as DM  # noqa: E402
 
 
 # Windowsローカルの既定は cp932。ログ出力の1文字で処理全体が落ちるのは
@@ -87,47 +94,69 @@ def _batch_assoc(listing_ids: list[str]) -> dict:
     return m
 
 
-def _batch_deal_itijitaiou(deal_ids: list[str]) -> dict:
-    """Deal の itijitaiou を batch/read. {deal_id: 'true'/'false'/None}."""
+PIPELINE = "21596025"   # 納品管理
+DEAL_PROPS = ["itijitaiou", "dealstage", "contract_start_date", "createdate",
+              DM.PROP_CODE, "kanri_mail_address"]
+
+
+def _batch_deals(deal_ids: list[str]) -> dict:
+    """Deal を batch/read. {deal_id: properties}."""
     m: dict = {}
     ids = sorted(set(deal_ids))
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
         r = post_retry(f"{BASE}/crm/v3/objects/0-3/batch/read",
-                       {"properties": ["itijitaiou"],
+                       {"properties": DEAL_PROPS,
                         "inputs": [{"id": x} for x in chunk]})
         for o in r.get("results", []):
-            m[str(o["id"])] = (o.get("properties") or {}).get("itijitaiou")
+            m[str(o["id"])] = o.get("properties") or {}
         time.sleep(0.1)
     return m
 
 
-def _flag_to_want(flags: list) -> str | None:
-    """itijitaiou値の集合 → 必要/不要/None(触らない)。true優先。"""
-    if "true" in flags:
+def load_pipeline_deals() -> dict:
+    """納品管理PLの全取引 {deal_id: properties}。同コードの取引を引くのに使う。"""
+    ds = search_all_by_id("0-3", DEAL_PROPS, [
+        {"propertyName": "pipeline", "operator": "EQ", "value": PIPELINE}])
+    return {str(d["id"]): d.get("properties") or {} for d in ds}
+
+
+def expand_by_code(deal_ids, deals: dict, by_code: dict) -> list:
+    """紐付く取引 + それと同じ取引先コードの取引 (納品管理PL内)。"""
+    out = list(dict.fromkeys(deal_ids))
+    for d in list(out):
+        c = str((deals.get(d) or {}).get(DM.PROP_CODE) or "").strip()
+        for x in by_code.get(c, []) if c else []:
+            if x not in out:
+                out.append(x)
+    return out
+
+
+def decide_want(deal_ids, deals: dict) -> str | None:
+    """取引群 → 必要/不要/None(触らない)。生きている取引の最新の値だけを見る。"""
+    latest = DM.latest_live(deal_ids, deals)
+    v = (deals.get(latest) or {}).get("itijitaiou") if latest else None
+    if v == "true":
         return "必要"
-    if "false" in flags:
+    if v == "false":
         return "不要"
     return None
 
 
-def build_mail_to_itijitaiou() -> dict:
-    """管理用メールアドレス(小文字) → itijitaiou。
-    同一メールに複数Dealがあれば true(必要) を優先。"""
-    deals = _search_all(
-        "0-3", ["itijitaiou", "kanri_mail_address"],
-        [{"propertyName": "kanri_mail_address", "operator": "HAS_PROPERTY"}])
+def build_mail_to_deals(deals: dict) -> dict:
+    """管理用メールアドレス(小文字) → [deal_id]。複数アドレスは ; , で分割。
+
+    旧実装は同一メールに複数Dealがあれば true を優先していた。
+    今は取引IDを全部持ち、decide_want (latest_live) で今の契約を選ぶ。
+    """
     m: dict = {}
-    for d in deals:
-        p = d.get("properties") or {}
-        v = p.get("itijitaiou")
-        km = (p.get("kanri_mail_address") or "").strip().lower()
-        if not km or v not in ("true", "false"):
-            continue
-        if km not in m or v == "true":     # true優先
-            m[km] = v
-    print(f"[deal] 管理用メール索引={len(m)} (kanri_mail_address持ちDeal={len(deals)})",
-          flush=True)
+    for did, p in deals.items():
+        raw = (p.get("kanri_mail_address") or "")
+        for km in raw.replace(",", ";").split(";"):
+            km = km.strip().lower()
+            if km:
+                m.setdefault(km, []).append(did)
+    print(f"[deal] 管理用メール索引={len(m)}", flush=True)
     return m
 
 
@@ -153,31 +182,37 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
         limit=limit)
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
-    # 2) HR経路: LISTING→Deal 関連(HubSpotの関連付け) + Deal.itijitaiou
+    # 2) HR経路: LISTING→Deal 関連(HubSpotの関連付け)
     assoc = _batch_assoc(lids)
-    all_deals = [d for ds in assoc.values() for d in ds]
-    deal_flag = _batch_deal_itijitaiou(all_deals)
+    deals = load_pipeline_deals()
+    missing = sorted({d for ds in assoc.values() for d in ds} - set(deals))
+    deals.update(_batch_deals(missing))     # 納品管理PL外の取引も値は読む
+    by_code = DM.group_by_code(
+        {d: p for d, p in deals.items() if d not in set(missing)})
     print(f"[assoc] Deal関連ありLISTING={sum(1 for v in assoc.values() if v)} "
-          f"/ 参照Deal={len(set(all_deals))}", flush=True)
-    # 2b) AW経路: 管理用メールアドレス経由の索引 (login_id→メール→itijitaiou)
+          f"/ 納品管理PL取引={len(deals) - len(missing)} / PL外={len(missing)}",
+          flush=True)
+    # 2b) AW経路: 管理用メールアドレス経由の索引 (login_id→メール→取引)
     login2mail = build_login_to_mail()
-    mail2flag = build_mail_to_itijitaiou()
+    mail2deals = build_mail_to_deals(
+        {d: p for d, p in deals.items() if d not in set(missing)})
     # 3) 各LISTINGの想定値を決定
     updates = []
     hr_matched = aw_matched = unresolved = 0
     for o in listings:
         p = o.get("properties") or {}
-        deals = assoc.get(o["id"], [])
+        linked = assoc.get(o["id"], [])
         want = None
-        if deals:                              # HR経路: 関連付けをたどる
-            want = _flag_to_want([deal_flag.get(d) for d in deals])
+        if linked:                             # HR経路: 関連付けをたどる
+            want = decide_want(expand_by_code(linked, deals, by_code), deals)
             if want:
                 hr_matched += 1
         else:                                  # AW経路: 管理用メールで取引を探す
             login = (p.get("airwork_account_login_id") or "").strip()
             km = login2mail.get(login, "")
-            flag = mail2flag.get(km) if km else None
-            want = _flag_to_want([flag]) if flag else None
+            cands = mail2deals.get(km, []) if km else []
+            want = (decide_want(expand_by_code(cands, deals, by_code), deals)
+                    if cands else None)
             if want:
                 aw_matched += 1
         if not want:

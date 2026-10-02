@@ -466,14 +466,23 @@ def check_ichijitaiou_sync() -> dict:
     if not deal_ids:
         return {"name": "一次対応の要否が取引と一致しているか", "value": 0,
                 "want": 0, "detail": ["取引に紐付く求人なし"]}
-    flags = _batch_props("0-3", deal_ids, ["itijitaiou"])
+    # ★sync_ichijitaiou と同じ規則で判定する (2026-10-02)。
+    #   求人は同じ取引先コードの取引すべてに紐付く方針になったので、
+    #   「どれか1件が true なら必要」で見ると、旧契約の値が残る求人を
+    #   食い違いとして数えてしまう (誤警報)。生きている取引の最新だけを見る。
+    from scripts.job_application_sync import sync_ichijitaiou as SI
+    from scripts.job_application_sync import deal_master as DM
+    deals = SI.load_pipeline_deals()
+    in_pl = set(deals)
+    missing = sorted(set(deal_ids) - in_pl)
+    deals.update(_batch_props("0-3", missing, SI.DEAL_PROPS))
+    by_code = DM.group_by_code({d: deals[d] for d in in_pl})
     mismatch = 0
     for o in rows:
         ds = assoc.get(o["id"]) or []
         if not ds:
             continue
-        vals = [flags.get(d, {}).get("itijitaiou") for d in ds]
-        want = "必要" if "true" in vals else ("不要" if "false" in vals else None)
+        want = SI.decide_want(SI.expand_by_code(ds, deals, by_code), deals)
         if want and (o.get("properties") or {}).get(
                 "ichijitaiounoumu_deforuto") != want:
             mismatch += 1

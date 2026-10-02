@@ -79,6 +79,70 @@ ASSOC_TYPE_ID_LISTING_TO_APPT = 6  # USER_DEFINED 「応募」
 # HR個別求人URL テンプレ (求人IDを付けるだけ, hrhacker_import と同一)
 HR_JOB_URL_TMPL = "https://hr-hacker.com/f-a-c-rikurozi/job-offers/show/{}"
 
+try:
+    from . import deal_master as DM
+except ImportError:  # pragma: no cover — CIはスクリプト直実行
+    import deal_master as DM  # type: ignore
+
+DELIVERY_PIPELINE = "21596025"   # 納品管理PL
+# 取引から読む項目: 今の契約の属性 + 並べ替えの根拠 + 一次対応8項目(暗黙知)
+DEAL_READ_PROPS = (["dealname", "contract_plan", "service1", "itijitaiou",
+                    "dealstage", "pipeline", "contract_start_date", "createdate",
+                    DM.PROP_CODE] + list(DM.ANMOKUCHI_PROPS))
+
+
+def deal_current_props(deal_ids: list, deals: dict) -> dict:
+    """求人に紐付く取引群 → 応募へ写す「今の契約」の属性 (純関数)。
+
+    ★2026-10-02: 取引名の枝番(deal_series)で選ぶのをやめ、deal_master.latest_live
+      (生きている取引を優先 → 契約開始日 → 作成日) に置き換えた。枝番で選ぶと
+      生きているかを見ないため、25コードで終わった取引の取引名・要否を応募へ
+      写していた (2026-10-01 実測)。
+    """
+    did = DM.latest_live(deal_ids, deals)
+    if not did:
+        return {}
+    dp = deals[did]
+    out: dict = {}
+    for src, dst in [("dealname", "oubosaki_torihiki_name"),
+                     ("contract_plan", "oubosaki_contract_plan"),
+                     ("service1", "oubosaki_riyou_service")]:
+        if dp.get(src):
+            out[dst] = dp[src]
+    # 1次対応: Dealのitijitaiou(true/false)から直接 必要/不要 を決める。
+    # LISTING.ichijitaiounoumu_deforuto(sync_ichijitaiouが後で埋める値)に
+    # 依存せず、応募紐付け時点で確定できる=順序非依存(逆証明Dの根治)。
+    it = dp.get("itijitaiou")
+    if it == "true":
+        out["ichijitaiounoumu"] = "必要"
+    elif it == "false":
+        out["ichijitaiounoumu"] = "不要"
+    return out
+
+
+def anmokuchi_transfer_props(deal_ids: list, deals: dict,
+                             now_ms: Optional[int] = None) -> dict:
+    """取引群 → 応募へ写す一次対応8項目 + 転記済みの印 (純関数)。
+
+    2026-10-01 定例MTG決定:
+      - マスター = 契約期間が最も新しく、かつ中身が入っている取引
+      - 一度応募に連携したら、親の値が後で変わっても上書きしない
+        → 印 (anmokuchi_tenki_nichiji) を必ず一緒に書き、印のある応募は
+          以後どの処理も触らない (backfill_appointment_anmokuchi が守る)
+    マスターが無い (どの取引も空/テンプレートのまま) なら {} = 印も付けない。
+    印を付けないので、後で取引に中身が入った晩に1回だけ転記される。
+    """
+    mid = DM.anmokuchi_master(deal_ids, deals)
+    if not mid:
+        return {}
+    vals = DM.anmokuchi_values(deals[mid])
+    if not vals:
+        return {}
+    vals[DM.APPT_TRANSFERRED_AT] = str(
+        now_ms if now_ms is not None else int(time.time() * 1000))
+    vals[DM.APPT_TRANSFERRED_FROM] = str(mid)
+    return vals
+
 # AW login_id → 管理用メールアドレス の遅延キャッシュ (Deal解決用)
 _AW_LOGIN_MAIL_CACHE: dict = {}
 
@@ -566,56 +630,62 @@ class RealHubSpotClient:
         except Exception:  # noqa: BLE001
             return {}
 
-    def _pick_latest_deal(self, deal_ids: list) -> Optional[str]:
-        """複数の取引から最新を選ぶ (契約更新で取引が増える運用への対応)。
+    def _read_deals(self, deal_ids: list) -> dict:
+        """取引をまとめて読む {id: props}。失敗は {} (best-effort)。"""
+        out: dict = {}
+        ids = list(dict.fromkeys(str(x) for x in deal_ids if x))
+        for i in range(0, len(ids), 100):
+            try:
+                r = self._requests.post(
+                    f"{self.BASE}/crm/v3/objects/0-3/batch/read",
+                    headers=self.headers,
+                    json={"inputs": [{"id": x} for x in ids[i:i + 100]],
+                          "properties": DEAL_READ_PROPS}, timeout=20)
+                r.raise_for_status()
+                for o in r.json().get("results", []):
+                    out[str(o["id"])] = o.get("properties") or {}
+            except Exception:  # noqa: BLE001
+                pass
+        return out
 
-        取得失敗時は先頭(=最古)にフォールバックする。応募の取込を止めるより
-        従来動作で継続する方が実害が小さいため (取込停止=応募が入らない)。
-        """
-        try:
-            from . import deal_series as _ds
-        except ImportError:  # pragma: no cover — CIはスクリプト直実行
-            import deal_series as _ds  # type: ignore
+    def _deals_by_code(self, code: str) -> dict:
+        """同じ取引先コードの納品管理PL取引 {id: props}。失敗は {}。"""
         try:
             r = self._requests.post(
-                f"{self.BASE}/crm/v3/objects/0-3/batch/read",
-                headers=self.headers,
-                json={"inputs": [{"id": x} for x in deal_ids],
-                      "properties": ["dealname", "createdate",
-                                     "contract_start_date"]}, timeout=20)
+                f"{self.BASE}/crm/v3/objects/0-3/search",
+                headers=self.headers, json={"filterGroups": [{"filters": [
+                    {"propertyName": DM.PROP_CODE, "operator": "EQ", "value": code},
+                    {"propertyName": "pipeline", "operator": "EQ",
+                     "value": DELIVERY_PIPELINE}]}],
+                    "properties": DEAL_READ_PROPS, "limit": 100}, timeout=20)
             r.raise_for_status()
-            props = {o["id"]: (o.get("properties") or {})
-                     for o in r.json().get("results", [])}
-            return _ds.latest_from_associations(deal_ids, props)
+            return {str(o["id"]): o.get("properties") or {}
+                    for o in r.json().get("results", [])}
         except Exception:  # noqa: BLE001
-            return deal_ids[0] if deal_ids else None
+            return {}
 
-    def _resolve_deal_props(self, listing_id: str, media: str,
-                            login_id: str) -> dict:
-        """紐付く求人(LISTING)の取引(Deal)を解決して取引プロパティを返す。
+    def _resolve_deal_group(self, listing_id: str, media: str,
+                            login_id: str) -> tuple:
+        """求人に紐付く取引群を解決する → (取引ID一覧, {id: props})。
 
-        HR: LISTING→Deal の関連付け(association)を辿る。
-        AW: 関連付けが無いので airwork_account_login_id → 管理用メールアドレス
+        HR/AW共通: LISTING→Deal の関連付けを辿る。
+        AW で関連付けが無いとき: airwork_account_login_id → 管理用メールアドレス
             → Deal.kanri_mail_address で突合 (sync_ichijitaiou と同経路)。
-        取得失敗は {} (best-effort)。
+        ★2026-10-02: 見つかった取引と**同じ取引先コード**の納品管理PL取引も
+          群に加える (2026-10-01 MTG「関連取引すべて」)。求人が終わった取引に
+          しか付いていなくても、生きている後継の取引から今の属性を取れる。
+        取得失敗は ([], {}) (best-effort)。
         """
-        deal_id = None
+        ids: list = []
         try:
             a = self._requests.get(
                 f"{self.BASE}/crm/v4/objects/0-420/{listing_id}/associations/0-3",
                 headers=self.headers, timeout=20).json().get("results", [])
-            if a:
-                ids = [str(x.get("toObjectId")) for x in a if x.get("toObjectId")]
-                # ★最新の取引を選ぶ (2026-08-06 是正):
-                # association配列は作成順(最古が先頭)で返るため、素朴に [0] を
-                # 採ると常に終了した古い契約を見てしまう。実測で検証40件中40件が
-                # 旧取引の情報を応募者へ転記しており、一次対応の要否判定が
-                # 古い契約条件のまま誤り続けていた。
-                deal_id = self._pick_latest_deal(ids) if len(ids) > 1 else (
-                    ids[0] if ids else None)
+            ids = [str(x.get("toObjectId")) for x in a if x.get("toObjectId")]
         except Exception:  # noqa: BLE001
             pass
-        if not deal_id and "Air" in media and login_id:
+        deals = self._read_deals(ids) if ids else {}
+        if not ids and "Air" in media and login_id:
             km = _aw_login_to_mail(login_id)
             if km:
                 try:
@@ -624,24 +694,23 @@ class RealHubSpotClient:
                         headers=self.headers, json={"filterGroups": [{"filters": [
                             {"propertyName": "kanri_mail_address",
                              "operator": "EQ", "value": km}]}],
-                            "properties": ["dealname", "contract_plan",
-                                           "service1", "itijitaiou"],
-                            "limit": 1}, timeout=20).json()
-                    res = r.get("results", [])
-                    if res:
-                        return res[0].get("properties") or {}
+                            "properties": DEAL_READ_PROPS, "limit": 10},
+                        timeout=20).json()
+                    for o in r.get("results", []):
+                        deals[str(o["id"])] = o.get("properties") or {}
                 except Exception:  # noqa: BLE001
                     pass
-        if not deal_id:
-            return {}
-        try:
-            d = self._requests.get(
-                f"{self.BASE}/crm/v3/objects/0-3/{deal_id}"
-                f"?properties=dealname,contract_plan,service1,itijitaiou",
-                headers=self.headers, timeout=20).json()
-            return d.get("properties") or {}
-        except Exception:  # noqa: BLE001
-            return {}
+        codes = {str(p.get(DM.PROP_CODE) or "").strip() for p in deals.values()}
+        for c in sorted(codes - {""}):
+            deals.update(self._deals_by_code(c))
+        return list(deals), deals
+
+    def _resolve_deal_props(self, listing_id: str, media: str,
+                            login_id: str) -> dict:
+        """取引群のうち「今の契約」(deal_master.latest_live) の取引プロパティ。"""
+        ids, deals = self._resolve_deal_group(listing_id, media, login_id)
+        did = DM.latest_live(ids, deals)
+        return deals.get(did, {}) if did else {}
 
     def get_oubosaki_props(self, listing_id: str, media: str,
                            login_id: str, media_job_id: str) -> dict:
@@ -676,21 +745,10 @@ class RealHubSpotClient:
         elif lp.get("url_airwork"):
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
         # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
-        dp = self._resolve_deal_props(listing_id, media, login_id)
-        for src, dst in [("dealname", "oubosaki_torihiki_name"),
-                         ("contract_plan", "oubosaki_contract_plan"),
-                         ("service1", "oubosaki_riyou_service")]:
-            v = dp.get(src)
-            if v:
-                props[dst] = v
-        # 1次対応: Dealのitijitaiou(true/false)から直接 必要/不要 を決める。
-        # LISTING.ichijitaiounoumu_deforuto(sync_ichijitaiouが後で埋める値)に
-        # 依存せず、応募紐付け時点で確定できる=順序非依存(逆証明Dの根治)。
-        it = dp.get("itijitaiou")
-        if it == "true":
-            props["ichijitaiounoumu"] = "必要"
-        elif it == "false":
-            props["ichijitaiounoumu"] = "不要"
+        # + 一次対応8項目(暗黙知)。取引群は1回だけ解決して両方に使う。
+        ids, deals = self._resolve_deal_group(listing_id, media, login_id)
+        props.update(deal_current_props(ids, deals))
+        props.update(anmokuchi_transfer_props(ids, deals))
         return props
 
     def copy_listing_note(self, listing_id: str,

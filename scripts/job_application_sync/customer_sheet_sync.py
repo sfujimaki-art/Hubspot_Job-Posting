@@ -39,7 +39,11 @@ from dotenv import load_dotenv
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
+
+from scripts.job_application_sync import deal_master as DM  # noqa: E402
 
 BASE = "https://api.hubapi.com"
 TAB_NAME = "応募一覧(自動)"
@@ -311,6 +315,60 @@ def _listing_ids_via_deal(sheet_id: str) -> set:
     return lids
 
 
+_OWNER_PROPS = ["customer_sheet_url", "dealstage", "contract_start_date",
+                "createdate"]
+
+
+def owner_sheet_url(deal_ids, deals: dict) -> str:
+    """求人の転記先シートURL = 紐付く取引のうちシートURLを持つものの latest_live。
+
+    ★2026-10-02: 求人を同じ取引先コードの取引すべてに紐付ける方針
+      (2026-10-01 定例MTG) にすると、旧契約と新契約でシートURLが違う求人が
+      両方のシートから辿られ、**二重に転記**される (同日実測: 4コード)。
+      転記先は今の契約のシート1つに決める。
+    """
+    with_url = [d for d in deal_ids if (deals.get(d) or {}).get("customer_sheet_url")]
+    best = DM.latest_live(with_url, deals)
+    return (deals.get(best) or {}).get("customer_sheet_url") or "" if best else ""
+
+
+def filter_listings_for_sheet(sheet_id: str, lids, l2d: dict, deals: dict) -> set:
+    """このシートへ転記してよい求人だけに絞る。
+
+    取引から決まる転記先が**別のシート**なら外す。取引側にURLが無い求人は
+    移行期の経路 (求人票側の customer_sheet_url) で来たものとして残す。
+    """
+    out = set()
+    for lid in lids:
+        url = owner_sheet_url(l2d.get(lid) or [], deals)
+        if url and sheet_id not in url:
+            continue
+        out.add(lid)
+    return out
+
+
+def _owners_of(lids: list) -> tuple:
+    """求人 → 紐付く取引 と、その取引のプロパティ。"""
+    l2d: dict = {}
+    for i in range(0, len(lids), 100):
+        r = _post_hs(f"{BASE}/crm/v4/associations/0-420/0-3/batch/read",
+                     {"inputs": [{"id": x} for x in lids[i:i + 100]]})
+        for res in r.get("results", []):
+            l2d[str(res["from"]["id"])] = [str(t["toObjectId"])
+                                           for t in (res.get("to") or [])]
+        time.sleep(0.15)
+    dids = sorted({d for v in l2d.values() for d in v})
+    deals: dict = {}
+    for i in range(0, len(dids), 100):
+        r = _post_hs(f"{BASE}/crm/v3/objects/0-3/batch/read",
+                     {"inputs": [{"id": x} for x in dids[i:i + 100]],
+                      "properties": _OWNER_PROPS})
+        for o in r.get("results", []):
+            deals[str(o["id"])] = o.get("properties") or {}
+        time.sleep(0.15)
+    return l2d, deals
+
+
 def fetch_applicants(sheet_id: str, cutoff_iso: str, limit: int = 0) -> list:
     """指定シートURLを持つ求人に紐づく応募を、cutoff以降で取得。
 
@@ -345,6 +403,11 @@ def fetch_applicants(sheet_id: str, cutoff_iso: str, limit: int = 0) -> list:
     if not lids:
         return []
     lids = sorted(lids)
+    # 1b) 今の契約のシートが別なら外す (旧シートとの二重転記を防ぐ)
+    l2d, owner_deals = _owners_of(lids)
+    lids = sorted(filter_listings_for_sheet(sheet_id, lids, l2d, owner_deals))
+    if not lids:
+        return []
     # 2) LISTING → 応募 (batch)
     aids = set()
     for i in range(0, len(lids), 100):

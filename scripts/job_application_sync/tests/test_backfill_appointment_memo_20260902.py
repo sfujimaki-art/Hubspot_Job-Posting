@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from scripts.job_application_sync import backfill_appointment_memo as B
 from scripts.job_application_sync.notes import (
     COPIED_NOTE_MARKER as COPIED, TEMPLATE_SIGNATURE as TEMPLATE,
@@ -132,6 +134,12 @@ def test_検索はFLOORで絞っている(monkeypatch):
         return [{"id": "A1"}]
 
     monkeypatch.setattr(B, "search_all_by_id", fake_search)
+    # ★今日の日付に依存させない (2026-10-02 修正)。窓は「FLOOR と直近30日の
+    #   新しい方」なので、FLOORから30日を過ぎると下限は移動窓になり、
+    #   実行日によって落ちていた。FLOORが効く日付 (9/10) に固定して検証する。
+    _orig = B.window_start
+    monkeypatch.setattr(B, "window_start", lambda now=None: _orig(
+        datetime(2026, 9, 10, tzinfo=timezone.utc)))
     assert B.recent_appointments() == ["A1"]
     assert seen["obj_type"] == B.APPOINTMENT
     assert {"propertyName": "hs_createdate", "operator": "GTE",
