@@ -185,7 +185,7 @@ def resolve_targets(cands: list, deals: dict, by_code: dict) -> tuple:
         return [], ST_MULTI
     if len(codes) == 1:
         group = by_code.get(next(iter(codes)), [])
-        live = sorted(d for d in group if DM.is_live(deals.get(d, {})))
+        live = DM.link_targets(group, deals)   # 生きている主契約 (無ければオプション)
         if live:
             return live, ST_CODE_LIVE
         return [DM.latest_live(cands + group, deals)], ST_CODE_NOLIVE
@@ -254,7 +254,7 @@ def plan_new_links(listings: list, has: dict, shop2deals: dict,
 
 
 def plan_owner(listings: list, l2deals: dict, deals: dict, by_code: dict,
-               active_owners: set) -> list:
+               active_owners: set, shop_index: dict = None) -> list:
     """求人の担当者を、紐付く取引群の latest_live の担当者に**毎晩そろえる**。
 
     2026-10-02 是正: 旧実装は求人の担当者が空のときだけ埋めていたため、
@@ -272,8 +272,12 @@ def plan_owner(listings: list, l2deals: dict, deals: dict, by_code: dict,
     """
     lowner = {str(o["id"]): ((o.get("properties") or {}).get("hubspot_owner_id") or "")
               for o in listings}
+    lshop = {str(o["id"]): ((o.get("properties") or {}).get("id_shop_hrhakkaa") or "")
+             for o in listings}
     out = []
     for lid, dids in l2deals.items():
+        if shop_index and DM.is_shared_shop(lshop.get(lid), shop_index):
+            continue            # 店舗IDを別会社と共有 = どの会社の担当か決まらない
         src = owner_source(dids, deals, by_code)
         if not src or not DM.is_live(deals.get(src)):
             continue
@@ -432,7 +436,8 @@ def run(dry_run: bool = True, limit=None,
     if not active:
         # 空なら全件「無効」扱いになり何も書かないだけだが、APIの異常なので明示する
         raise SystemExit("有効なユーザー一覧が空です (owners API の異常)")
-    to_set = plan_owner(listings, l2deals, deals, by_code, active)
+    to_set = plan_owner(listings, l2deals, deals, by_code, active,
+                        DM.shop_code_index(deals))
     owner_set = 0
     if not dry_run:
         for i in range(0, len(to_set), 100):

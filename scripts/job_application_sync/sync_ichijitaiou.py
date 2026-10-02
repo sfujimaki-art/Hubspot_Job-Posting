@@ -95,7 +95,8 @@ def _batch_assoc(listing_ids: list[str]) -> dict:
 
 
 PIPELINE = "21596025"   # 納品管理
-DEAL_PROPS = ["itijitaiou", "dealstage", "contract_start_date", "createdate",
+DEAL_PROPS = ["itijitaiou", "dealstage", "dealname", "contract_start_date", "createdate",
+              "hrhacker_shop_ids",
               DM.PROP_CODE, "kanri_mail_address"]
 
 
@@ -178,7 +179,8 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
     # 区別できず静かに完走扱いになる。実測では対象34,666件のうち10,000件
     # (28.8%)しか処理していなかった (2026-08-06 発見)。上限の無い list API へ。
     listings = list_all(
-        "0-420", ["ichijitaiounoumu_deforuto", "airwork_account_login_id"],
+        "0-420", ["ichijitaiounoumu_deforuto", "airwork_account_login_id",
+                  "id_shop_hrhakkaa"],
         limit=limit)
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
@@ -197,10 +199,15 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
     mail2deals = build_mail_to_deals(
         {d: p for d, p in deals.items() if d not in set(missing)})
     # 3) 各LISTINGの想定値を決定
+    shop_index = DM.shop_code_index(
+        {d: p for d, p in deals.items() if d not in set(missing)})
     updates = []
-    hr_matched = aw_matched = unresolved = 0
+    hr_matched = aw_matched = unresolved = shared = 0
     for o in listings:
         p = o.get("properties") or {}
+        if DM.is_shared_shop(p.get("id_shop_hrhakkaa"), shop_index):
+            shared += 1          # 店舗IDを別会社と共有 = どの会社の要否か決まらない
+            continue
         linked = assoc.get(o["id"], [])
         want = None
         if linked:                             # HR経路: 関連付けをたどる
@@ -232,6 +239,7 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
             time.sleep(0.15)
     summary = {"listings": len(lids), "hr_matched": hr_matched,
                "aw_matched": aw_matched, "unresolved": unresolved,
+               "shared_shop_skipped": shared,
                "to_update": len(updates), "applied": applied}
     print(f"[sync_ichijitaiou] {summary}", flush=True)
     return summary

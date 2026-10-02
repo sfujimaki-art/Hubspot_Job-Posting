@@ -148,13 +148,13 @@ class _Resp:
 class _FakeRequests:
     """listing→deal 関連・deal batch/read・コード検索だけを返す偽物。"""
 
-    def __init__(self, assoc, deals):
-        self.assoc, self.deals = assoc, deals
+    def __init__(self, assoc, deals, shop=""):
+        self.assoc, self.deals, self.shop = assoc, deals, shop
 
     def get(self, url, **kw):
         if "/associations/0-3" in url:
             return _Resp({"results": [{"toObjectId": d} for d in self.assoc]})
-        return _Resp({"properties": {}})
+        return _Resp({"properties": {"id_shop_hrhakkaa": self.shop}})
 
     def post(self, url, json=None, **kw):
         if url.endswith("/0-3/batch/read"):
@@ -162,7 +162,12 @@ class _FakeRequests:
             return _Resp({"results": [{"id": i, "properties": self.deals[i]}
                                       for i in ids if i in self.deals]})
         if url.endswith("/0-3/search"):
-            code = json["filterGroups"][0]["filters"][0]["value"]
+            f0 = json["filterGroups"][0]["filters"][0]
+            if f0["propertyName"] == "hrhacker_shop_ids":
+                return _Resp({"results": [
+                    {"id": i, "properties": p} for i, p in self.deals.items()
+                    if f0["value"] in str(p.get("hrhacker_shop_ids") or "").split(";")]})
+            code = f0["value"]
             return _Resp({"results": [{"id": i, "properties": p} for i, p in self.deals.items()
                                       if p.get("code_of_customer") == code]})
         return _Resp({})
@@ -183,3 +188,53 @@ def test_作成時経路_終わった取引にしか付いていない求人で�
     # 新しい取引は空なので、中身のある旧取引がマスター
     assert p["anmokuchi_keikenumukakunin"] == "旧条件"
     assert p[DM.APPT_TRANSFERRED_FROM] == "old"
+
+
+# ---- 2026-10-02 逆証明の是正 ------------------------------------------------
+
+def test_夜間_要否が未設定unsetなら空とみなして補完する():
+    deals = {"a": deal(LIVE, "2026-07-01", itijitaiou="true")}
+    appt = {DM.APPT_TRANSFERRED_AT: "1", "ichijitaiounoumu": "unset", "yingmuri": TODAY}
+    assert B.plan_for_appt(appt, ["a"], deals, NOW, today=TODAY) == {"ichijitaiounoumu": "必要"}
+
+
+def test_夜間_応募日が空の応募には要否を入れない():
+    # 古い応募か判断できない。BPOのキューに過去分を流さない
+    deals = {"a": deal(LIVE, "2026-07-01", itijitaiou="true")}
+    appt = {DM.APPT_TRANSFERRED_AT: "1", "ichijitaiounoumu": "", "yingmuri": ""}
+    assert B.plan_for_appt(appt, ["a"], deals, NOW, today=TODAY) == {}
+
+
+def test_夜間_今の契約はオプションより主契約():
+    deals = {"m": deal(LIVE, "2026-04-01", itijitaiou="false", dealname="サブスク継続②＿A社"),
+             "o": deal("1049738304", "2026-08-01", itijitaiou="true", dealname="求人追加＿A社")}
+    appt = {DM.APPT_TRANSFERRED_AT: "1", "ichijitaiounoumu": "", "yingmuri": TODAY}
+    assert B.plan_for_appt(appt, ["m", "o"], deals, NOW, today=TODAY) == {"ichijitaiounoumu": "不要"}
+
+
+def test_作成時経路_店舗IDを別会社と共有する求人には取引由来の値を入れない():
+    deals = {"a": deal(LIVE, "2026-04-01", dealname="A社", itijitaiou="true",
+                       code_of_customer="RL1", hrhacker_shop_ids="S9",
+                       keikenumukakunin="A社の条件"),
+             "b": deal(LIVE, "2026-04-01", dealname="B社", itijitaiou="false",
+                       code_of_customer="RL2", hrhacker_shop_ids="S9")}
+    cli = AI.RealHubSpotClient.__new__(AI.RealHubSpotClient)
+    cli.BASE = "https://api.hubapi.com"
+    cli.headers = {}
+    cli._requests = _FakeRequests(["a"], deals, shop="S9")
+    p = cli.get_oubosaki_props("L1", "HRハッカー", "", "")
+    for k in ("oubosaki_torihiki_name", "ichijitaiounoumu",
+              "anmokuchi_keikenumukakunin", DM.APPT_TRANSFERRED_AT):
+        assert k not in p
+
+
+def test_作成時経路_店舗IDが自社の取引だけなら通常どおり入れる():
+    deals = {"a": deal(LIVE, "2026-04-01", dealname="A社", itijitaiou="true",
+                       code_of_customer="RL1", hrhacker_shop_ids="S1",
+                       keikenumukakunin="A社の条件")}
+    cli = AI.RealHubSpotClient.__new__(AI.RealHubSpotClient)
+    cli.BASE = "https://api.hubapi.com"
+    cli.headers = {}
+    cli._requests = _FakeRequests(["a"], deals, shop="S1")
+    p = cli.get_oubosaki_props("L1", "HRハッカー", "", "")
+    assert p["oubosaki_torihiki_name"] == "A社" and p["anmokuchi_keikenumukakunin"] == "A社の条件"

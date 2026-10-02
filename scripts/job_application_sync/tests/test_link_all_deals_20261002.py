@@ -66,14 +66,22 @@ def test_索引は同じ店舗IDを持つ取引を全部返す():
     assert mail["a@x.jp"] == ["300"] and mail["b@x.jp"] == ["300"]
 
 
-def test_候補のコードが1つなら生きている取引すべてへ_店舗ID無しの新取引も含む():
+def test_候補のコードが1つなら生きている主契約すべてへ_店舗ID無しの新取引も含む():
     deals = {"old": d(ENDED, "RL1", "2025-01-01", shops="S1"),
              "new1": d(LIVE, "RL1", "2026-04-01"),          # 店舗IDを引き継いでいない
              "opt": d(LIVE2, "RL1", "2026-05-01"),
              "other": d(LIVE, "RL9")}
     by_code = DM.group_by_code(deals)
     targets, how = SDA.resolve_targets(["old"], deals, by_code)
-    assert targets == ["new1", "opt"] and how == SDA.ST_CODE_LIVE
+    # オプション契約には足さない (2026-10-02 逆証明: オプションが「今の契約」に見える)
+    assert targets == ["new1"] and how == SDA.ST_CODE_LIVE
+
+
+def test_生きている主契約が無ければ生きているオプションへ():
+    deals = {"old": d(ENDED, "RL1", "2025-01-01", shops="S1"),
+             "opt": d(LIVE2, "RL1", "2026-05-01")}
+    targets, how = SDA.resolve_targets(["old"], deals, DM.group_by_code(deals))
+    assert targets == ["opt"] and how == SDA.ST_CODE_LIVE
 
 
 def test_生きている取引が無ければ最新1件だけ():
@@ -207,12 +215,32 @@ def test_dry_runでは書き込みAPIを呼ばない(tmp_path):
 
 # ============ relink_to_latest_deal ==========================================
 
-def test_relink_古い取引の求人を生きている取引すべてへ足す():
-    deals = {"old": d(ENDED, "RL1"), "new": d(LIVE, "RL1"), "opt": d(LIVE2, "RL1")}
+def test_relink_古い取引の求人を生きている主契約すべてへ足す():
+    deals = {"old": d(ENDED, "RL1"), "new": d(LIVE, "RL1"), "new2": d(LIVE, "RL1"),
+             "opt": d(LIVE2, "RL1")}
     d2l = {"old": ["L1", "L2"], "new": ["L2"]}
     pairs, manual, stat = RL.plan_all_live(deals, d2l, {}, {})
-    assert sorted(pairs) == [("L1", "new"), ("L1", "opt"), ("L2", "opt")]
+    # オプション契約には足さない
+    assert sorted(pairs) == [("L1", "new"), ("L1", "new2"), ("L2", "new2")]
     assert manual == []
+
+
+def test_relink_店舗IDを別会社と共有する求人は広げず人の確認へ():
+    deals = {"a_old": d(ENDED, "RL1", shops="S9"), "a_new": d(LIVE, "RL1"),
+             "b": d(LIVE, "RL2", shops="S9")}
+    d2l = {"a_old": ["L1", "L2"]}
+    pairs, manual, stat = RL.plan_all_live(deals, d2l, {}, {}, {"L1": "S9", "L2": "S1"})
+    # L1 は店舗 S9 を別会社(RL2)も持つので広げない。L2 は通常どおり
+    assert pairs == [("L2", "a_new")]
+    assert [r for r in manual if "共有" in str(r)]
+
+
+def test_担当者は店舗IDを別会社と共有する求人を触らない():
+    deals = {"n": d(LIVE, "RL1", owner="U1", shops="S9"), "x": d(LIVE, "RL2", shops="S9")}
+    listings = [_listing("L1", shop="S9", owner="U0")]
+    to_set = SDA.plan_owner(listings, {"L1": ["n"]}, deals, DM.group_by_code(deals),
+                            {"U0", "U1"}, DM.shop_code_index(deals))
+    assert to_set == []
 
 
 def test_relink_最新に求人が1件でもあっても足す():

@@ -88,7 +88,7 @@ DELIVERY_PIPELINE = "21596025"   # 納品管理PL
 # 取引から読む項目: 今の契約の属性 + 並べ替えの根拠 + 一次対応8項目(暗黙知)
 DEAL_READ_PROPS = (["dealname", "contract_plan", "service1", "itijitaiou",
                     "dealstage", "pipeline", "contract_start_date", "createdate",
-                    DM.PROP_CODE] + list(DM.ANMOKUCHI_PROPS))
+                    DM.PROP_CODE, "hrhacker_shop_ids"] + list(DM.ANMOKUCHI_PROPS))
 
 
 def deal_current_props(deal_ids: list, deals: dict) -> dict:
@@ -664,6 +664,27 @@ class RealHubSpotClient:
         except Exception:  # noqa: BLE001
             return {}
 
+    def _shop_is_shared(self, shop_id: str) -> bool:
+        """店舗IDを別々の取引先コードの取引が持っているか。失敗時は True (安全側)。"""
+        if not str(shop_id or "").strip():
+            return False
+        try:
+            r = self._requests.post(
+                f"{self.BASE}/crm/v3/objects/0-3/search",
+                headers=self.headers, json={"filterGroups": [{"filters": [
+                    {"propertyName": "hrhacker_shop_ids", "operator": "CONTAINS_TOKEN",
+                     "value": str(shop_id).strip()},
+                    {"propertyName": "pipeline", "operator": "EQ",
+                     "value": DELIVERY_PIPELINE}]}],
+                    "properties": [DM.PROP_CODE, "hrhacker_shop_ids"], "limit": 100},
+                timeout=20)
+            r.raise_for_status()
+            deals = {str(o["id"]): o.get("properties") or {}
+                     for o in r.json().get("results", [])}
+        except Exception:  # noqa: BLE001
+            return True
+        return DM.is_shared_shop(shop_id, DM.shop_code_index(deals))
+
     def _resolve_deal_group(self, listing_id: str, media: str,
                             login_id: str) -> tuple:
         """求人に紐付く取引群を解決する → (取引ID一覧, {id: props})。
@@ -724,7 +745,7 @@ class RealHubSpotClient:
             lp = self._requests.get(
                 f"{self.BASE}/crm/v3/objects/0-420/{listing_id}?properties="
                 "hs_name,shigotonaiyou,zhizhong,qinwude,kinmujikan,"
-                "kinmukeitai,kyuuyokeitai,url_airwork",
+                "kinmukeitai,kyuuyokeitai,url_airwork,id_shop_hrhakkaa",
                 headers=self.headers, timeout=20).json().get("properties") or {}
         except Exception:  # noqa: BLE001
             lp = {}
@@ -746,6 +767,10 @@ class RealHubSpotClient:
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
         # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
         # + 一次対応8項目(暗黙知)。取引群は1回だけ解決して両方に使う。
+        # ★店舗IDを別会社と共有している求人は、どの会社の契約か決まらない。
+        #   別会社の取引名・要否・一次対応の条件を入れるより、空で人に回す。
+        if self._shop_is_shared(lp.get("id_shop_hrhakkaa")):
+            return props
         ids, deals = self._resolve_deal_group(listing_id, media, login_id)
         props.update(deal_current_props(ids, deals))
         props.update(anmokuchi_transfer_props(ids, deals))

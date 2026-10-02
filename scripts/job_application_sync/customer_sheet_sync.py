@@ -315,7 +315,7 @@ def _listing_ids_via_deal(sheet_id: str) -> set:
     return lids
 
 
-_OWNER_PROPS = ["customer_sheet_url", "dealstage", "contract_start_date",
+_OWNER_PROPS = ["customer_sheet_url", "dealstage", "dealname", "contract_start_date",
                 "createdate"]
 
 

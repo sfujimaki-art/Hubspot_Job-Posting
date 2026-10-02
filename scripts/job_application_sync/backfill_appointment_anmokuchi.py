@@ -95,7 +95,11 @@ def plan_for_appt(appt: dict, group_ids: list, deals: dict,
     out: dict = {}
     if not str(appt.get(DM.APPT_TRANSFERRED_AT) or "").strip():
         out.update(AI.anmokuchi_transfer_props(group_ids, deals, now_ms=now_ms))
-    if not str(appt.get("ichijitaiounoumu") or "").strip():
+    # 「未設定」(値 unset) も空とみなす (2026-10-02 逆証明: 値域は 必要/不要/unset)。
+    # 応募日が空の応募には入れない: 古い応募か判断できず、BPOのキューに過去分が
+    # 流れ込むおそれがある (実測: 応募日が空のAW応募 21件)。
+    cur = str(appt.get("ichijitaiounoumu") or "").strip()
+    if (not cur or cur == "unset") and str(appt.get("yingmuri") or "").strip():
         v = AI.deal_current_props(group_ids, deals).get("ichijitaiounoumu")
         if v:
             tmp = {"ichijitaiounoumu": v}
@@ -137,7 +141,7 @@ def collect(since: str) -> tuple:
     stat = Counter(window=len(apps))
     need = {a: p for a, p in apps.items()
             if not str(p.get(DM.APPT_TRANSFERRED_AT) or "").strip()
-            or not str(p.get("ichijitaiounoumu") or "").strip()}
+            or str(p.get("ichijitaiounoumu") or "").strip() in ("", "unset")}
     stat["already_done"] = len(apps) - len(need)
     if not need:
         return need, {}, {}, stat
@@ -148,17 +152,25 @@ def collect(since: str) -> tuple:
     deals = _batch_read(DEAL, direct, AI.DEAL_READ_PROPS) if direct else {}
     # 同じ取引先コードの納品管理PL取引も群に加える (MTG「関連取引すべて」)
     codes = {str(p.get(DM.PROP_CODE) or "").strip() for p in deals.values()} - {""}
-    if codes:
-        for r in search_all_by_id(
-                DEAL, AI.DEAL_READ_PROPS,
-                [{"propertyName": "pipeline", "operator": "EQ",
-                  "value": AI.DELIVERY_PIPELINE}]):
-            p = r.get("properties") or {}
-            if str(p.get(DM.PROP_CODE) or "").strip() in codes:
-                deals[str(r["id"])] = p
+    pipeline = {str(r["id"]): r.get("properties") or {} for r in search_all_by_id(
+        DEAL, AI.DEAL_READ_PROPS,
+        [{"propertyName": "pipeline", "operator": "EQ",
+          "value": AI.DELIVERY_PIPELINE}])}
+    for did, p in pipeline.items():
+        if str(p.get(DM.PROP_CODE) or "").strip() in codes:
+            deals[did] = p
+    # 店舗IDを別会社と共有している求人 (=どの会社の契約か決まらない)
+    shop_index = DM.shop_code_index(pipeline)
+    lshop = {l: (p.get("id_shop_hrhakkaa") or "")
+             for l, p in _batch_read(LISTING, lids, ["id_shop_hrhakkaa"]).items()} if lids else {}
+    shared_l = {l for l, s in lshop.items() if DM.is_shared_shop(s, shop_index)}
     by_code = DM.group_by_code(deals)
     groups: dict = {}
     for a in need:
+        if any(l in shared_l for l in a2l.get(a, [])):
+            stat["shared_shop"] += 1     # 別会社の条件を入れない。人の確認へ
+            groups[a] = []
+            continue
         ids = [d for l in a2l.get(a, []) for d in l2d.get(l, [])]
         if not a2l.get(a):
             stat["no_listing"] += 1
@@ -194,7 +206,8 @@ def main(argv=None) -> int:
         if pl:
             plans[appt_id] = pl
     print(f"対象期間の応募 {stat['window']:,}件 (印・要否とも済み {stat['already_done']:,}件)"
-          f" / 求人未紐付け {stat['no_listing']} / 求人に取引なし {stat['no_deal']}", flush=True)
+          f" / 求人未紐付け {stat['no_listing']} / 求人に取引なし {stat['no_deal']}"
+          f" / 店舗ID共有で見送り {stat['shared_shop']}", flush=True)
     print(f"  8項目を転記 {stat['transfer']} / マスター無し(取引が空・翌晩再訪) "
           f"{stat['no_master']} / 要否を補完 {stat['youhi_fill']} / 書き込む応募 {len(plans)}",
           flush=True)

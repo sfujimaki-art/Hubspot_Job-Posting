@@ -74,6 +74,7 @@ BASE = "https://api.hubapi.com"
 NG_NOCODE = "× 取引先コードが無い"
 NG_SPLIT = "× 取引先コードが割れている"
 NG_CROSS = "× 別々の取引先コードの取引に紐付いている求人"
+NG_SHARED = "× 店舗IDを別会社と共有している求人"
 
 TODO_TEXT = {
     NG_NOCODE: "計上の取引を作成し、この納品管理の取引と関連付けてください。"
@@ -82,6 +83,8 @@ TODO_TEXT = {
               "どれが正しい契約か決めて、納品管理の取引先コードに入れてください",
     NG_CROSS: "この求人が本当はどの契約のものか確認し、違う方の取引との紐付けを"
               "外してください (店舗IDの共有などで別会社に付いた可能性があります)",
+    NG_SHARED: "この取引に付いた求人の店舗IDを、別の会社の取引も持っています。"
+               "どちらの会社の店舗か確認し、違う方の取引から店舗IDを外してください",
 }
 
 MANUAL_COLS = ["区分", "やること", "取引ID", "取引名", "ステージ",
@@ -186,14 +189,45 @@ def collect() -> dict:
     """
     deals = _search_pipeline(DS.PIPELINE_NOUHIN,
                              ["dealname", "dealstage", "createdate",
-                              "contract_start_date", DS.PROP_CODE])
+                              "contract_start_date", DS.PROP_CODE,
+                              "hrhacker_shop_ids"])
     did = sorted(deals)
     d2l = _batch_assoc("0-3", "0-420", did)
     d2d = _batch_assoc("0-3", "0-3", did)
     keijo: dict = {}
     for pid in sorted(DS.PIPELINES_KEIJO):
         keijo.update(_search_pipeline(pid, [DS.PROP_CODE]))
-    return {"deals": deals, "d2l": d2l, "d2d": d2d, "keijo": keijo}
+    lids = sorted({l for v in d2l.values() for l in v})
+    l_shop = _listing_shops(lids)
+    return {"deals": deals, "d2l": d2l, "d2d": d2d, "keijo": keijo,
+            "l_shop": l_shop}
+
+
+def _listing_shops(lids: list) -> dict:
+    """{求人ID: HRハッカー店舗ID}。100件ずつ batch/read。"""
+    out = {}
+    for i in range(0, len(lids), 100):
+        r = _req("POST", f"{BASE}/crm/v3/objects/0-420/batch/read",
+                 json={"inputs": [{"id": x} for x in lids[i:i + 100]],
+                       "properties": ["id_shop_hrhakkaa"]})
+        for o in r.get("results", []):
+            v = ((o.get("properties") or {}).get("id_shop_hrhakkaa") or "").strip()
+            if v:
+                out[str(o["id"])] = v
+        time.sleep(0.2)
+    return out
+
+
+def shared_shop_listings(deals: dict, l_shop: dict) -> set:
+    """店舗IDを別々の取引先コードの取引が持っている求人 (=どの会社のものか決まらない)。
+
+    2026-10-02 逆証明: 別会社と店舗IDを共有している求人 (実測: 店舗ID 94件) は、
+    たまたま先に付いた会社の取引にぶら下がっている。そのまま広げると、別会社の
+    生きた取引すべてへ紐付き、担当者・要否・一次対応の条件まで別会社のものが
+    入る。コードは1つに見えるので、他の検知にも掛からない。人の確認へ回す。
+    """
+    idx = DM.shop_code_index(deals)
+    return {lid for lid, sid in l_shop.items() if DM.is_shared_shop(sid, idx)}
 
 
 def code_candidates(deal_id: str, d2d: dict, keijo: dict) -> list:
@@ -218,7 +252,8 @@ def _manual_row(kind: str, deal_id: str, props: dict, codes: list,
     }
 
 
-def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict) -> tuple:
+def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict,
+                  l_shop: dict = None) -> tuple:
     """取引先コードごとに「生きている取引すべて」へ紐付ける計画 (純関数)。
 
     Returns:
@@ -254,6 +289,16 @@ def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict) -> tuple:
         for lid in d2l.get(did, []):
             l_codes[lid].add(code)
     cross = {lid for lid, cs in l_codes.items() if len(cs) > 1}
+    shared = shared_shop_listings(deals, l_shop or {}) - cross
+    if shared:
+        stat["★店舗IDが別会社と共有されている求人(人の確認)"] = len(shared)
+        seen_s = set()
+        for did, code in sorted(code_of.items()):
+            n = sum(1 for lid in d2l.get(did, []) if lid in shared)
+            if n and did not in seen_s:
+                seen_s.add(did)
+                manual.append(_manual_row(NG_SHARED, did, deals[did], [code], n))
+    cross = cross | shared
     if cross:
         stat["★別々の取引先コードに紐付いている求人(人の確認)"] = len(cross)
         seen = set()
@@ -272,7 +317,7 @@ def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict) -> tuple:
     pairs = []
     for code in sorted(groups):
         members = groups[code]
-        live = sorted(d for d in members if DM.is_live(deals[d]))
+        live = DM.link_targets(members, deals)   # 生きている主契約 (無ければオプション)
         if not live:
             stat["生きている取引が無いコード(対象外)"] += 1
             continue
@@ -329,7 +374,8 @@ def main(argv=None):
     c = collect()
     deals, d2l = c["deals"], c["d2l"]
     print(f"取引 {len(deals):,}件 / 計上 {len(c['keijo']):,}件\n", flush=True)
-    pairs, manual, stat = plan_all_live(deals, d2l, c["d2d"], c["keijo"])
+    pairs, manual, stat = plan_all_live(deals, d2l, c["d2d"], c["keijo"],
+                                        c.get("l_shop"))
     print("=== 判定結果 (系列=取引先コード / 生きている取引すべてへ) ===")
     for k, n in stat.most_common():
         if not k.startswith("(参考)"):

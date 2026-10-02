@@ -142,3 +142,41 @@ def test_取引先コードで束ねる_コード無しは含めない():
     deals = {"a": {"code_of_customer": "RL1"}, "b": {"code_of_customer": "RL1"},
              "c": {"code_of_customer": ""}, "d": {}}
     assert M.group_by_code(deals) == {"RL1": ["a", "b"]}
+
+
+# ---- 2026-10-02 逆証明の是正 ------------------------------------------------
+
+OPTION = "1049738304"   # オプション（求人追加・一次対応）
+
+
+def test_今の契約は生きている主契約を生きているオプションより優先する():
+    deals = {"main": deal(LIVE, "2026-04-01", dealname="サブスク継続②＿A社"),
+             "opt": deal(OPTION, "2026-08-01", dealname="求人追加＿A社"),
+             "aw": deal(LIVE, "2026-09-01", dealname="AirWork広告運用＿A社")}
+    assert M.latest_live(["main", "opt", "aw"], deals) == "main"
+
+
+def test_生きている主契約が無ければオプションを今の契約にする():
+    deals = {"old": deal(ENDED, "2026-01-01"),
+             "opt": deal(OPTION, "2026-08-01", dealname="求人追加＿A社")}
+    assert M.latest_live(["old", "opt"], deals) == "opt"
+
+
+def test_紐付け先は生きている主契約すべて_無ければ生きているオプション():
+    deals = {"m1": deal(LIVE, "2026-01-01"), "m2": deal(LIVE, "2026-04-01"),
+             "opt": deal(OPTION, "2026-08-01"), "e": deal(ENDED)}
+    assert M.link_targets(["m1", "m2", "opt", "e"], deals) == ["m1", "m2"]
+    assert M.link_targets(["opt", "e"], deals) == ["opt"]
+    assert M.link_targets(["e"], deals) == []
+
+
+def test_店舗IDを別々の取引先コードが持てば共有と判定する():
+    deals = {"a": {"code_of_customer": "RL1", "hrhacker_shop_ids": "S1;S2"},
+             "b": {"code_of_customer": "RL2", "hrhacker_shop_ids": "S2"},
+             "c": {"code_of_customer": "RL1", "hrhacker_shop_ids": "S1"},
+             "d": {"code_of_customer": "", "hrhacker_shop_ids": "S3"}}
+    idx = M.shop_code_index(deals)
+    assert M.is_shared_shop("S2", idx)
+    assert not M.is_shared_shop("S1", idx)      # 同じ会社の取引同士は共有ではない
+    assert not M.is_shared_shop("S3", idx)      # コード無しは判定に使わない
+    assert not M.is_shared_shop("", idx)

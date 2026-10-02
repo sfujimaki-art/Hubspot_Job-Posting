@@ -95,8 +95,34 @@ def _period_key(props: dict) -> tuple:
     return ((p.get("contract_start_date") or "")[:10], p.get("createdate") or "")
 
 
+# オプション契約。主契約と並行する別サービスで、担当者・要否が主契約と違う。
+# 2026-10-02 逆証明: 最新の生きた取引がオプションになるコードが46あり、
+# うち11で要否、11で担当者が主契約と食い違っていた。主契約を優先する。
+OPTION_STAGES = frozenset({"1049738304"})   # オプション（求人追加・一次対応）
+_OPTION_NAME = re.compile(r"^\s*(求人追加|AirWork広告運用|一次対応|エントリーフォーム)")
+
+
+def is_option(props: dict) -> bool:
+    import unicodedata
+    p = props or {}
+    name = unicodedata.normalize("NFKC", str(p.get("dealname") or ""))
+    return str(p.get("dealstage") or "") in OPTION_STAGES or bool(_OPTION_NAME.match(name))
+
+
+def link_targets(deal_ids: Iterable[str], deals: dict) -> list:
+    """求人を付ける取引: 生きている主契約すべて。主契約が無ければ生きているオプション。
+
+    オプション取引には、そのオプションで出した求人が既に付いている。主契約の
+    求人までオプションへ足すと、オプションが「今の契約」に見えてしまう。
+    """
+    ids = [d for d in dict.fromkeys(deal_ids) if d in deals and is_live(deals[d])]
+    main = [d for d in ids if not is_option(deals[d])]
+    return sorted(main or ids)
+
+
 def latest_live(deal_ids: Iterable[str], deals: dict) -> Optional[str]:
-    """生きている取引のうち最新。生きている取引が無ければ全体の最新。
+    """今の契約の取引。優先順: 生きている主契約 → 生きているオプション → 全体。
+    その中で契約開始日 → 作成日 が最新のもの。
 
     担当者・一次対応の要否・応募先取引名など「今の契約」の属性を取る用。
     """
@@ -104,7 +130,8 @@ def latest_live(deal_ids: Iterable[str], deals: dict) -> Optional[str]:
     if not ids:
         return None
     live = [d for d in ids if is_live(deals[d])]
-    pool = live or ids
+    main = [d for d in live if not is_option(deals[d])]
+    pool = main or live or ids
     return max(pool, key=lambda d: _period_key(deals[d]))
 
 
@@ -144,6 +171,29 @@ def anmokuchi_values(props: dict) -> dict:
     p = props or {}
     return {appt: p.get(deal) for deal, appt in ANMOKUCHI_PROPS.items()
             if value_has_content(deal, p.get(deal))}
+
+
+def shop_code_index(deals: dict) -> dict:
+    """{HRハッカー店舗ID: {取引先コード}}。"""
+    out: dict = {}
+    for p in deals.values():
+        code = str((p or {}).get(PROP_CODE) or "").strip()
+        if not code:
+            continue
+        for sid in str((p or {}).get("hrhacker_shop_ids") or "").replace(",", ";").split(";"):
+            if sid.strip():
+                out.setdefault(sid.strip(), set()).add(code)
+    return out
+
+
+def is_shared_shop(shop_id, index: dict) -> bool:
+    """その店舗IDを、別々の取引先コードの取引が持っているか (=会社が決まらない)。
+
+    2026-10-02 逆証明: 店舗IDを別会社と共有している (実測94件)。共有店舗の求人は
+    たまたま先に付いた会社の取引にぶら下がっており、そのまま値を写すと
+    別会社の担当者・要否・一次対応の条件が入る。触らずに人の確認へ回す。
+    """
+    return len(index.get(str(shop_id or "").strip(), ())) > 1
 
 
 def group_by_code(deals: dict) -> dict:
