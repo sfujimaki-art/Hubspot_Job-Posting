@@ -238,3 +238,17 @@ def test_作成時経路_店舗IDが自社の取引だけなら通常どおり�
     cli._requests = _FakeRequests(["a"], deals, shop="S1")
     p = cli.get_oubosaki_props("L1", "HRハッカー", "", "")
     assert p["oubosaki_torihiki_name"] == "A社" and p["anmokuchi_keikenumukakunin"] == "A社の条件"
+
+
+def test_作成時経路_別会社の取引に同時に紐付いた求人には取引由来の値を入れない():
+    deals = {"a": deal(LIVE, "2026-04-01", dealname="A社", itijitaiou="true",
+                       code_of_customer="RL1", keikenumukakunin="A社の条件"),
+             "b": deal(LIVE, "2026-05-01", dealname="B社", itijitaiou="false",
+                       code_of_customer="RL2")}
+    cli = AI.RealHubSpotClient.__new__(AI.RealHubSpotClient)
+    cli.BASE = "https://api.hubapi.com"
+    cli.headers = {}
+    cli._requests = _FakeRequests(["a", "b"], deals)
+    p = cli.get_oubosaki_props("L1", "HRハッカー", "", "")
+    for k in ("oubosaki_torihiki_name", "ichijitaiounoumu", "anmokuchi_keikenumukakunin"):
+        assert k not in p

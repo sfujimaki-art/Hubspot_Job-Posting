@@ -772,6 +772,9 @@ class RealHubSpotClient:
         if self._shop_is_shared(lp.get("id_shop_hrhakkaa")):
             return props
         ids, deals = self._resolve_deal_group(listing_id, media, login_id)
+        if DM.spans_codes(ids, deals):
+            # 別会社の取引に同時に紐付いている / 管理用メールを別会社と共有
+            return props
         props.update(deal_current_props(ids, deals))
         props.update(anmokuchi_transfer_props(ids, deals))
         return props

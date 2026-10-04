@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -200,6 +201,8 @@ def owner_source(deal_ids: list, deals: dict, by_code: dict):
     if not ids:
         return None
     codes = {str(deals[d].get(DS.PROP_CODE) or "").strip() for d in ids} - {""}
+    if len(codes) > 1:
+        return None         # 別会社の取引に同時に紐付いている = 担当が決まらない
     pool = list(ids)
     if len(codes) == 1:
         pool += by_code.get(next(iter(codes)), [])
@@ -420,6 +423,12 @@ def run(dry_run: bool = True, limit=None,
         for lid, did, _p in pairs:
             created.setdefault(lid, []).append(did)
     else:
+        # 戻せるように、作る紐付けを先に保存する (付け替えと同じ作法)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        bk = out_dir / f"sync_assoc_backup_{datetime.now():%Y%m%dT%H%M%S}.json"
+        bk.write_text(json.dumps([(lid, did) for lid, did, _p in pairs],
+                                 ensure_ascii=False), encoding="utf-8")
+        print(f"[backup] 作る紐付けを保存: {bk}", flush=True)
         ok, fail = associate_batch([(lid, did) for lid, did, _p in pairs])
         for lid, did in sorted(ok):
             created.setdefault(lid, []).append(did)

@@ -106,3 +106,29 @@ def test_健全性チェックも同じ規則で食い違いを数える(monkeyp
     r = HC.check_ichijitaiou_sync()
     # 旧規則 (true優先) なら L1 が食い違い。新規則では L2 だけが食い違い
     assert r["value"] == 1
+
+
+def test_run_別会社の取引に同時に紐付いた求人は触らない(monkeypatch):
+    deals = {"a": dict(d(LIVE, "2026-04-01", "true"), code_of_customer="RL1"),
+             "b": dict(d(LIVE, "2026-04-01", "false"), code_of_customer="RL2")}
+    monkeypatch.setattr(S, "list_all", lambda *a, **k: [
+        {"id": "L1", "properties": {"ichijitaiounoumu_deforuto": ""}}])
+    monkeypatch.setattr(S, "_batch_assoc", lambda ids: {"L1": ["a", "b"]})
+    monkeypatch.setattr(S, "load_pipeline_deals", lambda: dict(deals))
+    monkeypatch.setattr(S, "_batch_deals", lambda ids: {})
+    monkeypatch.setattr(S, "build_login_to_mail", lambda: {})
+    r = S.run(dry_run=True)
+    assert r["to_update"] == 0 and r["other_company_skipped"] == 1
+
+
+def test_run_管理用メールを別会社と共有する求人は触らない(monkeypatch):
+    deals = {"a": dict(d(LIVE, "2026-04-01", "true", mail="m@x.jp"), code_of_customer="RL1"),
+             "b": dict(d(LIVE, "2026-04-01", "false", mail="m@x.jp"), code_of_customer="RL2")}
+    monkeypatch.setattr(S, "list_all", lambda *a, **k: [
+        {"id": "L1", "properties": {"airwork_account_login_id": "acc1"}}])
+    monkeypatch.setattr(S, "_batch_assoc", lambda ids: {})
+    monkeypatch.setattr(S, "load_pipeline_deals", lambda: dict(deals))
+    monkeypatch.setattr(S, "_batch_deals", lambda ids: {})
+    monkeypatch.setattr(S, "build_login_to_mail", lambda: {"acc1": "m@x.jp"})
+    r = S.run(dry_run=True)
+    assert r["to_update"] == 0 and r["other_company_skipped"] == 1

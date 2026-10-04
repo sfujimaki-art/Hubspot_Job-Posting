@@ -196,6 +196,18 @@ def is_shared_shop(shop_id, index: dict) -> bool:
     return len(index.get(str(shop_id or "").strip(), ())) > 1
 
 
+def spans_codes(deal_ids: Iterable[str], deals: dict) -> bool:
+    """取引群が別々の取引先コードにまたがるか (=どの会社の契約か決まらない)。
+
+    2026-10-02 逆証明(第2回): 求人が別会社の取引に同時に紐付いている (実測122件)、
+    または管理用メールを別会社の取引が共有している (実測35件) と、両社の取引から
+    「今の契約」が選ばれ、別会社の担当者・要否・一次対応の条件が入りうる。
+    """
+    codes = {str((deals.get(d) or {}).get(PROP_CODE) or "").strip()
+             for d in deal_ids} - {""}
+    return len(codes) > 1
+
+
 def group_by_code(deals: dict) -> dict:
     """{取引先コード: [取引ID]}。コードの無い取引は含めない。"""
     out: dict = {}

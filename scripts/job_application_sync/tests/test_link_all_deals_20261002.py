@@ -285,3 +285,10 @@ def test_relink_dry_runでは書き込まない(tmp_path):
         rc = RL.main(["--report-dir", str(tmp_path)])
     ap.assert_not_called()
     assert rc == 0
+
+
+def test_担当者は別会社の取引に同時に紐付いた求人を触らない():
+    deals = {"a": d(LIVE, "RL1", owner="U1"), "b": d(LIVE, "RL2", owner="U2")}
+    to_set = SDA.plan_owner([_listing("L1", owner="U0")], {"L1": ["a", "b"]},
+                            deals, DM.group_by_code(deals), {"U0", "U1", "U2"})
+    assert to_set == []

@@ -172,6 +172,10 @@ def collect(since: str) -> tuple:
             groups[a] = []
             continue
         ids = [d for l in a2l.get(a, []) for d in l2d.get(l, [])]
+        if DM.spans_codes(ids, deals):
+            stat["shared_shop"] += 1     # 別会社の取引に同時に紐付いている
+            groups[a] = []
+            continue
         if not a2l.get(a):
             stat["no_listing"] += 1
         elif not ids:
@@ -207,7 +211,7 @@ def main(argv=None) -> int:
             plans[appt_id] = pl
     print(f"対象期間の応募 {stat['window']:,}件 (印・要否とも済み {stat['already_done']:,}件)"
           f" / 求人未紐付け {stat['no_listing']} / 求人に取引なし {stat['no_deal']}"
-          f" / 店舗ID共有で見送り {stat['shared_shop']}", flush=True)
+          f" / 別会社とまたがるため見送り {stat['shared_shop']}", flush=True)
     print(f"  8項目を転記 {stat['transfer']} / マスター無し(取引が空・翌晩再訪) "
           f"{stat['no_master']} / 要否を補完 {stat['youhi_fill']} / 書き込む応募 {len(plans)}",
           flush=True)

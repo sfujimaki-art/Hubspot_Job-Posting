@@ -180,3 +180,11 @@ def test_店舗IDを別々の取引先コードが持てば共有と判定する
     assert not M.is_shared_shop("S1", idx)      # 同じ会社の取引同士は共有ではない
     assert not M.is_shared_shop("S3", idx)      # コード無しは判定に使わない
     assert not M.is_shared_shop("", idx)
+
+
+def test_取引群が別々の取引先コードにまたがるか():
+    deals = {"a": {"code_of_customer": "RL1"}, "b": {"code_of_customer": "RL1"},
+             "c": {"code_of_customer": "RL2"}, "n": {"code_of_customer": ""}}
+    assert not M.spans_codes(["a", "b", "n"], deals)
+    assert M.spans_codes(["a", "c"], deals)
+    assert not M.spans_codes([], deals)

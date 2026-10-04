@@ -210,6 +210,9 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
             continue
         linked = assoc.get(o["id"], [])
         want = None
+        if linked and DM.spans_codes(linked, deals):
+            shared += 1          # 別会社の取引に同時に紐付いている = 要否が決まらない
+            continue
         if linked:                             # HR経路: 関連付けをたどる
             want = decide_want(expand_by_code(linked, deals, by_code), deals)
             if want:
@@ -218,6 +221,9 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
             login = (p.get("airwork_account_login_id") or "").strip()
             km = login2mail.get(login, "")
             cands = mail2deals.get(km, []) if km else []
+            if cands and DM.spans_codes(cands, deals):
+                shared += 1      # 管理用メールを別会社と共有 = 要否が決まらない
+                continue
             want = (decide_want(expand_by_code(cands, deals, by_code), deals)
                     if cands else None)
             if want:
@@ -239,7 +245,7 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
             time.sleep(0.15)
     summary = {"listings": len(lids), "hr_matched": hr_matched,
                "aw_matched": aw_matched, "unresolved": unresolved,
-               "shared_shop_skipped": shared,
+               "other_company_skipped": shared,
                "to_update": len(updates), "applied": applied}
     print(f"[sync_ichijitaiou] {summary}", flush=True)
     return summary
