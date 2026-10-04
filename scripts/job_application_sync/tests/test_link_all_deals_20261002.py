@@ -165,33 +165,55 @@ def test_担当者は無効化ユーザーへは書き換えない():
     assert to_set == []
 
 
-def test_一括紐付けは失敗した求人を数え成功扱いにしない():
+def _ok_resp(body):
+    """実物の成功応答 (2026-10-04 確認): results に双方向の組が並ぶ。"""
+    res = []
+    for x in body["inputs"]:
+        res.append({"from": {"id": x["from"]["id"]}, "to": {"id": x["to"]["id"]}})
+        res.append({"from": {"id": x["to"]["id"]}, "to": {"id": x["from"]["id"]}})
+    return {"status": "COMPLETE", "results": res}
+
+
+def test_一括紐付けは応答に返った組だけを成功にする():
     calls = []
 
     def fake_post(url, body):
-        calls.append((url, body))
-        return {"errors": [{"context": {"fromObjectId": ["L2"]}}], "numErrors": 1}
+        calls.append(url)
+        r = _ok_resp(body)
+        r["results"] = [x for x in r["results"] if x["from"]["id"] != "L2"]  # L2 は返らない
+        return r
 
-    with mock.patch.object(SDA, "_post_retry", side_effect=fake_post), \
-         mock.patch.object(SDA.time, "sleep"):
+    with mock.patch.object(SDA, "_post_retry", side_effect=fake_post),          mock.patch.object(SDA.time, "sleep"):
         ok, fail = SDA.associate_batch([("L1", "D1"), ("L2", "D2")])
     assert ok == {("L1", "D1")} and fail == 1
-    assert calls[0][0].endswith("/crm/v4/associations/0-420/0-3/batch/associate/default")
+    assert calls[0].endswith("/crm/v4/associations/0-420/0-3/batch/associate/default")
 
 
-def test_一括紐付けの失敗内訳が読めなければ成功扱いにしない():
-    with mock.patch.object(SDA, "_post_retry",
-                           return_value={"errors": [{"message": "x"}], "numErrors": 2}), \
-         mock.patch.object(SDA.time, "sleep"):
+def test_一括紐付けで400なら1件ずつ作り直し無効な1件だけ失敗にする():
+    def fake_post(url, body):
+        if any(x["to"]["id"] == "BAD" for x in body["inputs"]):
+            raise RuntimeError('HTTP 400: {"category": "VALIDATION_ERROR"}')
+        return _ok_resp(body)
+
+    with mock.patch.object(SDA, "_post_retry", side_effect=fake_post),          mock.patch.object(SDA.time, "sleep"):
+        ok, fail = SDA.associate_batch([("L1", "D1"), ("L2", "BAD"), ("L3", "D3")])
+    assert ok == {("L1", "D1"), ("L3", "D3")} and fail == 1
+
+
+def test_一括紐付けで400以外の失敗はまとまりごと失敗にする():
+    with mock.patch.object(SDA, "_post_retry", side_effect=RuntimeError("retry exhausted")),          mock.patch.object(SDA.time, "sleep"):
         ok, fail = SDA.associate_batch([("L1", "D1"), ("L2", "D2")])
     assert ok == set() and fail == 2
 
 
 def test_一括紐付けは100件ずつ送る():
     sizes = []
-    with mock.patch.object(SDA, "_post_retry",
-                           side_effect=lambda u, b: sizes.append(len(b["inputs"])) or {}), \
-         mock.patch.object(SDA.time, "sleep"):
+
+    def fake_post(u, b):
+        sizes.append(len(b["inputs"]))
+        return _ok_resp(b)
+
+    with mock.patch.object(SDA, "_post_retry", side_effect=fake_post),          mock.patch.object(SDA.time, "sleep"):
         ok, fail = SDA.associate_batch([(f"L{i}", "D") for i in range(250)])
     assert sizes == [100, 100, 50] and len(ok) == 250 and fail == 0
 

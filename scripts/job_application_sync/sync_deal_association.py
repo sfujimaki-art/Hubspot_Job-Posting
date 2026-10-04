@@ -335,39 +335,45 @@ def associate_batch(pairs: list, sleep: float = 0.25) -> tuple:
 
     ★1件ずつの PUT をやめた (2026-10-02)。全取引紐付けで件数が増えるため。
       間隔は 0.2秒以上 (0.1秒で 429 を実測)。
+    ★応答の形 (2026-10-04 実物で確認):
+      成功 = HTTP 200, results に {from:{id}, to:{id}} が双方向で並ぶ
+      無効なIDが1件でも混ざると **100件まとめて HTTP 400** (VALIDATION_ERROR)。
+      そのときは1件ずつ作り直し、無効な1件だけを失敗にする。
+      成功の判定は results に実際に返った組だけで行う (送っただけで成功にしない)。
     """
+    url = f"{BASE}/crm/v4/associations/0-420/0-3/batch/associate/default"
+
+    def _send(chunk: list):
+        r = _post_retry(url, {"inputs": [{"from": {"id": lid}, "to": {"id": did}}
+                                         for lid, did in chunk]})
+        got = {(str(x.get("from", {}).get("id")), str(x.get("to", {}).get("id")))
+               for x in (r.get("results") or [])}
+        return {(lid, did) for lid, did in chunk if (str(lid), str(did)) in got}
+
     ok, fail = set(), 0
     for i in range(0, len(pairs), 100):
         chunk = pairs[i:i + 100]
-        body = {"inputs": [{"from": {"id": lid}, "to": {"id": did}}
-                           for lid, did in chunk]}
         try:
-            r = _post_retry(
-                f"{BASE}/crm/v4/associations/0-420/0-3/batch/associate/default",
-                body)
+            done = _send(chunk)
         except Exception as e:  # noqa: BLE001
-            fail += len(chunk)
-            print(f"    ★紐付け失敗 {len(chunk)}件: {type(e).__name__}: "
-                  f"{str(e)[:120]}", flush=True)
-            time.sleep(sleep)
-            continue
-        bad = set()
-        errors = r.get("errors") or []
-        for err in errors:
-            for ctx in (err.get("context") or {}).get("fromObjectId", []) or []:
-                bad.add(str(ctx))
-        if errors and not bad:
-            # どの求人が失敗したか読めない応答。成功扱いにはしない。
-            fail += int(r.get("numErrors") or len(errors))
-            print(f"    ★紐付けの一部失敗 (内訳不明): {str(errors[0])[:160]}",
-                  flush=True)
-            time.sleep(sleep)
-            continue
-        for lid, did in chunk:
-            if lid in bad:
-                fail += 1
-            else:
-                ok.add((lid, did))
+            if "HTTP 400" not in str(e) or len(chunk) == 1:
+                fail += len(chunk)
+                print(f"    ★紐付け失敗 {len(chunk)}件: {type(e).__name__}: "
+                      f"{str(e)[:120]}", flush=True)
+                time.sleep(sleep)
+                continue
+            # 無効なIDが混ざっている。1件ずつ作り直して切り分ける
+            print(f"    [split] 400のため{len(chunk)}件を1件ずつ作り直します", flush=True)
+            done = set()
+            for pair in chunk:
+                try:
+                    done |= _send([pair])
+                except Exception as e1:  # noqa: BLE001
+                    print(f"    ★紐付け失敗 求人={pair[0]} 取引={pair[1]}: "
+                          f"{str(e1)[:120]}", flush=True)
+                time.sleep(sleep)
+        ok |= done
+        fail += len(chunk) - len(done)
         time.sleep(sleep)
     return ok, fail
 
