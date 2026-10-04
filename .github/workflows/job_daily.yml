@@ -267,7 +267,7 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_MEMO=0; RC_APPT=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_ANMOKU=0; RC_MEMO=0; RC_APPT=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
           #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
           #   → メモの転記 → 検知
@@ -286,6 +286,12 @@ jobs:
           # ままの求人はこちらでしか拾えない。追加のみ・判定不能はSlack通知。
           python scripts/job_application_sync/relink_to_latest_deal.py $FLAG || RC_RELINK=$?
           python scripts/job_application_sync/sync_ichijitaiou.py $FLAG || RC_ICHIJI=$?
+          # ★一次対応8項目を応募カードへ転記する (2026-10-01 定例MTG決定)。
+          #   マスター = 中身の入った最新の取引。作成時に取引が空だった応募へ、
+          #   中身が入った後に1回だけ届ける。転記済みの印がある応募は触らない
+          #   (親の条件が後で変わっても上書きしない)。要否は空の応募だけ補う。
+          #   紐付け・付け替え・要否の後に置く (正しい取引群が揃ってから)。
+          python scripts/job_application_sync/backfill_appointment_anmokuchi.py $FLAG || RC_ANMOKU=$?
           # 取引の暗黙知メモを配下の求人へ転記する。
           # メモの正は取引に置いてある(求人は出し直しで作り替えられるため)。
           # ここが無いと、取引でメモを直しても現場が見る求人には届かない。
@@ -318,7 +324,7 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI memo=$RC_MEMO appt=$RC_APPT drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI anmokuchi=$RC_ANMOKU memo=$RC_MEMO appt=$RC_APPT drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
           NG=""
@@ -328,6 +334,7 @@ jobs:
           [ $RC_ASSOC  -ne 0 ] && NG="$NG 求人→取引の紐付け"
           [ $RC_RELINK -ne 0 ] && NG="$NG 最新取引への付け替え"
           [ $RC_ICHIJI -ne 0 ] && NG="$NG 一次対応の転記"
+          [ $RC_ANMOKU -ne 0 ] && NG="$NG 応募への一次対応8項目の転記"
           [ $RC_MEMO   -ne 0 ] && NG="$NG 暗黙知メモの転記"
           [ $RC_APPT   -ne 0 ] && NG="$NG 応募メモの穴埋め"
           [ $RC_DRIFT  -ne 0 ] && NG="$NG 顧客シートURL乖離の検知"
