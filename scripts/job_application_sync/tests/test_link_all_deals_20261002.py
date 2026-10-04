@@ -314,3 +314,15 @@ def test_担当者は別会社の取引に同時に紐付いた求人を触ら�
     to_set = SDA.plan_owner([_listing("L1", owner="U0")], {"L1": ["a", "b"]},
                             deals, DM.group_by_code(deals), {"U0", "U1", "U2"})
     assert to_set == []
+
+
+def test_要確認CSVにAWのログインIDを書かない():
+    # 公開リポジトリのActions成果物になるため (2026-10-04 セキュリティレビュー指摘)
+    deals = {"a": d(LIVE, "RL1", mails="m@x.jp"), "b": d(LIVE, "RL2", mails="m@x.jp")}
+    by_code = DM.group_by_code(deals)
+    shop, mail = SDA.build_indexes(deals)
+    listings = [_listing("L9", login="secret_login_id")]
+    pairs, stat, review = SDA.plan_new_links(listings, {}, shop, mail,
+                                             {"secret_login_id": "m@x.jp"}, deals, by_code)
+    assert [r["求人ID"] for r in review] == ["L9"]
+    assert "secret_login_id" not in str(review)

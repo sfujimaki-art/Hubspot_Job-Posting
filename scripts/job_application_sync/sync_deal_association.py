@@ -244,7 +244,11 @@ def plan_new_links(listings: list, has: dict, shop2deals: dict,
         if how == ST_MULTI:
             review.append({
                 "求人ID": lid,
-                "手がかり": f"{'店舗ID' if path == 'hr' else 'AWログインID'}={key}",
+                # ★AWのログインIDは書かない: このCSVは公開リポジトリのActions成果物
+                #   (要対応リスト) として誰でも取れる。ログインIDは媒体アカウントの
+                #   認証情報の片方。人は求人IDから辿れば足りる (2026-10-04)。
+                "手がかり": (f"店舗ID={key}" if path == "hr"
+                             else "AWログインID(非表示・求人IDから確認)"),
                 "候補の取引ID": " / ".join(cands),
                 "候補の取引先コード": " / ".join(sorted(
                     {str(deals[c].get(DS.PROP_CODE) or "").strip() or "(無)"
