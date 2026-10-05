@@ -745,7 +745,8 @@ class RealHubSpotClient:
             lp = self._requests.get(
                 f"{self.BASE}/crm/v3/objects/0-420/{listing_id}?properties="
                 "hs_name,shigotonaiyou,zhizhong,qinwude,kinmujikan,"
-                "kinmukeitai,kyuuyokeitai,url_airwork,id_shop_hrhakkaa",
+                "kinmukeitai,kyuuyokeitai,url_airwork,id_shop_hrhakkaa,"
+                f"{DM.LISTING_OWNER}",
                 headers=self.headers, timeout=20).json().get("properties") or {}
         except Exception:  # noqa: BLE001
             lp = {}
@@ -767,6 +768,14 @@ class RealHubSpotClient:
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
         # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
         # + 一次対応8項目(暗黙知)。取引群は1回だけ解決して両方に使う。
+        # ★求人に持ち主コードが判定済み (resolve_listing_owner・2026-10-05) なら、
+        #   そのコードの取引群を使う。店舗IDの共有は関係ない。
+        owner = (lp.get(DM.LISTING_OWNER) or "").strip()
+        if owner:
+            deals = self._deals_by_code(owner)
+            props.update(deal_current_props(list(deals), deals))
+            props.update(anmokuchi_transfer_props(list(deals), deals))
+            return props
         # ★店舗IDを別会社と共有している求人は、どの会社の契約か決まらない。
         #   別会社の取引名・要否・一次対応の条件を入れるより、空で人に回す。
         if self._shop_is_shared(lp.get("id_shop_hrhakkaa")):

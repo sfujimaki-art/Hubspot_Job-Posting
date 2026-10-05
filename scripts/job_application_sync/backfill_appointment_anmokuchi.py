@@ -161,12 +161,26 @@ def collect(since: str) -> tuple:
             deals[did] = p
     # 店舗IDを別会社と共有している求人 (=どの会社の契約か決まらない)
     shop_index = DM.shop_code_index(pipeline)
-    lshop = {l: (p.get("id_shop_hrhakkaa") or "")
-             for l, p in _batch_read(LISTING, lids, ["id_shop_hrhakkaa"]).items()} if lids else {}
+    lprops = _batch_read(LISTING, lids, ["id_shop_hrhakkaa", DM.LISTING_OWNER]) if lids else {}
+    lshop = {l: (p.get("id_shop_hrhakkaa") or "") for l, p in lprops.items()}
+    lowner = {l: (p.get(DM.LISTING_OWNER) or "").strip() for l, p in lprops.items()}
     shared_l = {l for l, s in lshop.items() if DM.is_shared_shop(s, shop_index)}
+    by_code_all = DM.group_by_code(pipeline)
     by_code = DM.group_by_code(deals)
     groups: dict = {}
     for a in need:
+        # ★求人に持ち主コードが判定済み (2026-10-05) なら、その取引群をそのまま使う
+        owners = {lowner.get(l) for l in a2l.get(a, [])} - {"", None}
+        if len(owners) == 1:
+            code = next(iter(owners))
+            for did in by_code_all.get(code, []):
+                deals.setdefault(did, pipeline[did])
+            groups[a] = list(by_code_all.get(code, []))
+            continue
+        if len(owners) > 1:
+            stat["shared_shop"] += 1     # 応募の求人の持ち主が複数社
+            groups[a] = []
+            continue
         if any(l in shared_l for l in a2l.get(a, [])):
             stat["shared_shop"] += 1     # 別会社の条件を入れない。人の確認へ
             groups[a] = []

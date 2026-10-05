@@ -196,6 +196,110 @@ def is_shared_shop(shop_id, index: dict) -> bool:
     return len(index.get(str(shop_id or "").strip(), ())) > 1
 
 
+# ---- 求人の持ち主 (2026-10-05 ユーザー決定・案A) --------------------------------
+# HRハッカーでは1つの店舗に複数の会社の求人が入る。さらに
+# backfill_deal_shop_id_via_email が通知先メールの一致した会社の取引へ店舗IDを
+# 足していくため、同じ店舗IDを複数の会社の取引が持つ (実測95店舗)。
+# → 店舗IDと通知先メールは独立した証拠ではない。**通知先メールを主、店舗IDを補助**に
+#   して持ち主の取引先コードを決め、求人のシステム専用項目へ書く (現場の入力は無し)。
+LISTING_OWNER = "hr_owner_code"
+LISTING_OWNER_BASIS = "hr_owner_basis"
+BASIS_MAIL = "通知先メールで1社"
+BASIS_MAIL_SHOP = "通知先メールが複数社→店舗IDで1社"
+BASIS_SHOP = "通知先メールが取引に無い→店舗IDで1社"
+BASIS_NG_SITES = "判定不可: 通知先メールも店舗IDも複数社(同じ会社の別拠点など)"
+BASIS_NG_SHOP = "判定不可: 通知先メールが取引に無く店舗IDも複数社"
+BASIS_NG_NONE = "判定不可: 手がかり無し"
+BASIS_MAIL_LIVE = "通知先メールが複数社→生きた契約は1社"
+BASIS_NG_DEAD = "判定不可: 持ち主の候補に生きた契約が無い"
+# 別名つきアドレス (local+alias@domain) の「元」になっている別名なしのアドレスは、
+# 全社共通の受け口でどの会社の求人かを示さないので判定に使わない
+# (2026-10-05 逆証明: 元アドレスが1社の取引の管理用メールに入っており、元アドレスを
+#  通知先にした求人がすべてその会社に寄る形だった)。
+# ★実在のアドレスは公開リポジトリに書かない。元アドレスはデータから見つける。
+
+
+def _base_of(mail: str) -> str:
+    local, _, domain = mail.partition("@")
+    return f"{local.split('+')[0]}@{domain}" if "+" in local else ""
+
+
+def owner_indexes(deals: dict) -> tuple:
+    """({店舗ID: {コード}}, {管理用メール(小文字): {コード}})。コード無しの取引は使わない。"""
+    shop, mail = {}, {}
+    for p in deals.values():
+        code = str((p or {}).get(PROP_CODE) or "").strip()
+        if not code:
+            continue
+        for s in str((p or {}).get("hrhacker_shop_ids") or "").replace(",", ";").split(";"):
+            if s.strip():
+                shop.setdefault(s.strip(), set()).add(code)
+        for m in re.split(r"[;,\s]+", str((p or {}).get("kanri_mail_address") or "").lower()):
+            if "@" in m:
+                mail.setdefault(m.strip(), set()).add(code)
+    bases = {_base_of(m) for m in mail} - {""}
+    for b in bases:
+        mail.pop(b, None)                 # 共通の元アドレスは手がかりにしない
+    return shop, mail
+
+
+def live_codes(deals: dict) -> set:
+    """生きている取引を1件以上持つ取引先コード。"""
+    return {str(p.get(PROP_CODE) or "").strip() for p in deals.values()
+            if is_live(p) and str(p.get(PROP_CODE) or "").strip()}
+
+
+def resolve_owner(shop_id, notify_mails, shop_index: dict, mail_index: dict,
+                  live: set = None) -> tuple:
+    """求人1件の持ち主 (取引先コード or None, 根拠)。
+
+    M = 通知先メールを管理用メールに持つ取引のコード / S = 店舗IDを持つ取引のコード。
+    live を渡すと、**生きている取引のあるコードだけ**を持ち主にする
+    (2026-10-05 逆証明: 終わった契約のコードを持ち主にすると、要否や応募の取引名を
+     終わった取引から取ってしまう。実測86件)。
+
+    1. M が1つ → 持ち主
+    2. M が複数 → 生きているコードが1つならそれ / 店舗IDとの共通部分が1つならそれ
+    3. M が空 → S が1つなら持ち主
+    4. 候補が終わった契約だけ → 店舗IDの生きたコードが1つならそれ。無ければ決めない
+    5. それ以外は決めない (別会社の値を入れるより空で人に回す)
+    """
+    S = set(shop_index.get(str(shop_id or "").strip(), ()))
+    M = set()
+    for m in notify_mails or ():
+        M |= mail_index.get(str(m).strip().lower(), set())
+    narrowed = False
+    if live is not None:
+        Ml, Sl = M & live, S & live
+        narrowed = len(M) > 1 and len(Ml) == 1
+        if M and not Ml:                       # 通知先は終わった契約だけ
+            if len(Sl) == 1:
+                return next(iter(Sl)), BASIS_SHOP
+            return None, BASIS_NG_DEAD
+        M = Ml if M else M
+        if not M and S and not Sl:
+            return None, BASIS_NG_DEAD
+        S = Sl if S else S
+    if len(M) == 1:
+        return next(iter(M)), (BASIS_MAIL_LIVE if narrowed else BASIS_MAIL)
+    if len(M) > 1:
+        both = M & S
+        if len(both) == 1:
+            return next(iter(both)), BASIS_MAIL_SHOP
+        return None, BASIS_NG_SITES
+    if len(S) == 1:
+        return next(iter(S)), BASIS_SHOP
+    if len(S) > 1:
+        return None, BASIS_NG_SHOP
+    return None, BASIS_NG_NONE
+
+
+def owner_group(listing_props: dict, by_code: dict) -> Optional[list]:
+    """求人に持ち主コードが書かれていれば、そのコードの取引群。無ければ None。"""
+    c = str((listing_props or {}).get(LISTING_OWNER) or "").strip()
+    return list(by_code.get(c, [])) if c else None
+
+
 def spans_codes(deal_ids: Iterable[str], deals: dict) -> bool:
     """取引群が別々の取引先コードにまたがるか (=どの会社の契約か決まらない)。
 

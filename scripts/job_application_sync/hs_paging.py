@@ -70,7 +70,7 @@ def post_retry(url: str, body: dict, retries: int = 5, timeout: int = 60) -> dic
 
 
 def iter_all(obj_type: str, props: list, page: int = 100,
-             archived: bool = False, retries: int = 4,
+             archived: bool = False, retries: int = 6,
              progress_every: int = 5000) -> Iterator[dict]:
     """list API で全件を順に返す。10,000件上限は無い。
 
@@ -88,6 +88,9 @@ def iter_all(obj_type: str, props: list, page: int = 100,
                 r = requests.get(f"{BASE}/crm/v3/objects/{obj_type}",
                                  headers=_h(), params=params, timeout=60)
             except requests.RequestException:
+                # ★通信断は数十秒続くことがある (2026-10-04/05 にローカルで
+                #   getaddrinfo failed が2回、合計15秒の待ちでは足りなかった)。
+                #   1+2+4+8+16+32 = 約1分まで待つ。
                 if i < retries:
                     time.sleep(2 ** i)
                     continue

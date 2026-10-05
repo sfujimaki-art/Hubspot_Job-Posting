@@ -252,3 +252,24 @@ def test_作成時経路_別会社の取引に同時に紐付いた求人には�
     p = cli.get_oubosaki_props("L1", "HRハッカー", "", "")
     for k in ("oubosaki_torihiki_name", "ichijitaiounoumu", "anmokuchi_keikenumukakunin"):
         assert k not in p
+
+
+def test_作成時経路_持ち主コードがあれば店舗IDの共有でもその会社の取引群から取る():
+    deals = {"x": deal(LIVE, "2026-04-01", dealname="X社", itijitaiou="true",
+                       code_of_customer="RLX", hrhacker_shop_ids="S9", keikenumukakunin="X社の条件"),
+             "y": deal(LIVE, "2026-05-01", dealname="Y社", itijitaiou="false",
+                       code_of_customer="RLY", hrhacker_shop_ids="S9")}
+
+    class _Owned(_FakeRequests):
+        def get(self, url, **kw):
+            if "/associations/0-3" in url:
+                return _Resp({"results": [{"toObjectId": d} for d in self.assoc]})
+            return _Resp({"properties": {"id_shop_hrhakkaa": "S9", DM.LISTING_OWNER: "RLX"}})
+
+    cli = AI.RealHubSpotClient.__new__(AI.RealHubSpotClient)
+    cli.BASE = "https://api.hubapi.com"
+    cli.headers = {}
+    cli._requests = _Owned(["y"], deals)          # 今はY社の取引に付いている
+    p = cli.get_oubosaki_props("L1", "HRハッカー", "", "")
+    assert p["oubosaki_torihiki_name"] == "X社" and p["ichijitaiounoumu"] == "必要"
+    assert p["anmokuchi_keikenumukakunin"] == "X社の条件"

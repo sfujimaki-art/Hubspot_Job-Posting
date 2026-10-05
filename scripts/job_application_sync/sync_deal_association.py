@@ -227,6 +227,15 @@ def plan_new_links(listings: list, has: dict, shop2deals: dict,
             stat["already_linked"] += 1
             continue
         p = o.get("properties") or {}
+        # ★持ち主コードが判定済み (resolve_listing_owner・2026-10-05) なら、
+        #   店舗IDの共有に関係なく、そのコードの生きている主契約へ付ける
+        og = DM.owner_group(p, by_code)
+        if og:
+            tg = DM.link_targets(og, deals) or ([DM.latest_live(og, deals)] if og else [])
+            stat["持ち主コードで紐付け"] += 1
+            for did in tg:
+                pairs.append((lid, did, "hr"))
+            continue
         shop = (p.get("id_shop_hrhakkaa") or "").strip()
         login = (p.get("airwork_account_login_id") or "").strip()
         cands, path, key = [], "", ""
@@ -281,11 +290,16 @@ def plan_owner(listings: list, l2deals: dict, deals: dict, by_code: dict,
               for o in listings}
     lshop = {str(o["id"]): ((o.get("properties") or {}).get("id_shop_hrhakkaa") or "")
              for o in listings}
+    lprops = {str(o["id"]): (o.get("properties") or {}) for o in listings}
     out = []
     for lid, dids in l2deals.items():
-        if shop_index and DM.is_shared_shop(lshop.get(lid), shop_index):
-            continue            # 店舗IDを別会社と共有 = どの会社の担当か決まらない
-        src = owner_source(dids, deals, by_code)
+        og = DM.owner_group(lprops.get(lid), by_code)
+        if og:
+            src = DM.latest_live(og, deals)        # 持ち主コードが判定済み
+        else:
+            if shop_index and DM.is_shared_shop(lshop.get(lid), shop_index):
+                continue        # 店舗IDを別会社と共有 = どの会社の担当か決まらない
+            src = owner_source(dids, deals, by_code)
         if not src or not DM.is_live(deals.get(src)):
             continue
         ow = str((deals.get(src) or {}).get("hubspot_owner_id") or "")
@@ -401,7 +415,7 @@ def _write_review(rows: list, out_dir: Path) -> Path | None:
 def run(dry_run: bool = True, limit=None,
         out_dir: Path = _REPO / "data" / "job_application_sync") -> dict:
     _props = ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
-              "hubspot_owner_id"]
+              "hubspot_owner_id", DM.LISTING_OWNER]
     # Search API は10,000件で HTTP 400 になり、素朴な実装では「もう次が無い」と
     # 区別できず静かに完走扱いになる。上限の無い list API を使う(2026-08-06)。
     listings = list_all("0-420", _props, limit=limit)

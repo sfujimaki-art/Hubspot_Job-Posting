@@ -198,24 +198,28 @@ def collect() -> dict:
     for pid in sorted(DS.PIPELINES_KEIJO):
         keijo.update(_search_pipeline(pid, [DS.PROP_CODE]))
     lids = sorted({l for v in d2l.values() for l in v})
-    l_shop = _listing_shops(lids)
+    l_shop, l_owner = _listing_shops(lids)
     return {"deals": deals, "d2l": d2l, "d2d": d2d, "keijo": keijo,
-            "l_shop": l_shop}
+            "l_shop": l_shop, "l_owner": l_owner}
 
 
-def _listing_shops(lids: list) -> dict:
-    """{求人ID: HRハッカー店舗ID}。100件ずつ batch/read。"""
-    out = {}
+def _listing_shops(lids: list) -> tuple:
+    """({求人ID: HRハッカー店舗ID}, {求人ID: 持ち主の取引先コード})。100件ずつ batch/read。"""
+    out, owner = {}, {}
     for i in range(0, len(lids), 100):
         r = _req("POST", f"{BASE}/crm/v3/objects/0-420/batch/read",
                  json={"inputs": [{"id": x} for x in lids[i:i + 100]],
-                       "properties": ["id_shop_hrhakkaa"]})
+                       "properties": ["id_shop_hrhakkaa", DM.LISTING_OWNER]})
         for o in r.get("results", []):
-            v = ((o.get("properties") or {}).get("id_shop_hrhakkaa") or "").strip()
+            p = o.get("properties") or {}
+            v = (p.get("id_shop_hrhakkaa") or "").strip()
             if v:
                 out[str(o["id"])] = v
+            c = (p.get(DM.LISTING_OWNER) or "").strip()
+            if c:
+                owner[str(o["id"])] = c
         time.sleep(0.2)
-    return out
+    return out, owner
 
 
 def shared_shop_listings(deals: dict, l_shop: dict) -> set:
@@ -253,7 +257,7 @@ def _manual_row(kind: str, deal_id: str, props: dict, codes: list,
 
 
 def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict,
-                  l_shop: dict = None) -> tuple:
+                  l_shop: dict = None, l_owner: dict = None) -> tuple:
     """取引先コードごとに「生きている取引すべて」へ紐付ける計画 (純関数)。
 
     Returns:
@@ -288,8 +292,11 @@ def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict,
     for did, code in code_of.items():
         for lid in d2l.get(did, []):
             l_codes[lid].add(code)
-    cross = {lid for lid, cs in l_codes.items() if len(cs) > 1}
-    shared = shared_shop_listings(deals, l_shop or {}) - cross
+    # ★持ち主コードが判定済みの求人 (resolve_listing_owner・2026-10-05) は
+    #   「別会社にまたがる/店舗ID共有」でも持ち主が決まっているので人へ回さない。
+    owner = dict(l_owner or {})
+    cross = {lid for lid, cs in l_codes.items() if len(cs) > 1} - set(owner)
+    shared = shared_shop_listings(deals, l_shop or {}) - cross - set(owner)
     if shared:
         stat["★店舗IDが別会社と共有されている求人(人の確認)"] = len(shared)
         seen_s = set()
@@ -321,7 +328,11 @@ def plan_all_live(deals: dict, d2l: dict, d2d: dict, keijo: dict,
         if not live:
             stat["生きている取引が無いコード(対象外)"] += 1
             continue
-        jobs = sorted({lid for d in members for lid in d2l.get(d, [])} - cross)
+        # 持ち主が別のコードと判定された求人は、このコードの取引へ広げない
+        jobs = {lid for lid in {lid for d in members for lid in d2l.get(d, [])} - cross
+                if owner.get(lid, code) == code}
+        # 持ち主がこのコードなのに、別会社の取引にしか付いていない求人も運ぶ
+        jobs = sorted(jobs | {lid for lid, c in owner.items() if c == code})
         if not jobs:
             stat["求人の無いコード(対象外)"] += 1
             continue
@@ -375,7 +386,7 @@ def main(argv=None):
     deals, d2l = c["deals"], c["d2l"]
     print(f"取引 {len(deals):,}件 / 計上 {len(c['keijo']):,}件\n", flush=True)
     pairs, manual, stat = plan_all_live(deals, d2l, c["d2d"], c["keijo"],
-                                        c.get("l_shop"))
+                                        c.get("l_shop"), c.get("l_owner"))
     print("=== 判定結果 (系列=取引先コード / 生きている取引すべてへ) ===")
     for k, n in stat.most_common():
         if not k.startswith("(参考)"):

@@ -180,7 +180,7 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
     # (28.8%)しか処理していなかった (2026-08-06 発見)。上限の無い list API へ。
     listings = list_all(
         "0-420", ["ichijitaiounoumu_deforuto", "airwork_account_login_id",
-                  "id_shop_hrhakkaa"],
+                  "id_shop_hrhakkaa", DM.LISTING_OWNER],
         limit=limit)
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
@@ -205,6 +205,19 @@ def run(dry_run: bool = True, limit: int | None = None) -> dict:
     hr_matched = aw_matched = unresolved = shared = 0
     for o in listings:
         p = o.get("properties") or {}
+        og = DM.owner_group(p, by_code)
+        if og:
+            # ★持ち主コードが判定済み (2026-10-05): 店舗共有・またがりに関係なく
+            #   持ち主の取引群の「今の契約」に合わせる
+            want = decide_want(og, deals)
+            if want:
+                hr_matched += 1
+                if p.get("ichijitaiounoumu_deforuto") != want:
+                    updates.append({"id": o["id"],
+                                    "properties": {"ichijitaiounoumu_deforuto": want}})
+            else:
+                unresolved += 1
+            continue
         if DM.is_shared_shop(p.get("id_shop_hrhakkaa"), shop_index):
             shared += 1          # 店舗IDを別会社と共有 = どの会社の要否か決まらない
             continue
