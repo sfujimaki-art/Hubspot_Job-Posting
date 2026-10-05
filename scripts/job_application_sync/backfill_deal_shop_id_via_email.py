@@ -24,14 +24,19 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+# 標準出力を差し替えない (テストから import すると出力処理が壊れる)。他の処理と同じ作法。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 LOG_DIR = HERE / "logs"; LOG_DIR.mkdir(exist_ok=True)
@@ -80,62 +85,81 @@ def load_hr_mail_to_shops(hr_csv: Path) -> dict[str, set]:
     return m2s
 
 
-def load_deal_mail_index() -> dict[str, dict]:
-    """kanri_mail(小文字) → {deal_id, shops(既存)} (納品管理Deal)."""
-    idx = {}
-    after = None
-    while True:
-        body = {"filterGroups": [{"filters": [
-            {"propertyName": "kanri_mail_address", "operator": "HAS_PROPERTY"},
-            {"propertyName": "pipeline", "operator": "EQ", "value": PIPE}]}],
-            "properties": ["kanri_mail_address", PROP], "limit": 100}
-        if after:
-            body["after"] = after
-        j = requests.post(f"{BASE}/crm/v3/objects/0-3/search",
-                          headers=H, json=body, timeout=40).json()
-        for o in j.get("results", []):
-            did = o["id"]
-            shops = split_ids(o["properties"].get(PROP, ""))
-            for m in (o["properties"].get("kanri_mail_address") or "").replace(",", ";").split(";"):
-                mm = m.strip().lower()
-                if mm and mm not in idx:
-                    idx[mm] = {"deal_id": did, "shops": shops}
-        after = j.get("paging", {}).get("next", {}).get("after")
-        if not after:
-            break
-    return idx
+def load_pipeline_deals() -> dict:
+    """納品管理PLの取引 {id: props}。10,000件上限の無い取得で全件。"""
+    try:
+        from scripts.job_application_sync.hs_paging import search_all_by_id
+    except ImportError:  # スクリプト直実行
+        from hs_paging import search_all_by_id  # type: ignore
+    return {str(d["id"]): d.get("properties") or {} for d in search_all_by_id(
+        "0-3", ["kanri_mail_address", PROP, "code_of_customer", "dealstage",
+                "dealname", "contract_start_date", "createdate"],
+        [{"propertyName": "pipeline", "operator": "EQ", "value": PIPE}])}
+
+
+def plan_additions(m2s: dict, deals: dict) -> tuple:
+    """純関数: {取引ID: 足す店舗ID集合} と内訳。
+
+    ★2026-10-05 是正 (ユーザー決定)。旧実装は管理用メールが一致した取引の
+      **最初の1件**に店舗IDを足していた。同じ会社の別拠点が同じ別名を使うと
+      別の拠点の取引や終わった取引に店舗IDが入り、同じ店舗IDを複数の会社
+      (取引先コード) の取引が持つ状態を毎日作っていた (実測95店舗)。
+      人が拠点ごとに振り分けても、次の取り込みで足し戻されていた。
+
+    足すのは次の全部を満たすときだけ:
+      1. メールが**1つの取引先コードだけ**を指す (同じ会社の別拠点が同じ別名なら足さない)
+      2. 足す先はそのコードの**生きている今の契約** (終わった取引には足さない)
+      3. その店舗IDが**別の取引先コードの取引に入っていない** (人の振り分けを崩さない)
+    外すことはしない。
+    """
+    try:
+        from scripts.job_application_sync import deal_master as DM
+    except ImportError:  # スクリプト直実行
+        import deal_master as DM  # type: ignore
+    shop_index, mail_index = DM.owner_indexes(deals)
+    by_code = DM.group_by_code(deals)
+    add, stat = defaultdict(set), Counter()
+    for mail, shops in m2s.items():
+        codes = mail_index.get(mail)
+        if not codes:
+            stat["メールが取引に無い"] += 1
+            continue
+        if len(codes) > 1:
+            stat["メールが複数の取引先コードを指す(自動で足さない)"] += 1
+            continue
+        code = next(iter(codes))
+        target = DM.latest_live(by_code.get(code, []), deals)
+        if not target or not DM.is_live(deals.get(target)):
+            stat["そのコードに生きている取引が無い"] += 1
+            continue
+        for sid in shops:
+            others = set(shop_index.get(sid, ())) - {code}
+            if others:
+                stat["店舗IDが別の取引先コードに入っている(足さない)"] += 1
+                continue
+            if sid not in split_ids(deals[target].get(PROP)):
+                add[target].add(sid)
+        stat["メールが1社を指す"] += 1
+    return add, stat
 
 
 def main(dry_run, limit, hr_csv):
     print(f"=== backfill_deal_shop_id_via_email (dry_run={dry_run}) ===")
     m2s = load_hr_mail_to_shops(Path(hr_csv))
-    didx = load_deal_mail_index()
-    print(f"HR 連絡先メール: {len(m2s)} / 納品管理Deal(kanri_mail): {len(didx)}")
+    deals = load_pipeline_deals()
+    print(f"HR 連絡先メール: {len(m2s)} / 納品管理Deal: {len(deals)}")
+    deal_add, stat = plan_additions(m2s, deals)
+    for k, n in stat.most_common():
+        print(f"  {n:6}  {k}")
 
-    # メール一致で Deal に店舗IDマージ (同一Dealに複数メールが来る場合は集約)
-    deal_add = defaultdict(set)     # deal_id -> 追加候補店舗ID
-    deal_existing = {}
-    matched_mail = 0
-    for mail, shops in m2s.items():
-        d = didx.get(mail)
-        if not d:
-            continue
-        matched_mail += 1
-        deal_add[d["deal_id"]] |= shops
-        deal_existing[d["deal_id"]] = d["shops"]
-    print(f"HRメール->Deal一致: {matched_mail}")
-
-    plan, skip_same, updated, errors = [], 0, 0, 0
-    items = list(deal_add.items())
+    plan, updated, errors = [], 0, 0
+    items = sorted(deal_add.items())
     if limit:
         items = items[:limit]
     for did, add in items:
-        existing = deal_existing.get(did, set())
+        existing = split_ids(deals[did].get(PROP))
         merged = existing | add
-        if merged == existing:
-            skip_same += 1
-            continue
-        plan.append({"deal_id": did, "added": sorted(add - existing),
+        plan.append({"deal_id": did, "added": sorted(add),
                      "existing": len(existing), "merged": len(merged)})
         if not dry_run:
             resp = requests.patch(f"{BASE}/crm/v3/objects/0-3/{did}", headers=H,
@@ -148,9 +172,8 @@ def main(dry_run, limit, hr_csv):
                 plan[-1]["error"] = resp.text[:120]
             time.sleep(0.06)
 
-    print(f"\n--- 結果 ---")
+    print("\n--- 結果 ---")
     print(f"  {'書込予定' if dry_run else '書込実行'}(新規店舗ID追加): {len(plan)} 件")
-    print(f"  既存に全て含む(skip): {skip_same} 件")
     if not dry_run:
         print(f"  更新OK: {updated} / NG: {errors}")
     ts = datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -160,6 +183,8 @@ def main(dry_run, limit, hr_csv):
     print(f"  log: {log}")
     for p in plan[:6]:
         print(f"    Deal {p['deal_id']} += {p['added'][:5]} (既存{p['existing']}->{p['merged']})")
+    if errors:
+        raise RuntimeError(f"店舗IDの書き込みに {errors} 件失敗")
 
 
 def parse_args(argv=None):
