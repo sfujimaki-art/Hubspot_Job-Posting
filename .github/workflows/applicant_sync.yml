@@ -33,6 +33,10 @@ on:
         description: "ドライラン (書込なし)"
         type: boolean
         default: true
+      cutoff:
+        description: "シート1を読む開始日 YYYY-MM-DD (空=直近14日。14日より前に取り残した応募の回収用)"
+        type: string
+        default: ""
 
 concurrency:
   group: applicant-sync          # 単一インスタンス (重複runを直列化)
@@ -87,6 +91,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           MODE: ${{ inputs.mode || 'sync' }}
           MEDIA: ${{ inputs.media || 'BOTH' }}
+          CUTOFF: ${{ inputs.cutoff || '' }}
         run: |
           # 状態(台帳/セッション)は actions/cache で保持 (GCS請求先問題の代替)。
           FLAG=$([ "${{ inputs.dry_run }}" = "true" ] && echo "--dry-run" || echo "--actual")
@@ -106,5 +111,12 @@ jobs:
               # AWは MAX_AW_ACCOUNTS_PER_RUN で1run社数をcap(一斉ログインBAN対策)。
               *)         EXTRA="--source sheet1 --media BOTH" ;;
             esac
+            # ★取り込み開始日 (2026-10-05)。未突合のまま14日を過ぎた応募は、
+            #   アカウントシートを直しても自動では取り込まれない (直近14日しか読まない)。
+            #   手動起動で開始日を渡したときだけ、その日から読み直す。
+            if [ -n "$CUTOFF" ]; then
+              echo "$CUTOFF" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'                 || { echo "::error::cutoff は YYYY-MM-DD で指定してください: $CUTOFF"; exit 1; }
+              EXTRA="$EXTRA --hr-cutoff $CUTOFF"
+            fi
             python scripts/job_application_sync/applicant_sync.py $FLAG $EXTRA
           fi

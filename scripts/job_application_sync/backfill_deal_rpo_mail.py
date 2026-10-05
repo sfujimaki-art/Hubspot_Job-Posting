@@ -128,6 +128,15 @@ def load_sheet_index() -> dict:
     return idx
 
 
+def _is_writable(stage_id) -> bool:
+    """生きている取引か (deal_stages の正本)。終わった取引は書き込み先にしない。"""
+    try:
+        from scripts.job_application_sync import deal_stages as DS
+    except ImportError:  # スクリプト直実行
+        import deal_stages as DS  # type: ignore
+    return DS.is_writable(stage_id)
+
+
 def _closed_stages() -> set:
     """解約済のステージID。ここへ値を入れても使われないので対象外にする。"""
     r = requests.get(f"{BASE}/crm/v3/pipelines/0-3/{PIPELINE_NOUHIN}",
@@ -139,11 +148,21 @@ def _closed_stages() -> set:
 
 def build_plan() -> tuple:
     deals = search_all("0-3", ["dealname", "kanri_mail_address", "dealstage",
-                               "hubspot_owner_id"],
+                               "hubspot_owner_id", "code_of_customer"],
                        [{"propertyName": "pipeline", "operator": "EQ",
                          "value": PIPELINE_NOUHIN}])
     closed = _closed_stages()
     n_all = len(deals)
+    # ⓪ 同じ取引先コードの他の取引の値 (2026-10-05)。取引名を鍵にすると、種別の
+    #   二重接頭辞・「追加求人」等の一覧に無い表記・半角「_」区切りで外れていた
+    #   (実測22件)。取引先コードは契約単位で同じ拠点なので、取り違えが起きない。
+    #   解約済の取引の値も手がかりには使う (書き込み先にはしない)。
+    by_code = defaultdict(set)
+    for o in deals:
+        c = (o["properties"].get("code_of_customer") or "").strip()
+        v = (o["properties"].get("kanri_mail_address") or "").strip()
+        if c and v:
+            by_code[c].add(v)
     deals = [o for o in deals if o["properties"].get("dealstage") not in closed]
     print(f"納品管理PLの取引 {n_all:,}件 "
           f"(解約済 {n_all - len(deals):,}件を除外 → 対象 {len(deals):,}件)",
@@ -163,9 +182,19 @@ def build_plan() -> tuple:
         p = o["properties"]
         if (p.get("kanri_mail_address") or "").strip():
             continue                       # 既に値がある → 触らない
+        if not _is_writable(p.get("dealstage")):
+            continue                       # 終わった取引 (継続済等) へは書かない (deal_stages の決まり)
         k = deal_base(p.get("dealname"))
         ex, sh = by_key.get(k), sheet.get(k)
-        if ex and len(ex) == 1:
+        bc = by_code.get((p.get("code_of_customer") or "").strip())
+        if bc and len(bc) == 1:
+            src, val = "同じ取引先コード", list(bc)[0]
+        elif bc:
+            ambiguous.append({"取引ID": o["id"], "取引名": p.get("dealname"),
+                              "理由": "同じ取引先コードに値が複数種",
+                              "候補": " | ".join(sorted(bc))})
+            continue
+        elif ex and len(ex) == 1:
             src, val = "他取引", list(ex)[0]
         elif ex:
             ambiguous.append({"取引ID": o["id"], "取引名": p.get("dealname"),

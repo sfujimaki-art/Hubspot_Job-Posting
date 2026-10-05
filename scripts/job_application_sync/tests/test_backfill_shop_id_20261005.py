@@ -60,3 +60,12 @@ def test_生きている取引が無いコードには足さない():
 def test_取引に無いメールは何もしない():
     add, stat = B.plan_additions({"other@x": {"S1"}}, {"a": d(LIVE, "RL1", mails="rpo+a@x")})
     assert dict(add) == {} and stat["メールが取引に無い"] == 1
+
+
+# ---- 会社名の表記ゆれ: 統轄/統括 (2026-10-05) ---------------------------------
+
+def test_会社名の統轄と統括を同じとみなす():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(HERE))))
+    from scripts.job_application_sync import applicant_queue as AQ
+    assert AQ._norm_company("株式会社A 名古屋統轄本部") == AQ._norm_company("株式会社A　名古屋統括本部")
+    assert AQ._norm_company("株式会社A 名古屋本部") != AQ._norm_company("株式会社A 岡山本部")

@@ -1040,10 +1040,70 @@ def publish_to_sheet(rows: list, title: str) -> str:
               flush=True)
         return ""
 
+def check_owner_undetermined() -> dict:
+    """直近に応募が来ている求人で、持ち主 (取引先コード) が決まらなかったもの。
+
+    2026-10-05 ユーザー決定: 機械が決められないときだけ「この店舗IDを、この
+    拠点の取引に入れてください」と人に知らせ、人が入れる。持ち主は
+    resolve_listing_owner が HRハッカーの取り込みのたびに判定して求人に書く。
+
+    ★明細は公開リポジトリの Actions 成果物 (要対応_*.csv) になるので、
+      会社名・メールは入れない。IDと HubSpot の URL だけ。
+    """
+    from collections import Counter
+    from scripts.job_application_sync import deal_master as DM
+    todo = {
+        DM.BASIS_NG_SITES: "同じ会社の別拠点で通知先メールも店舗IDも同じ。この求人の店舗IDを、"
+                           "正しい拠点の取引だけの『HRハッカー店舗ID』に入れ、ほかの拠点からは外す",
+        DM.BASIS_NG_DEAD: "候補の会社に生きている契約が無い。新しい契約の取引に取引先コードと"
+                          "管理用メールを入れる (契約が終わっているなら求人を閉じる)",
+    }
+    name = f"直近{UNLINKED_DAYS}日に応募が来た求人で持ち主が決まらないもの"
+    since = (datetime.now(timezone.utc) - timedelta(days=UNLINKED_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    apps = search_all("0-421", ["hs_createdate"],
+                      [{"propertyName": "hs_createdate", "operator": "GTE", "value": since}])
+    a2l = _assoc("0-421", "0-420", [o["id"] for o in apps])
+    n_app = Counter(l for ls in a2l.values() for l in ls)
+    lids = sorted(n_app)
+    if not lids:
+        return {"name": name, "value": 0, "want": 0, "detail": ["対象の応募なし"]}
+    props = _batch_props("0-420", lids,
+                         ["id_shop_hrhakkaa", DM.LISTING_OWNER, DM.LISTING_OWNER_BASIS])
+    ng = {l: p for l, p in props.items()
+          if not (p.get(DM.LISTING_OWNER) or "").strip()
+          and (p.get(DM.LISTING_OWNER_BASIS) or "") in todo}
+    if not ng:
+        return {"name": name, "value": 0, "want": 0,
+                "detail": [f"応募が来た求人 {len(lids):,}件。持ち主が決まらないものは無し"]}
+    deals = _deals_with_shop()
+    shop_codes = DM.shop_code_index(deals)
+    by_reason = Counter()
+    items = []
+    for l, p in sorted(ng.items(), key=lambda x: -n_app[x[0]]):
+        basis = p.get(DM.LISTING_OWNER_BASIS) or ""
+        by_reason[basis] += n_app[l]
+        sid = (p.get("id_shop_hrhakkaa") or "").strip()
+        items.append({"区分": basis.replace("判定不可: ", ""), "やること": todo[basis],
+                      "求人ID": l, "求人URL": f"https://app.hubspot.com/contacts/{PORTAL_ID}/record/0-420/{l}",
+                      "店舗ID": sid, "店舗IDを持つ取引先コード": " / ".join(sorted(shop_codes.get(sid, ()))),
+                      f"直近{UNLINKED_DAYS}日の応募": n_app[l]})
+    return {"name": name, "value": len(ng), "want": 0, "items": items,
+            "detail": [f"応募が来た求人 {len(lids):,}件のうち {len(ng):,}件 "
+                       f"(応募 {sum(n_app[l] for l in ng):,}件)"]
+                      + [f"  {k.replace('判定不可: ', '')}: 応募 {v:,}件" for k, v in by_reason.most_common()]}
+
+
+def _deals_with_shop() -> dict:
+    """納品管理PLの取引 (店舗ID・取引先コード) {id: props}。"""
+    rows = search_all("0-3", ["hrhacker_shop_ids", "code_of_customer"],
+                      [{"propertyName": "pipeline", "operator": "EQ", "value": PIPELINE_NOUHIN}])
+    return {str(o["id"]): o.get("properties") or {} for o in rows}
+
+
 CHECKS = [check_stage_consistency, check_recent_listings_linked,
           check_ichijitaiou_sync, check_search_cap,
           check_recent_applications_linked,
-          check_unlinked_listings_by_customer]
+          check_unlinked_listings_by_customer, check_owner_undetermined]
 
 
 def main(argv=None):
