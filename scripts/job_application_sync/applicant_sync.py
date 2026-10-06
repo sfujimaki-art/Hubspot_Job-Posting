@@ -224,7 +224,7 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
     still = _missing_aw_listings(missing, os.environ.get("HUBSPOT_ACCESS_TOKEN", ""))
     got = [x for x in missing if x not in still]
     if still:
-        msg = (f"⚠️ AirWorkの求人を取得できませんでした (login={bid})\n"
+        msg = (f"⚠️ AirWorkの求人を取得できませんでした (login={mask_secret(bid)})\n"
                f"・要求 {len(missing)}件 / 取得 {len(got)}件 / "
                f"**取れなかった {len(still)}件**\n"
                f"・求人ID: {', '.join(still[:12])}"
@@ -241,13 +241,48 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
 
 
 
+def mask_secret(v: str) -> str:
+    """ログ・Slack に出すための伏字。先頭2文字だけ残す。"""
+    v = str(v or "")
+    return (v[:2] + "…") if len(v) > 2 else "…"
+
+
+def scrub_secrets(text: str, secrets) -> str:
+    """文字列中のログインID・パスワードを伏字に置き換える。
+
+    ★2026-10-05: 本番リポジトリは public で、Actions のログは誰でも読める。
+      取得処理の例外文に login_id がそのまま埋め込まれており、アカウントシートで
+      ID欄にパスワードが入っている行ではパスワードまでログに出ていた。
+      出力の直前でまとめて伏せる (例外文を1か所ずつ直すと漏れる)。
+    """
+    t = str(text or "")
+    for v in sorted({str(x) for x in (secrets or []) if x and len(str(x)) >= 3},
+                    key=len, reverse=True):
+        t = t.replace(v, mask_secret(v))
+    return t
+
+
 def process_aw_account(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
     allow_acquire: bool = False,
 ) -> dict:
+    """AW 1アカウントの応募を取得→登録し、結果のログインID・パスワードを伏せて返す。"""
+    res = _process_aw_account_raw(company, b_ids, b_pw, out_dir, dry_run, allow_acquire)
+    secrets = list(b_ids or []) + [b_pw]
+    res["error"] = scrub_secrets(res.get("error", ""), secrets)
+    res["login_id"] = mask_secret(res.get("login_id", "")) if res.get("login_id") else ""
+    return res
+
+
+def _process_aw_account_raw(
+    company: str, b_ids: list[str], b_pw: str,
+    out_dir: Path, dry_run: bool = True,
+    allow_acquire: bool = False,
+) -> dict:
     """AW 1アカウントの応募を取得→(案2b求人先行)→登録。複数B系IDは順に試行。
-    Returns: {ok, linked, unlinked, dup, jobs_fetched, error, login_id}"""
+    Returns: {ok, linked, unlinked, dup, jobs_fetched, error, login_id}
+    ★戻り値の error / login_id は伏せていない。外へ出すのは process_aw_account 経由のみ。"""
     token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
     result = {"ok": False, "linked": 0, "unlinked": 0, "dup": 0,
               "jobs_fetched": 0, "error": "", "login_id": ""}
@@ -284,7 +319,7 @@ def process_aw_account(
                     time.sleep(15)  # HubSpot search index 反映待ち
             except Exception as e:  # noqa: BLE001
                 print(f"  自己修復失敗(応募は続行・対象外->後続relinkで救出): "
-                      f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+                      f"{type(e).__name__}: {scrub_secrets(str(e), [bid, b_pw])[:80]}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
         cli = ai.RealHubSpotClient(token)
         results = ai.run_import(rows, cli, default_login_id=bid)
@@ -522,6 +557,10 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                   flush=True)
             res = process_hr_batch(hr_items, out_dir, dry_run,
                                    date_from=hr_date_from, date_to=hr_date_to)
+            # HRハッカーの管理アカウントのID・パスワードも公開ログに出さない
+            res["error"] = scrub_secrets(res.get("error", ""),
+                                         [os.environ.get("HRHACKER_USER", ""),
+                                          os.environ.get("HRHACKER_PASS", "")])
             if res["ok"]:
                 # 放置ゼロ: 取得した日付範囲に入る項目だけ DONE。
                 # 範囲外(古い/未来)は未登録なので NEW のまま残す(次の広い範囲で処理)。

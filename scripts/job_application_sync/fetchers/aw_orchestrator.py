@@ -65,6 +65,12 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
 from scripts.job_application_sync import airwork_import as awi  # noqa: E402
 
 
+
+def _mask(v) -> str:
+    """ログインIDを公開のActionsログに出さない (2026-10-05)。先頭2文字だけ残す。"""
+    v = str(v or "")
+    return (v[:2] + "…") if len(v) > 2 else "…"
+
 def _extract_xlsx_from_zip(zip_or_xlsx: Path) -> Path:
     """ZIP なら中の .xlsx を temp に展開して返す。既に xlsx ならそのまま返す。
 
@@ -430,7 +436,7 @@ async def orchestrate(parallel: int = 5,
             r = await process_one(sem, acc, out_dir, dry_run, headless, phase="collect")
             done_count["n"] += 1
             print(f"[collect {done_count['n']}/{total}] {r['status']} "
-                  f"login_id={r.get('login_id')} ({r.get('company','')[:18]})",
+                  f"login_id={_mask(r.get('login_id'))} ({r.get('company','')[:18]})",
                   flush=True)
             return r
         results = await asyncio.gather(*[_wrapped_c(a) for a in accounts])
@@ -542,7 +548,7 @@ async def orchestrate(parallel: int = 5,
                   "error": "NG "}.get(r["status"], r["status"] + " ")
         print(
             f"[done {done_count['n']}/{total}] {marker}"
-            f"login_id={r.get('login_id')} "
+            f"login_id={_mask(r.get('login_id'))} "
             f"({r.get('company','')[:20]})",
             flush=True,
         )

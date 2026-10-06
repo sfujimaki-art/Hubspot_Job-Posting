@@ -744,7 +744,8 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
 
     print(f"=== airwork_import (dry_run={dry_run}) ===")
     print(f"INPUT: {input_path}")
-    print(f"login_id: {login_id}")
+    # ★ログインIDは公開のActionsログに出さない (2026-10-05)。先頭2文字だけ
+    print(f"login_id: {(str(login_id)[:2] + '…') if login_id else '(なし)'}")
 
     rows = load_aw_input(input_path, login_id=login_id, sheet=sheet,
                          strict_client_code=strict_client_code)

@@ -69,3 +69,26 @@ def test_会社名の統轄と統括を同じとみなす():
     from scripts.job_application_sync import applicant_queue as AQ
     assert AQ._norm_company("株式会社A 名古屋統轄本部") == AQ._norm_company("株式会社A　名古屋統括本部")
     assert AQ._norm_company("株式会社A 名古屋本部") != AQ._norm_company("株式会社A 岡山本部")
+
+
+# ---- 公開ログにログインID・パスワードを出さない (2026-10-05) ----------------------
+
+def test_ログインIDとパスワードを伏字にする():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(HERE))))
+    from scripts.job_application_sync import applicant_sync as S
+    msg = "secretid@example.com: RuntimeError: ログイン失敗 (login_id=secretid@example.com, pw=Pass1234)"
+    out = S.scrub_secrets(msg, ["secretid@example.com", "Pass1234"])
+    assert "secretid@example.com" not in out and "Pass1234" not in out
+    assert "se…" in out and "Pa…" in out
+    assert S.scrub_secrets("ok", ["", None, "ab"]) == "ok"      # 短すぎる値・空は触らない
+
+
+def test_取得処理の結果はログインIDを伏せて返す(monkeypatch):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(HERE))))
+    from scripts.job_application_sync import applicant_sync as S
+    monkeypatch.setattr(S, "_process_aw_account_raw",
+                        lambda *a, **k: {"ok": False, "error": "myloginid: 失敗 PW=topsecret",
+                                         "login_id": "myloginid"})
+    r = S.process_aw_account("A社", ["myloginid"], "topsecret", None)
+    assert "myloginid" not in r["error"] and "topsecret" not in r["error"]
+    assert r["login_id"] == "my…"
