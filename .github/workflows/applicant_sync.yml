@@ -39,7 +39,11 @@ on:
         default: ""
 
 concurrency:
-  group: applicant-sync          # 単一インスタンス (重複runを直列化)
+  # 単一インスタンス (重複runを直列化)。
+  # ★開始日 (cutoff) を指定した手動の回収は別の列にする (2026-10-05)。同じ列だと、
+  #   待っている間に5分ごとの定期起動が後から来て置き換えられ、回収が取り消される
+  #   (GitHub は列ごとに待機を1つしか持てない)。応募の重複は取り込み処理が防ぐ。
+  group: applicant-sync${{ github.event.inputs.cutoff != '' && github.event.inputs.cutoff != null && '-backfill' || '' }}
   cancel-in-progress: false      # 実行中は待つ (キャンセルしない)
 
 jobs:
