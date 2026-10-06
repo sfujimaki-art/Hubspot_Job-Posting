@@ -304,22 +304,52 @@ class AccountResolver:
                     _norm_company(g(c["comp"])), []).append(r)
         return self
 
-    def _disambiguate(self, key: str, row: list, item: QueueItem):
-        """共用メールキーなら会社名で1社に絞る。絞れなければ None。
+    def _login_of(self, row: list):
+        """行のログイン認証 (企業AirWork IDの集合, PW, 解約済)."""
+        g = lambda i: row[i] if i is not None and len(row) > i else ""  # noqa: E731
+        c = self.cols
+        return (frozenset(_norm(b) for b in _split_multi(g(c["bid"]))),
+                g(c["bpw"]).strip(),
+                g(c["closed"]).upper() == "TRUE")
 
+    def _same_login(self, cands: list) -> bool:
+        """候補行がすべて同じログイン認証(空でない)なら True.
+
+        取り込みで行から使うのはログイン認証と表示用の会社名だけで、
+        拠点は応募の求人(media_job_id→LISTING)から決まる。認証が同じなら
+        どの行を選んでも取り込み結果は変わらない。
+        例: 拠点3行が同じ別名・同じログイン → 会社名で絞れなくても突合してよい。
+        解約済の印が行で違うと SKIP するかが変わるので、それも同一を求める。
+        """
+        logins = {self._login_of(r) for r in cands}
+        if len(logins) != 1:
+            return False
+        bids, bpw, _closed = next(iter(logins))
+        return bool(bids) and bool(bpw)
+
+    def _disambiguate(self, key: str, row: list, item: QueueItem):
+        """共用メールキーなら会社名で1社に絞る。
+
+        Returns: (行, 同一認証で選んだか)。絞れなければ (None, False)。
         ★None を返す = 未突合として人へ回す。誤配より未突合が安全。
           実測 2026-08-07: 顧客管理シート 2,017行のうち59キーが2社以上で共用。
           例 cZq81Kp+AAa11Bb@example.com は東日本WMSの西部PC/中部PC/東部PC。
           従来は dict の後勝ちで「西部PC」が根拠なく選ばれていた。
+        ★会社名で絞れなくても、候補の認証がすべて同じならシート上の先頭行を
+          返す (どれを選んでも同じ結果になるため。_same_login 参照)。
         """
         cands = self.idx_mail_multi.get(key) or []
         if len(cands) <= 1:
-            return row
+            return row, False
         ci = self.cols["comp"]
         want = _norm_company(item.company)
         exact = [r for r in cands
                  if _norm_company(r[ci] if len(r) > ci else "") == want]
-        return exact[0] if len(exact) == 1 else None
+        if len(exact) == 1:
+            return exact[0], False
+        if self._same_login(cands):
+            return cands[0], True
+        return None, False
 
     def resolve(self, item: QueueItem) -> Optional[ResolvedAccount]:
         """queue項目 → ResolvedAccount。突合できなければ None (=要報告)."""
@@ -336,9 +366,11 @@ class AccountResolver:
                 continue
             cand = idx[key]
             if name != "company_exact":
-                cand = self._disambiguate(key, cand, item)
+                cand, same = self._disambiguate(key, cand, item)
                 if cand is None:
                     continue     # 共用キーで絞れず → 次のキーを試す
+                if same:
+                    name = f"{name}(同一認証の複数行)"
             row, by = cand, name
             break
         if row is None:
@@ -360,10 +392,10 @@ class AccountResolver:
                     (self.idx_bid, "b_id(2件目以降)"),
                 ):
                     if _k in _idx:
-                        _c = self._disambiguate(_k, _idx[_k], item)
+                        _c, _same = self._disambiguate(_k, _idx[_k], item)
                         if _c is None:
                             continue
-                        row, by = _c, _nm
+                        row, by = _c, (f"{_nm}(同一認証の複数行)" if _same else _nm)
                         break
                 if row is not None:
                     break
@@ -372,9 +404,12 @@ class AccountResolver:
             # **候補が2件以上あるものは触らない**(事業所違いを掴むため)。
             # 実測 2026-08-07: 未突合35件のうち22件がこれで繋がる。
             # 残る11件は事業所が複数あり機械では決められない=人へ回す。
+            # ただし候補の認証がすべて同じなら先頭行でよい (_same_login 参照)。
             cand = self.idx_comp_norm.get(_norm_company(item.company)) or []
             if len(cand) == 1:
                 row, by = cand[0], "company_normalized"
+            elif len(cand) > 1 and self._same_login(cand):
+                row, by = cand[0], "company_normalized(同一認証の複数行)"
         if row is None:
             return None
         g = lambda i: row[i] if len(row) > i else ""  # noqa: E731

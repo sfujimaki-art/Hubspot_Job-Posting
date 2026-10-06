@@ -268,3 +268,108 @@ def test_他の用途の列を会社名にしない():
         rows.append(r)
     cols = aq._resolve_account_columns(h, rows)
     assert cols["comp"] == 3 and cols["reclog"] == 8
+
+
+# --------------------------------------------------------------------------
+# 4. 共用キーでも、候補のログイン認証がすべて同じなら突合する (2026-10-06)
+#
+# ★取り込みで行から使うのはログイン認証と表示用の会社名だけで、拠点は
+#   応募の求人(media_job_id→LISTING)から決まる。認証が同じならどの行を
+#   選んでも結果は同じ。例: 拠点3行が同じ別名・同じログイン → 未突合に
+#   していたのは取りこぼし。認証が1つでも違えば従来どおり人へ回す。
+# --------------------------------------------------------------------------
+def _row_login(comp: str, alias: str, bid: str, bpw: str,
+               closed: bool = False) -> list:
+    r = _row(comp, alias=alias, bid=bid, closed=closed)
+    r[COLS["bpw"]] = bpw
+    return r
+
+
+def test_同一認証の3行は先頭行で突合する():
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 丙拠点", shared, "bid-1", "pw-1")]
+    acc = _resolver(rows).resolve(_item("サンプル物流", [shared]))
+    assert acc is not None
+    assert acc.company == "サンプル物流 甲拠点", "シート上で先頭の行"
+    assert acc.b_ids == ["bid-1"] and acc.b_pw == "pw-1"
+    assert acc.matched_by == "alias(同一認証の複数行)"
+
+
+def test_同一認証は企業IDの並び順と大小文字の違いを同じとみなす():
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1\nbid-2", "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, "BID-2, bid-1", "pw-1")]
+    acc = _resolver(rows).resolve(_item("サンプル物流", [shared]))
+    assert acc is not None and acc.company == "サンプル物流 甲拠点"
+
+
+@pytest.mark.parametrize("bid, bpw", [("bid-9", "pw-1"), ("bid-1", "pw-9")])
+def test_認証が1行だけ違えば突合しない(bid, bpw):
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 丙拠点", shared, bid, bpw)]
+    assert _resolver(rows).resolve(_item("サンプル物流", [shared])) is None
+
+
+def test_解約済の印が行で違えば突合しない():
+    """解約済かどうかで SKIP が変わるので、同じ結果にならない."""
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, "bid-1", "pw-1",
+                       closed=True)]
+    assert _resolver(rows).resolve(_item("サンプル物流", [shared])) is None
+
+
+@pytest.mark.parametrize("bids", [("", ""), ("bid-1", ""), ("", "bid-1")])
+def test_企業IDが空の行が混じれば突合しない(bids):
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, bids[0], "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, bids[1], "pw-1")]
+    assert _resolver(rows).resolve(_item("サンプル物流", [shared])) is None
+
+
+def test_PWが空なら同じでも突合しない():
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1", ""),
+            _row_login("サンプル物流 乙拠点", shared, "bid-1", "")]
+    assert _resolver(rows).resolve(_item("サンプル物流", [shared])) is None
+
+
+def test_会社名で1行に絞れるなら従来の行を選ぶ():
+    """同一認証でも、会社名が完全一致する行があればそちらが優先."""
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, "bid-1", "pw-1")]
+    acc = _resolver(rows).resolve(_item("サンプル物流 乙拠点", [shared]))
+    assert acc is not None and acc.company == "サンプル物流 乙拠点"
+    assert acc.matched_by == "alias"
+
+
+def test_2件目以降のメールでも同一認証なら突合する():
+    shared = "branch-alias@example.com"
+    rows = [_row_login("サンプル物流 甲拠点", shared, "bid-1", "pw-1"),
+            _row_login("サンプル物流 乙拠点", shared, "bid-1", "pw-1")]
+    acc = _resolver(rows).resolve(
+        _item("サンプル物流", ["unknown@example.co.jp", shared]))
+    assert acc is not None and acc.company == "サンプル物流 甲拠点"
+    assert acc.matched_by == "alias(2件目以降)(同一認証の複数行)"
+
+
+def test_会社名の表記ゆれ一致で複数候補でも同一認証なら突合する():
+    rows = [_row_login("サンプル物流", "", "bid-1", "pw-1"),
+            _row_login("サンプル物流", "", "bid-1", "pw-1")]
+    r = _resolver(rows)
+    r.idx_comp.clear()   # 完全一致の経路を外し、表記ゆれ一致だけを試す
+    acc = r.resolve(_item("サンプル物流", []))
+    assert acc is not None and acc.matched_by == "company_normalized(同一認証の複数行)"
+
+
+def test_会社名の表記ゆれ一致で複数候補かつ認証違いは触らない():
+    rows = [_row_login("サンプル物流", "", "bid-1", "pw-1"),
+            _row_login("サンプル物流", "", "bid-2", "pw-1")]
+    r = _resolver(rows)
+    r.idx_comp.clear()
+    assert r.resolve(_item("サンプル物流", [])) is None
