@@ -57,6 +57,7 @@ if _REPO_ROOT not in _sys.path:
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import os
 import sys
@@ -123,7 +124,11 @@ def detect_diff(prev: dict, curr: dict) -> dict:
         p = prev.get(jid) or {}
         c = curr.get(jid) or {}
         return (p.get("status") != c.get("status")
-                or p.get("job_name") != c.get("job_name"))
+                or p.get("job_name") != c.get("job_name")
+                # 求人票の本文・画像 (2026-10-08): 変わった日に取込を動かし、HubSpot の
+                # 履歴に残す。前回の控えに無い (導入直後) ときも 1 度だけ変化として扱い、
+                # 最初の版を書く。
+                or p.get("copy_hash") != c.get("copy_hash"))
 
     changed = sorted(jid for jid in (prev_ids & curr_ids) if _job_changed(jid))
     return {"new": new, "removed": removed, "changed": changed}
@@ -172,6 +177,15 @@ def save_snapshot(snapshot_dir: Path, snapshot: dict,
     return path
 
 
+def copy_hash(row: dict) -> Optional[str]:
+    """求人票の本文・画像の指紋 (控えを小さく保つため値そのものは持たない)。
+    CSV に該当列が無ければ None."""
+    body, images = row.get("copy_body"), row.get("copy_images")
+    if body is None and images is None:
+        return None
+    return hashlib.sha256(f"{body}\x00{images}".encode("utf-8")).hexdigest()
+
+
 def csv_rows_to_snapshot(rows: list[dict], source_csv: str) -> dict:
     """hrhacker_import.load_hr_csv の戻り値をスナップショット辞書に変換.
 
@@ -191,6 +205,7 @@ def csv_rows_to_snapshot(rows: list[dict], source_csv: str) -> dict:
             "status": (r.get("original_status") or "").strip(),
             "shop_id": (r.get("shop_id") or "").strip(),
             "job_name": (r.get("job_name") or "").strip(),
+            "copy_hash": copy_hash(r),
         }
     return {
         "fetched_at": datetime.now().isoformat(),
