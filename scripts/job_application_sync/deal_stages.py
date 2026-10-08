@@ -44,6 +44,11 @@ HubSpot の `metadata.isClosed` も判定には使えない (2026-08-17 API実�
         ただし**値の供給源としては有用**(前契約は同じ顧客のもの)なので、
         索引には残す。書く先にしないだけ。
 
+    対象外 (NOT_TARGET_STAGES = マーケ関連)
+        紹介料の取引で、応募連携の対象外 (ユーザー判断 2026-10-08)。
+        実測: 10件・求人の紐付き/管理用メール/店舗IDいずれも0件。
+        終わった契約ではないので DEAD_STAGES には入れない。
+
     書き込み可 (WRITABLE_STAGES)
         上記以外。ヨミ(T/D/C/B)は継続提案中=生きている契約なので含む。
 """
@@ -111,22 +116,30 @@ ENDED_ONLY = frozenset({
     "1281526627",   # 満了済オプション（一次対応・追加）
 })
 
+# 紹介料の取引。応募連携の対象外 (ユーザー判断 2026-10-08)。
+NOT_TARGET_STAGES = frozenset({
+    "1278456227",   # マーケ関連
+})
+
 DEAD_STAGES = frozenset(KAIYAKU_STAGES | ENDED_ONLY)
-WRITABLE_STAGES = frozenset(set(STAGE_LABELS) - DEAD_STAGES)
+WRITABLE_STAGES = frozenset(set(STAGE_LABELS) - DEAD_STAGES - NOT_TARGET_STAGES)
 
 KIND_KAIYAKU = "解約済"
 KIND_ENDED = "契約終了"
+KIND_NOT_TARGET = "対象外"
 KIND_WRITABLE = "書込可"
 KIND_UNKNOWN = "不明"
 
 
 def classify(stage_id) -> str:
-    """ステージID → 4分類。未知IDは「不明」(=書き込み対象外)。"""
+    """ステージID → 5分類。未知IDは「不明」(=書き込み対象外)。"""
     s = str(stage_id or "")
     if s in KAIYAKU_STAGES:
         return KIND_KAIYAKU
     if s in ENDED_ONLY:
         return KIND_ENDED
+    if s in NOT_TARGET_STAGES:
+        return KIND_NOT_TARGET
     if s in WRITABLE_STAGES:
         return KIND_WRITABLE
     return KIND_UNKNOWN

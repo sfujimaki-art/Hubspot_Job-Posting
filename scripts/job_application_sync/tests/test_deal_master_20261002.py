@@ -188,3 +188,16 @@ def test_取引群が別々の取引先コードにまたがるか():
     assert not M.spans_codes(["a", "b", "n"], deals)
     assert M.spans_codes(["a", "c"], deals)
     assert not M.spans_codes([], deals)
+
+# ---- 2026-10-08 マーケ関連は対象外 --------------------------------------------
+
+def test_マーケ関連は生きている取引に数えない():
+    # 紹介料の取引で応募連携の対象外 (ユーザー判断 2026-10-08)。
+    # 終わった契約ではないので解約済・契約終了には入れない。
+    mkt = "1278456227"   # マーケ関連
+    assert not M.is_live(deal(mkt))
+    assert M.DS.classify(mkt) == M.DS.KIND_NOT_TARGET
+    assert mkt not in M.DS.DEAD_STAGES
+    deals = {"m": deal(mkt, "2026-09-01"), "l": deal(LIVE, "2025-01-01")}
+    assert M.link_targets(["m", "l"], deals) == ["l"]
+    assert M.latest_live(["m", "l"], deals) == "l"
