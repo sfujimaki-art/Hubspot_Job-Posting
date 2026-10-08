@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -59,6 +61,8 @@ RELINK_LIMIT_PER_SYNC = int(os.environ.get("JAS_RELINK_PER_SYNC", "500"))
 _DATA = _REPO / "data" / "job_application_sync"
 SESSION_DIR = Path(os.environ.get("JAS_SESSION_DIR", _DATA / "aw_sessions"))
 LEDGER_PATH = Path(os.environ.get("JAS_LEDGER_PATH", _DATA / "applicant_ledger.json"))
+# 回収run (開始日を指定した手動起動) が残した台帳。あれば読み込み時に混ぜる (Ledger.merge_from)
+LEDGER_MERGE_FROM = os.environ.get("JAS_LEDGER_MERGE_FROM", "")
 LOCK_PATH = _DATA / "applicant_sync.lock"
 
 
@@ -93,14 +97,66 @@ class Lock:
 # 処理台帳 (放置ゼロ: DONE は成功時のみ / FAILED は試行回数を記録)
 # ============================================================================
 class Ledger:
-    def __init__(self, path: Path = LEDGER_PATH) -> None:
+    # 応募以外の記録 (会社ごとの認証の状態など) は、この接頭辞の鍵で同じ台帳に置く。
+    # 応募の鍵 (JOB-xxx / 内容ハッシュ) とは重ならない。status は "META"。
+    META_PREFIX = "__"
+
+    def __init__(self, path: Path = LEDGER_PATH, merge_from: str = "") -> None:
         self.path = path
         self.data: dict = {}
+        self.merged = 0
         if path.exists():
             try:
                 self.data = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 self.data = {}
+        if merge_from:
+            self.merged = self.merge_from(Path(merge_from))
+
+    def merge_from(self, path: Path) -> int:
+        """別の run が保存した台帳を混ぜる。同じ鍵は updated が新しい方を採る。
+
+        ★なぜ要るか (2026-10-08 実測): 回収run (開始日指定) と定期run は別の
+          concurrency group で同時に走り、どちらも actions/cache の「最新」を
+          復元して自分の run_id で保存していた。2026-10-07 には回収run
+          (10:02〜10:25) が保存した台帳を 10:26 の定期runが復元し、その間に
+          定期run 4本 (10:06〜10:21) が積んだ記録が消えた
+          (台帳の総記録数 7,698 → 7,772 = 回収run開始時の 7,697 + 回収分75)。
+          回収runは別の鍵で保存し、定期runがそれをここで混ぜる。
+        Returns: 採用した件数。
+        """
+        if not path.exists():
+            return 0
+        try:
+            other = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return 0
+        n = 0
+        for k, e in (other or {}).items():
+            if not isinstance(e, dict):
+                continue
+            mine = self.data.get(k)
+            if mine is None or str(e.get("updated", "")) > str(mine.get("updated", "")):
+                self.data[k] = e
+                n += 1
+        return n
+
+    def meta(self, kind: str, name: str) -> dict:
+        return self.data.get(f"{self.META_PREFIX}{kind}__:{name}") or {}
+
+    def set_meta(self, kind: str, name: str, **fields) -> None:
+        e = self.data.setdefault(f"{self.META_PREFIX}{kind}__:{name}", {})
+        e.update(fields)
+        e["status"] = "META"
+        e["updated"] = datetime.now().isoformat()
+
+    def meta_names(self, kind: str) -> set:
+        pre = f"{self.META_PREFIX}{kind}__:"
+        return {k[len(pre):] for k in self.data if k.startswith(pre)}
+
+    def n_records(self) -> int:
+        """応募の記録数 (META を除く)。ログの「台帳の総記録数」を以前と比べられるようにする。"""
+        return sum(1 for k in self.data if not k.startswith(self.META_PREFIX))
 
     def status(self, row_id: str) -> str:
         return (self.data.get(row_id) or {}).get("status", "NEW")
@@ -188,7 +244,8 @@ def _missing_aw_listings(job_ids: list[str], token: str) -> list[str]:
     return [j for j in ids if j not in exist]
 
 
-def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> int:
+def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
+                    absent_out: Optional[list] = None) -> int:
     """自己修復: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
 
     生成待ちあり(timeout_min分)。欠落時のみ発火。
@@ -202,6 +259,8 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
       AirWorkのエクスポートに含まれていなかった」ことで、**その事実が
       ログにもSlackにも一切残らなかった**のが実質的な問題だった。
       取れなかったIDを必ず報告する。
+
+    absent_out: 渡されたら、取れなかった求人IDをここへ足す (呼び出し側が台帳に覚える)。
     """
     from scripts.job_application_sync.fetchers import aw_csv_fetcher as awf
     from scripts.job_application_sync.fetchers.aw_orchestrator import (
@@ -223,6 +282,8 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path) -> i
     # 既存の _missing_aw_listings を再利用する(同じ判定を2度書かない)。
     still = _missing_aw_listings(missing, os.environ.get("HUBSPOT_ACCESS_TOKEN", ""))
     got = [x for x in missing if x not in still]
+    if absent_out is not None:
+        absent_out.extend(still)
     if still:
         msg = (f"⚠️ AirWorkの求人を取得できませんでした (login={mask_secret(bid)})\n"
                f"・要求 {len(missing)}件 / 取得 {len(got)}件 / "
@@ -262,13 +323,58 @@ def scrub_secrets(text: str, secrets) -> str:
     return t
 
 
+# 認証の欄が「空」とみなす値: 空白とダッシュ類だけ。
+# ★2026-10-08 実測: 顧客管理シートでダッシュ1文字だけのセルは ー(U+30FC) 313 /
+#   -(U+002D) 21 / ―(U+2015) 16。以前は「ー」「-」しか空とみなさず、
+#   「―」をログインIDとして送ってログインを試していた。
+# ★PW の空白除去・全角の変換はしない (値が変わるとログインが通らなくなりうる)。
+_BLANK_CRED = re.compile(
+    r"^[\s\u3000\-\u2010-\u2015\u2212\u30fc\uff0d\uff70\u2500\u2501]*$")
+
+
+def is_blank_cred(v) -> bool:
+    """空白とダッシュ類だけ (= 認証が入っていない) なら True."""
+    return _BLANK_CRED.match(str(v or "")) is not None
+
+
+def has_aw_auth(b_ids, b_pw) -> bool:
+    """ログインを試す意味があるか。ID が1つも無い、または PW が無ければ False."""
+    return (any(not is_blank_cred(b) for b in (b_ids or []))
+            and not is_blank_cred(b_pw))
+
+
+def auth_fingerprint(b_ids, b_pw) -> str:
+    """シートの認証値が変わったかを見るための指紋。値そのものは台帳に残さない。"""
+    raw = json.dumps([list(b_ids or []), str(b_pw or "")], ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def company_key(company: str) -> str:
+    """台帳に会社ごとの記録を置くときの鍵。会社名そのものは台帳に書かない。"""
+    return hashlib.sha256(str(company or "").encode("utf-8")).hexdigest()[:16]
+
+
+def order_aw_groups(cands: list, failed_before) -> list:
+    """前回失敗した社を後ろへ回す (同じ扱いの中ではシートの順を保つ)。
+
+    ★2026-10-08: 処理順はシート1の行順で、毎回失敗する社は古い応募が残るため
+      先頭に来る。1runの枠 (MAX_AW_ACCOUNTS_PER_RUN=12) を先に使い切り、
+      取り込めるはずの社が後回しになっていた
+      (実測: 回収run 37604733962 は処理した12社のうち10社が失敗する社)。
+    cands: [(key, ...)]、failed_before: key -> bool。
+    """
+    return sorted(cands, key=lambda c: bool(failed_before(c[0])))
+
+
 def process_aw_account(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
     allow_acquire: bool = False,
+    known_absent: Optional[set] = None,
 ) -> dict:
     """AW 1アカウントの応募を取得→登録し、結果のログインID・パスワードを伏せて返す。"""
-    res = _process_aw_account_raw(company, b_ids, b_pw, out_dir, dry_run, allow_acquire)
+    res = _process_aw_account_raw(company, b_ids, b_pw, out_dir, dry_run, allow_acquire,
+                                  known_absent=known_absent)
     secrets = list(b_ids or []) + [b_pw]
     res["error"] = scrub_secrets(res.get("error", ""), secrets)
     res["login_id"] = mask_secret(res.get("login_id", "")) if res.get("login_id") else ""
@@ -279,16 +385,21 @@ def _process_aw_account_raw(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
     allow_acquire: bool = False,
+    known_absent: Optional[set] = None,
 ) -> dict:
     """AW 1アカウントの応募を取得→(案2b求人先行)→登録。複数B系IDは順に試行。
-    Returns: {ok, linked, unlinked, dup, jobs_fetched, error, login_id}
+    Returns: {ok, linked, unlinked, no_listing_old, dup, jobs_fetched, error, login_id}
+    known_absent: 媒体の求人一覧に無かった求人ID (台帳に覚えたもの)。
+      自己修復で取りに行かず、その求人への応募は unlinked でなく no_listing_old で数える。
+      渡された set には今回新たに一覧に無かったIDを足して返す。
     ★戻り値の error / login_id は伏せていない。外へ出すのは process_aw_account 経由のみ。"""
     token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
-    result = {"ok": False, "linked": 0, "unlinked": 0, "dup": 0,
+    result = {"ok": False, "linked": 0, "unlinked": 0, "no_listing_old": 0, "dup": 0,
               "jobs_fetched": 0, "error": "", "login_id": ""}
+    known = known_absent if known_absent is not None else set()
     last_err = ""
     for bid in b_ids or []:
-        if not bid or bid in ("ー", "-"):
+        if is_blank_cred(bid):
             continue
         try:
             csv_path = asyncio.run(_fetch_aw_csv(bid, b_pw, out_dir))
@@ -311,10 +422,22 @@ def _process_aw_account_raw(
             try:
                 job_ids = list({r.media_job_id for r in rows if r.media_job_id})
                 missing = _missing_aw_listings(job_ids, token)
+                # ★前回までに「媒体の求人一覧に無い」と確かめた求人IDは取りに行かない
+                #   (2026-10-08)。応募CSVには終わった求人への過去の応募も残るので、
+                #   放っておくと取り込みのたびに同じIDで全件の求人取得 (約8分・
+                #   ログイン1回) をやり直していた。新しい求人IDが出たときは従来どおり。
+                known_missing = [j for j in missing if j in known]
+                missing = [j for j in missing if j not in known]
+                if known_missing:
+                    print(f"  自己修復: {company[:18]} 求人の一覧に無いと確認済みの"
+                          f"求人ID {len(known_missing)}件は取り直さない", flush=True)
                 if missing:
                     print(f"  自己修復: {company[:18]} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
-                    jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir)
+                    absent: list = []
+                    jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
+                                                   absent_out=absent)
+                    known.update(absent)
                     result["acquired_job_ids"] = missing  # 過去分救出(ピンポイントrelink)用
                     time.sleep(15)  # HubSpot search index 反映待ち
             except Exception as e:  # noqa: BLE001
@@ -335,9 +458,18 @@ def _process_aw_account_raw(
         #   error件数はログにもSlackにも出ず、**全滅しても無音**だった。
         #   1件でも成功していれば ok、全部エラーなら ok=False で再試行に回す。
         ok = (len(results) == 0) or (n_err < len(results))
+        # ★紐付け先の無い古い応募を、未紐付けと分けて数える (2026-10-08)。
+        #   媒体の求人一覧に無い求人 (= 終わって消えた求人) への応募は、紐付く先が
+        #   どこにも無い。実測: 8/1以降に作ったAWの応募で求人に紐付いていない
+        #   623件は、すべて応募日が8/1より前で、211種の求人IDがHubSpotに無かった。
+        #   同じ「未紐付け」に混ぜると、人が直すべき未紐付けが見えなくなる。
+        #   取り込み自体は今までどおり行う (対象外＋備考「求人未特定」)。
+        n_old = sum(1 for r in results
+                    if r.status == "unlinked" and r.media_job_id in known)
         result.update(ok=ok, login_id=bid, jobs_fetched=jobs_fetched,
                       linked=st.get("linked", 0),
-                      unlinked=st.get("unlinked", 0),
+                      unlinked=st.get("unlinked", 0) - n_old,
+                      no_listing_old=n_old,
                       dup=st.get("skip_duplicate", 0),
                       error_rows=n_err, total=len(results))
         if n_err:
@@ -436,10 +568,16 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     if not lock.acquire():
         print("[applicant_sync] 別インスタンス実行中 -> skip", flush=True)
         return {"skipped": True}
-    ledger = Ledger()
+    ledger = Ledger(merge_from=LEDGER_MERGE_FROM)
+    if ledger.merged:
+        print(f"[applicant_sync] 回収runの台帳から {ledger.merged}件を反映", flush=True)
     out_dir = _REPO / "scratchpad" / "applicant_sync_csv"
+    # unlinked       : 求人に紐付かなかった応募 (人が直す余地があるもの)
+    # no_listing_old : 媒体の求人一覧に無い求人への応募 (紐付け先がどこにも無い)
+    # no_auth        : 企業AirWorkのID・PWがシートに無く、ログインしなかった応募
     summary = {"accounts": 0, "done": 0, "failed": 0, "reported": 0,
-               "unresolved": 0, "out_of_scope": 0, "linked": 0}
+               "unresolved": 0, "out_of_scope": 0, "linked": 0,
+               "unlinked": 0, "no_listing_old": 0, "no_auth": 0}
     try:
         if source == "sheet1":
             # GAS queue座礁の迂回: シート1を直読み(F列マーカーで未処理判定)。
@@ -513,7 +651,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         print(f"[applicant_sync] 台帳による除外: {_before}件 → {len(items)}件 "
               f"(DONE={_st['DONE']} SKIP={_st['SKIP']} "
               f"FAILED上限超={_st['FAILED_OVER']}) / 台帳の総記録数="
-              f"{len(ledger.data):,}", flush=True)
+              f"{ledger.n_records():,}", flush=True)
         # セッション再利用が効いているか (BAN対策の本丸。設計書2026-07-07)。
         # 保存されていなければ毎回フルログイン = PW反復送信 = BANリスク源。
         try:
@@ -622,43 +760,90 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             return summary   # lock は finally で解放
 
         aw_groups = {k: v for k, v in grouped.items() if k.startswith("AW::")}
-        # BAN対策: 1runのAWアカウント数を上限でcap(一斉ログイン回避)。
-        cap = limit_accounts if limit_accounts else MAX_AW_ACCOUNTS_PER_RUN
-        keys = list(aw_groups)[:cap]
-        if len(aw_groups) > len(keys):
-            print(f"[applicant_sync] AW {len(aw_groups)}社中 今回{len(keys)}社処理 "
-                  f"(残{len(aw_groups)-len(keys)}社は次サイクル / BAN対策の分散)",
-                  flush=True)
-        # 自己修復の1run習得budget: 求人習得(mode=full)は生成待ちを内包し重いため
-        # 少数に cap。溢れた社は次サイクル(5分毎)で自動的に習得される。
-        acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "2"))
-        acquired_total = 0
-        acquired_job_ids: list = []
-        for key in keys:
-            group = aw_groups[key]
+        # ── 枠を数える前に、ログインしなくても結果が決まる社を外す (2026-10-08) ──
+        #   以前は枠 (先頭12社) を取ってから認証を見ていたため、解約済・認証なしの
+        #   社もログインする社と同じく1枠を使っていた。
+        #   認証なし (IDかPWが空・ダッシュだけ) は、何度試しても結果が同じ。
+        #   シートの認証値が変わるまで再試行せず、Slack も初回 (と値が変わったとき) だけ。
+        runnable: list = []
+        n_noauth_co = 0
+        for key, group in aw_groups.items():
             company = key[len("AW::"):]
-            summary["accounts"] += 1
-            # そのアカウントのB系認証を resolver から (代表itemで再解決)
             acc = resolver.resolve(group[0])
             if acc is None or acc.closed:
                 for it in group:
                     ledger.mark(it.row_id, "SKIP", "closed/unresolved")
                 continue
+            ck = company_key(company)
+            if not has_aw_auth(acc.b_ids, acc.b_pw):
+                n_noauth_co += 1
+                summary["no_auth"] += len(group)
+                fp = auth_fingerprint(acc.b_ids, acc.b_pw)
+                if ledger.meta("aw_noauth", ck).get("auth") != fp:
+                    ledger.set_meta("aw_noauth", ck, auth=fp)
+                    summary["reported"] += 1
+                    slack_notify(dry_run=dry_run, message=
+                        f"⚠️ 応募取り込み: {company} の企業AirWorkのIDかPWが"
+                        f"顧客管理シートに入っていません (応募{len(group)}件)\n"
+                        f"→ シートに入れると、次の回から自動で取り込みます。"
+                        f"入るまでこの社はログインせず、この通知も繰り返しません")
+                    print(f"  ❌ {company[:18]}: 認証なし (応募{len(group)}件・"
+                          f"ログインせず→Slack報告)", flush=True)
+                continue
+            if ledger.meta("aw_noauth", ck).get("auth"):
+                ledger.set_meta("aw_noauth", ck, auth="")   # 認証が入った
+            runnable.append((key, acc))
+        runnable = order_aw_groups(
+            runnable,
+            lambda k: ledger.meta("aw_fail", company_key(k[len("AW::"):])).get("failed"))
+        n_failed_before = sum(
+            1 for k, _a in runnable
+            if ledger.meta("aw_fail", company_key(k[len("AW::"):])).get("failed"))
+        # BAN対策: 1runのAWアカウント数を上限でcap(一斉ログイン回避)。
+        cap = limit_accounts if limit_accounts else MAX_AW_ACCOUNTS_PER_RUN
+        keys = runnable[:cap]
+        if n_noauth_co:
+            print(f"[applicant_sync] 認証なし {n_noauth_co}社 / 応募{summary['no_auth']}件は"
+                  f"ログインせず枠も使わない", flush=True)
+        if len(runnable) > len(keys) or n_failed_before:
+            print(f"[applicant_sync] AW {len(runnable)}社中 今回{len(keys)}社処理 "
+                  f"(残{len(runnable)-len(keys)}社は次サイクル / BAN対策の分散。"
+                  f"前回失敗した{n_failed_before}社は後ろへ)", flush=True)
+        # 自己修復の1run習得budget: 求人習得(mode=full)は生成待ちを内包し重いため
+        # 少数に cap。溢れた社は次サイクル(5分毎)で自動的に習得される。
+        acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "2"))
+        acquired_total = 0
+        acquired_job_ids: list = []
+        # 媒体の求人一覧に無かった求人ID (台帳に覚えている分 + この回に見つけた分)
+        known_absent = ledger.meta_names("aw_absent_job")
+        absent_before = set(known_absent)
+        for key, acc in keys:
+            group = aw_groups[key]
+            company = key[len("AW::"):]
+            ck = company_key(company)
+            summary["accounts"] += 1
             res = process_aw_account(
                 company, acc.b_ids, acc.b_pw, out_dir, dry_run,
-                allow_acquire=(not dry_run and acquired_total < acquire_budget))
+                allow_acquire=(not dry_run and acquired_total < acquire_budget),
+                known_absent=known_absent)
             if res.get("jobs_fetched"):
                 acquired_total += 1
                 acquired_job_ids.extend(res.get("acquired_job_ids") or [])
             if res["ok"]:
+                if ledger.meta("aw_fail", ck).get("failed"):
+                    ledger.set_meta("aw_fail", ck, failed=False)
                 for it in group:
                     ledger.mark(it.row_id, "DONE")
                 summary["done"] += len(group)
                 summary["linked"] += res.get("linked", 0)
+                summary["unlinked"] += res.get("unlinked", 0)
+                summary["no_listing_old"] += res.get("no_listing_old", 0)
                 print(f"  ✅ {company[:18]}: 応募{len(group)}件 "
                       f"linked={res.get('linked')} unlinked={res.get('unlinked')} "
+                      f"一覧に無い求人への古い応募={res.get('no_listing_old', 0)} "
                       f"dup={res.get('dup')} 求人fetch={res.get('jobs_fetched')} (login={res.get('login_id')})", flush=True)
             else:
+                ledger.set_meta("aw_fail", ck, failed=True)
                 # 失敗 → リトライ回数を数え、上限超過で Slack 報告
                 atts = 0
                 for it in group:
@@ -677,6 +862,8 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         # 自己修復の仕上げ: 今回求人を習得した場合、過去に取りこぼした(対象外)応募を
         # 習得した求人IDに絞ったピンポイントrelinkで即救出する。全走査+sortは
         # HubSpot検索のページング途切れで取りこぼすため、IDで直接引く(確実・軽量)。
+        for jid in sorted(known_absent - absent_before):
+            ledger.set_meta("aw_absent_job", jid, seen=True)
         if acquired_job_ids and not dry_run:
             try:
                 relink(dry_run=False, target_job_ids=acquired_job_ids)

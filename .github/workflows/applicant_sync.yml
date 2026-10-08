@@ -57,13 +57,29 @@ jobs:
           python-version: "3.10"
       # 状態永続化: GCS(請求先問題)の代わりに Actions cache で
       # 台帳(ledger)+AWセッション(storage_state)を run 間で保持。
+      # ★復元と保存を分け、回収run (cutoff 指定) は別の鍵に台帳だけを保存する (2026-10-08)。
+      #   回収runと定期runは concurrency group が別で同時に走る。以前はどちらも
+      #   最新の state を復元して同じ鍵の系列に保存していたため、あとから保存した
+      #   側が先の記録を消していた。実測 2026-10-07: 回収run (10:02〜10:25) の
+      #   保存を 10:26 の定期runが復元し、その間の定期run 4本 (10:06〜10:21) の
+      #   記録が消えた (台帳 7,698 → 7,772 = 回収run開始時 7,697 + 回収分75)。
+      #   いまは state の系列は定期runだけが書き、回収runの台帳は定期runが
+      #   読み込み時に混ぜる (同じ応募は updated の新しい方。Ledger.merge_from)。
+      #   どちらの系列も同じ group の中で直列なので、上書き合いは起きない。
       - name: Restore state (ledger + sessions)
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: data/job_application_sync
           key: jas-applicant-state-v2-${{ github.run_id }}
           restore-keys: |
             jas-applicant-state-v2-
+      - name: Restore backfill ledger
+        uses: actions/cache/restore@v4
+        with:
+          path: data/job_application_sync_backfill
+          key: jas-applicant-backfill-v1-${{ github.run_id }}
+          restore-keys: |
+            jas-applicant-backfill-v1-
       - name: Install deps + Playwright
         run: |
           python -m pip install --upgrade pip
@@ -96,6 +112,7 @@ jobs:
           MODE: ${{ inputs.mode || 'sync' }}
           MEDIA: ${{ inputs.media || 'BOTH' }}
           CUTOFF: ${{ inputs.cutoff || '' }}
+          JAS_LEDGER_MERGE_FROM: data/job_application_sync_backfill/applicant_ledger.json
         run: |
           # 状態(台帳/セッション)は actions/cache で保持 (GCS請求先問題の代替)。
           FLAG=$([ "${{ inputs.dry_run }}" = "true" ] && echo "--dry-run" || echo "--actual")
@@ -127,3 +144,22 @@ jobs:
             fi
             python scripts/job_application_sync/applicant_sync.py $FLAG $EXTRA
           fi
+      # 保存は旧 actions/cache の後処理と同じく、ジョブが成功したときだけ。
+      - name: Save state (定期run)
+        if: ${{ success() && (inputs.cutoff || '') == '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/job_application_sync
+          key: jas-applicant-state-v2-${{ github.run_id }}
+      - name: Copy ledger for backfill (回収run)
+        if: ${{ success() && (inputs.cutoff || '') != '' }}
+        run: |
+          mkdir -p data/job_application_sync_backfill
+          cp data/job_application_sync/applicant_ledger.json data/job_application_sync_backfill/applicant_ledger.json \
+            || echo '{}' > data/job_application_sync_backfill/applicant_ledger.json
+      - name: Save backfill ledger (回収run)
+        if: ${{ success() && (inputs.cutoff || '') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/job_application_sync_backfill
+          key: jas-applicant-backfill-v1-${{ github.run_id }}
