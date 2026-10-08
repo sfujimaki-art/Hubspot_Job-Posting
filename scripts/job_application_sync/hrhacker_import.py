@@ -51,8 +51,10 @@ from dotenv import load_dotenv
 
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
     from . import listing_stage as _stage
+    from . import private_log as plog
 except ImportError:  # pragma: no cover
     import listing_stage as _stage  # type: ignore
+    import private_log as plog  # type: ignore
 
 # ============================================================================
 # 環境設定
@@ -577,8 +579,13 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dic
         })
         print(f"  更新: ✅{u_ok} ❌{u_ng}")
         print(f"  作成: ✅{c_ok} ❌{c_ng}")
-        if u_err: print(f"  更新エラー: {u_err[:3]}")
-        if c_err: print(f"  作成エラー: {c_err[:3]}")
+        # HubSpot のエラー文は値 (会社名など) を含みうるので件数だけ。本文は非公開ログ
+        if u_err:
+            print(f"  更新エラー: {len(u_err)}件 (内容は非公開ログ)")
+            plog.detail("hrhacker_import_update_errors", errors=u_err[:20])
+        if c_err:
+            print(f"  作成エラー: {len(c_err)}件 (内容は非公開ログ)")
+            plog.detail("hrhacker_import_create_errors", errors=c_err[:20])
         # ③新規LISTINGに暗黙知テンプレNoteを付与 (best-effort, 既ピン留めはskip)
         try:
             from scripts.job_application_sync.notes import attach_template_notes
@@ -628,4 +635,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

@@ -78,6 +78,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_stages as DS       # noqa: E402
 from scripts.job_application_sync.hs_paging import post_retry    # noqa: E402
 from scripts.job_application_sync.rollup_merge import (          # noqa: E402
@@ -222,13 +223,15 @@ def create_note(deal_id: str, body: str) -> str:
 def slack(message: str) -> bool:
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:300]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         return requests.post(url, json={"text": message},
                              timeout=15).status_code == 200
     except requests.RequestException as e:  # noqa: BLE001
-        print(f"[slack送信失敗] {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -264,9 +267,14 @@ def main(dry_run: bool, limit, do_slack: bool) -> int:
     print(f"\n契約グループ {plan['groups']:,} / 引き継ぐ {len(plan['write']):,}件"
           f" / 変化なし {plan['nochange']:,} / 人へ回す {len(plan['deferred']):,}件",
           flush=True)
+    # 取引先コード・取引名・取引IDは公開ログに出さない (2026-10-09)。非公開ログへ
     for w in plan["write"][:6]:
-        print(f"    {w['取引先コード']} {w['取引名'][:26]:<28} "
-              f"取引{w['deal_id']} {w['before_len']:,}字 → {len(w['body']):,}字")
+        print(f"    {plog.mask_id(w['取引先コード'])} {plog.mask_name(w['取引名']):<8} "
+              f"取引{plog.mask_id(w['deal_id'])} {w['before_len']:,}字 → {len(w['body']):,}字")
+    for w in plan["write"]:
+        plog.detail("inherit_rollup_plan", code=w["取引先コード"], name=w["取引名"],
+                    deal_id=w["deal_id"], before_len=w["before_len"],
+                    after_len=len(w["body"]), dry_run=dry_run)
 
     items = plan["write"][:limit] if limit else plan["write"]
     ok = ng = 0
@@ -285,7 +293,9 @@ def main(dry_run: bool, limit, do_slack: bool) -> int:
                 ok += 1
             except Exception as e:  # noqa: BLE001
                 ng += 1
-                print(f"  [NG] 取引 {w['deal_id']}: {e}", flush=True)
+                print(f"  [NG] 取引 {plog.mask_id(w['deal_id'])}: {type(e).__name__} "
+                      f"(内容は非公開ログ)", flush=True)
+                plog.detail("inherit_rollup_ng", deal_id=w["deal_id"], error=str(e)[:500])
             time.sleep(0.08)
         print(f"  引き継ぎOK {ok:,} / NG {ng:,}", flush=True)
 
@@ -346,3 +356,5 @@ if __name__ == "__main__":
                   "　▶ 確認: Job Daily の deal_hygiene のログ "
                   "(inherit_rollup_by_contract)")
         raise
+    finally:
+        plog.flush()

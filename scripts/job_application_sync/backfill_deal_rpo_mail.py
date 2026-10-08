@@ -55,6 +55,7 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync.hs_paging import (  # noqa: E402
     post_retry, search_all)
 
@@ -76,13 +77,15 @@ def slack_notify(message: str) -> bool:
     """機械で決められない件を人へ回す。件数だけでなく行動と影響も書く。"""
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:300]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         return requests.post(url, json={"text": message},
                              timeout=15).status_code == 200
     except requests.RequestException as e:  # noqa: BLE001
-        print(f"[slack送信失敗] {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -254,6 +257,10 @@ def main(argv=None):
           f"({dict(src_count)})")
     print(f"人の確認が要る : {len(ambiguous):,}件")
     print(f"案(CSV): {p.resolve()}")
+    # ★2026-10-09: 公開の Actions 成果物 (RPOアドレス*.csv) の代わりに、
+    #   非公開の顧客管理シートのタブへ全置換で書く (取引名・メールを含むため)。
+    plog.replace_list(PLAN_TAB, plan, create=bool(plan))
+    q_tab_ok = plog.replace_list(AMBIGUOUS_TAB, ambiguous, create=bool(ambiguous))
     if ambiguous:
         q = out / f"RPOアドレス要確認_{datetime.now():%Y-%m-%d}.csv"
         with q.open("w", encoding="utf-8-sig", newline="") as f:
@@ -271,7 +278,9 @@ def main(argv=None):
                          "（rpo.medica+／複数可・;区切り）」に正しい値を入れる")
             lines.append("▶ 放置すると: この顧客の求人が取引に紐付かず、"
                          "応募の一次対応の要否・担当者・応募先取引名が空のまま入る")
-            lines.append(f"▶ 対象一覧: {q.resolve()}")
+            lines.append("▶ 対象一覧: "
+                         + (f"顧客管理シートのタブ「{AMBIGUOUS_TAB}」" if q_tab_ok
+                            else str(q.resolve())))
             for x in ambiguous[:5]:
                 lines.append(f"　- {x.get('取引名','')[:30]} "
                              f"／理由={x.get('理由','')}"
@@ -304,7 +313,7 @@ def main(argv=None):
             ok += len(chunk)
         except Exception as e:  # noqa: BLE001
             fail += len(chunk)
-            print(f"  ★失敗: {type(e).__name__}: {str(e)[:140]}")
+            print(f"  ★失敗: {type(e).__name__}: {plog.redact(str(e)[:140])}")
         print(f"  {min(i + 100, len(plan)):,}/{len(plan):,}", flush=True)
         time.sleep(0.15)
     print(f"\n=== 結果 === 書込 {ok:,}件 / 失敗 {fail:,}件")
@@ -313,5 +322,13 @@ def main(argv=None):
     return 0
 
 
+PLAN_TAB = "RPOアドレス補完案"
+AMBIGUOUS_TAB = "RPOアドレス要確認"
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    finally:
+        plog.flush()
+    sys.exit(rc)

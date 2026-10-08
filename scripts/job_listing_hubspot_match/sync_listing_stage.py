@@ -177,7 +177,8 @@ def main(argv=None):
         print(f"   {n:7,}件  {k}")
     print(f"\n★更新対象 = {len(targets):,}件  (dry_run={not a.actual})")
     for t in targets[:5]:
-        print(f"   例: {t['id']} {t['name'][:26]!r} "
+        # 求人名は会社名を含むので先頭2文字だけ (公開ログ方針 2026-10-09)
+        print(f"   例: {t['id']} {(t['name'] or '')[:2] + '***'!r} "
               f"{LABEL.get(t['before'], '(未設定)')} → {LABEL[t['after']]}")
     if not a.actual:
         print("\n(dry-run のため書き込みません。--actual で実行)")

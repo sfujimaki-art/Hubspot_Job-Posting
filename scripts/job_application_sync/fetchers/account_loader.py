@@ -155,9 +155,9 @@ def _get_field(row: dict, *candidates: str) -> str:
 
 # ── セル正規化 (2026-07-24) ─────────────────────────────────────────────
 # 顧客管理シートには1セルに複数値/ラベル/メモが混在する行がある(実測 十数件):
-#   'ID：sankikoube\nID：@sanki6451\nID：SANKI7228'      … 複数ID+ラベル
-#   'ID :kountohoku7200'                                  … ラベル(スペース揺れ)
-#   'otsuka@roadcar.jp\n1.0で登録：https://...'           … 資格情報+メモ混在
+#   'ID：sample01\nID：@sample0123\nID：SAMPLE0456'       … 複数ID+ラベル (架空の例)
+#   'ID :example7200'                                     … ラベル(スペース揺れ)
+#   'taro@example.com\n1.0で登録：https://...'            … 資格情報+メモ混在
 # 生値のままログインすると必ず失敗するため、最初の妥当な値だけを抽出する。
 # クリーンなセル(改行/ラベル無し)は無変更で素通し = 既存挙動を壊さない。
 _CRED_LABEL = re.compile(r"^(ID|PW|パスワード)\s*[：:]\s*", re.IGNORECASE)
@@ -168,7 +168,7 @@ def _first_credential(cell: str, split_comma: bool = True) -> str:
     """複数値/ラベル/メモ混在セルから最初の妥当な資格情報を返す。
 
     split_comma: IDはカンマ区切りも分割。PWはカンマを含み得るため False 推奨。
-    ('yamanaka/kisai/10' のようにスラッシュを含む正規IDがあるため / では割らない)
+    ('sample/abc/10' のようにスラッシュを含む正規IDがあるため / では割らない)
     """
     cell = (cell or "").strip()
     if "\n" not in cell and not _CRED_LABEL.match(cell):

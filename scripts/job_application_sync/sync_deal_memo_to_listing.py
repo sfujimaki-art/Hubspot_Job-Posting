@@ -91,6 +91,7 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_stages as DS       # noqa: E402
 from scripts.job_application_sync.hs_paging import (              # noqa: E402
     post_retry, search_all_by_id)
@@ -462,12 +463,18 @@ def rollback(path: str) -> int:
 def _print_deferred(deferred: list) -> None:
     if not deferred:
         return
-    print(f"\n★ 人へ回す (書いていません): {len(deferred)}件")
+    # 求人名・取引ID・取引先コード・取引名は公開ログに出さない (2026-10-09)
+    print(f"\n★ 人へ回す (書いていません): {len(deferred)}件 (明細は非公開ログ)")
     for d in deferred[:10]:
-        print(f"   求人 {d['listing_id']} {d.get('求人名', '')[:28]}  {d['理由']}")
+        print(f"   求人 {d['listing_id']} {plog.mask_name(d.get('求人名', ''))}  {d['理由']}")
         for t in d["取引"]:
-            print(f"      取引 {t['deal_id']} {t['取引先コード'] or '(コード無し)'} "
-                  f"{t['取引名'][:28]} [{t['ステージ']}]")
+            print(f"      取引 {plog.mask_id(t['deal_id'])} "
+                  f"{plog.mask_id(t['取引先コード']) or '(コード無し)'} "
+                  f"{plog.mask_name(t['取引名'])} [{t['ステージ']}]")
+    for d in deferred[:200]:
+        plog.detail("memo_transfer_deferred", listing_id=d["listing_id"],
+                    listing_name=d.get("求人名", ""), reason=d["理由"],
+                    deals=d["取引"])
 
 
 def main(argv=None) -> int:
@@ -543,9 +550,11 @@ def main(argv=None) -> int:
     print(f"\n=== 結果 === 作成 {len(res['created']):,} / 更新 {len(res['patched']):,} / "
           f"人の編集あり(見送り) {len(res['human_edited']):,} / 失敗 {len(res['failed']):,}")
     for h in res["human_edited"][:10]:
-        print(f"   ★求人 {h['listing_id']} {h.get('求人名', '')[:28]} の転記Note {h['note_id']} に人の編集。上書きせず")
+        print(f"   ★求人 {h['listing_id']} {plog.mask_name(h.get('求人名', ''))} の転記Note {h['note_id']} に人の編集。上書きせず")
+        plog.detail("memo_transfer_human_edited", **h)
     for f_ in res["failed"][:10]:
-        print(f"   ★失敗 {f_}")
+        print(f"   ★失敗 求人 {f_.get('listing_id')} {f_.get('op', '')} (内容は非公開ログ)")
+        plog.detail("memo_transfer_failed", **f_)
     if res["created"] or res["patched"]:
         lp = _write_log("memo_transfer", res)
         print(f"記録: {lp.resolve()}\n戻す場合: python {Path(__file__).name} --rollback {lp}")
@@ -553,4 +562,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    finally:
+        plog.flush()
+    sys.exit(rc)

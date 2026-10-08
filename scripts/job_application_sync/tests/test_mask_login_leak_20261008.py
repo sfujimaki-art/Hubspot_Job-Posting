@@ -38,7 +38,9 @@ def test_顧客別サマリはログインIDと理由を伏せる():
     assert "ok…" in out and "ng…" in out, "どの行か分かる程度に先頭だけ残す"
     assert "新規=1" in out and "更新=2" in out
     assert "遷移せず" in out, "理由そのものは消さない"
-    assert "C社 理由=不明" in out
+    # 2026-10-09: 会社名も伏せる (先頭2文字 + ***)
+    assert "C社*** 理由=不明" in out
+    assert "A社 " not in out and "B社 " not in out
 
 
 # ---------------------------------------------------------------- 2. health_check

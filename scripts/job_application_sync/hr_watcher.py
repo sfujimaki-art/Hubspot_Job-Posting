@@ -54,6 +54,8 @@ _REPO_ROOT = str(_pathlib.Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in _sys.path:
     _sys.path.insert(0, _REPO_ROOT)
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
+
 import argparse
 import asyncio
 import gzip
@@ -447,7 +449,7 @@ def run(csv_path: Optional[str] = None,
         summary["hrhacker_summary"] = hr_summary
     except Exception as e:
         summary["hrhacker_error"] = str(e)
-        print(f"[hr_watcher] ⚠️ A-1 失敗: {e}")
+        print(f"[hr_watcher] ⚠️ A-1 失敗: {type(e).__name__}: {plog.redact(e)}")
 
     # ---- W-4-b: 影響店舗ID集合 ----
     affected_shop_ids = extract_affected_shop_ids(curr, prev, diff)
@@ -484,7 +486,7 @@ def run(csv_path: Optional[str] = None,
         except Exception as e:
             deals = []
             summary["deal_search_error"] = str(e)
-            print(f"[hr_watcher] ⚠️ Deal Search 失敗: {e}")
+            print(f"[hr_watcher] ⚠️ Deal Search 失敗: {type(e).__name__}: {plog.redact(e)}")
     summary["matched_deals"] = len(deals)
 
     # ---- W-4-d/e: login_id 候補 → account 解決 ----
@@ -555,7 +557,7 @@ def run(csv_path: Optional[str] = None,
         summary["aw_result"] = aw_result
     except Exception as e:
         summary["aw_error"] = str(e)
-        print(f"[hr_watcher] ⚠️ AW orchestrate 失敗: {e}")
+        print(f"[hr_watcher] ⚠️ AW orchestrate 失敗: {type(e).__name__}: {plog.redact(e)}")
 
     summary["finished_at"] = datetime.now().isoformat()
     log_path = _write_log(summary, "completed")
@@ -611,7 +613,32 @@ def main(argv: Optional[list[str]] = None) -> None:
         snapshot_dir=snapshot_dir,
         input_mapping_json=args.input_mapping_json,
     )
-    print(f"\n[hr_watcher-done] {json.dumps({k: v for k, v in result.items() if k != 'hrhacker_summary'}, ensure_ascii=False, indent=2)[:600]}")
+    print(f"\n[hr_watcher-done] {json.dumps(public_summary(result), ensure_ascii=False, indent=2)[:600]}")
+    plog.detail("hr_watcher_done", **{k: v for k, v in result.items()
+                                      if k != "hrhacker_summary"})
+
+
+# 公開ログでは中身を出さず件数にする項目 (店舗ID・ログインID・パス等)。2026-10-09
+_PUBLIC_COUNT_KEYS = ("affected_shop_ids", "target_login_ids")
+_PUBLIC_DROP_KEYS = ("hrhacker_summary", "csv_path", "snapshot_path", "log_path",
+                     "hrhacker_error", "deal_search_error",
+                     "account_resolve_error", "aw_error")
+
+
+def public_summary(result: dict) -> dict:
+    """[hr_watcher-done] 用。ID の一覧は件数に、自由文 (例外文) は有無だけにする。"""
+    out: dict = {}
+    for k, v in result.items():
+        if k in _PUBLIC_COUNT_KEYS:
+            out[f"{k}_count"] = len(v or [])
+        elif k == "aw_result" and isinstance(v, dict):
+            out[k] = {x: v.get(x) for x in ("ok", "ng", "total") if x in v}
+        elif k in _PUBLIC_DROP_KEYS:
+            if k.endswith("_error") and v:
+                out[k] = "あり (内容は非公開ログ)"
+        else:
+            out[k] = v
+    return out
 
 
 if __name__ == "__main__":
@@ -619,4 +646,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

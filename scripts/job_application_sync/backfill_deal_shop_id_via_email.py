@@ -31,6 +31,11 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
+    from scripts.job_application_sync import private_log as plog
+except ImportError:  # pragma: no cover
+    import private_log as plog  # type: ignore
+
 # 標準出力を差し替えない (テストから import すると出力処理が壊れる)。他の処理と同じ作法。
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -181,8 +186,14 @@ def main(dry_run, limit, hr_csv):
     log.write_text(json.dumps({"plan": plan[:800]}, ensure_ascii=False, indent=2),
                    encoding="utf-8")
     print(f"  log: {log}")
+    # 取引ID・店舗IDは公開ログに出さない (2026-10-09)。全件は非公開ログへ
     for p in plan[:6]:
-        print(f"    Deal {p['deal_id']} += {p['added'][:5]} (既存{p['existing']}->{p['merged']})")
+        print(f"    Deal {plog.mask_id(p['deal_id'])} += {len(p['added'])}件 "
+              f"(既存{p['existing']}->{p['merged']})")
+    for p in plan:
+        plog.detail("deal_shop_id_added", deal_id=p["deal_id"], added=p["added"],
+                    existing=p["existing"], merged=p["merged"],
+                    error=p.get("error", ""), dry_run=dry_run)
     if errors:
         raise RuntimeError(f"店舗IDの書き込みに {errors} 件失敗")
 
@@ -199,13 +210,15 @@ def parse_args(argv=None):
 def _slack(message: str) -> bool:
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:300]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         return requests.post(url, json={"text": message},
                              timeout=15).status_code == 200
     except requests.RequestException as e:  # noqa: BLE001
-        print(f"[slack送信失敗] {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -232,3 +245,5 @@ if __name__ == "__main__":
             "　▶ 確認: Job Daily の hr フェーズのログ "
             "(backfill_deal_shop_id_via_email)")
         raise
+    finally:
+        plog.flush()

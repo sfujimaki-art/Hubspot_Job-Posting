@@ -49,6 +49,7 @@ for _s in (sys.stdout, sys.stderr):
 
 os.environ.setdefault("SHEETS_AUTH_MODE", "sa")
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync.hs_paging import iter_all  # noqa: E402
 
 BASE = "https://api.hubapi.com"
@@ -65,12 +66,14 @@ def _h() -> dict:
 def slack_notify(message: str) -> bool:
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:200]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         return requests.post(url, json={"text": message}, timeout=15).status_code == 200
     except requests.RequestException as e:
-        print(f"[slack送信失敗] {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -165,8 +168,12 @@ def main(argv=None):
     print(f"  ★HubSpotが使用中だがD列に存在しないシート: {len(orphan):,}種 "
           f"(求人 {sum(orphan.values()):,}件)")
     print(f"   D列にあるがHubSpot未反映のシート        : {len(unused):,}件")
+    # シートIDは公開ログに出さない (2026-10-09)。全件は非公開ログへ
     for sid, n in sorted(orphan.items(), key=lambda x: -x[1])[:8]:
-        print(f"      求人{n:4d}件  {sid[:26]}…")
+        print(f"      求人{n:4d}件  {plog.mask_id(sid)}")
+    if orphan:
+        plog.detail("sheet_url_orphan", n=len(orphan),
+                    sheets=dict(sorted(orphan.items(), key=lambda x: -x[1])[:200]))
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     p = out / f"顧客シートURL乖離_{datetime.now():%Y-%m-%d}.csv"
@@ -198,4 +205,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

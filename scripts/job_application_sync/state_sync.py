@@ -30,6 +30,8 @@ _REPO = _HERE.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
+
 # 同期するローカルディレクトリ (このディレクトリ配下を丸ごとGCSと同期)
 LOCAL_STATE_DIR = _REPO / "data" / "job_application_sync"
 
@@ -86,7 +88,8 @@ def pull() -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         blob.download_to_filename(str(dest))
         n += 1
-    print(f"[state_sync] pull: {n} files from gs://{bkt.name}/{pref}/")
+    # バケット名は公開ログに出さない (2026-10-09)
+    print(f"[state_sync] pull: {n} files from gs://{plog.mask_id(bkt.name)}/{pref}/")
     return n
 
 
@@ -102,7 +105,7 @@ def push() -> int:
         blob = bkt.blob(f"{pref}/{rel}")
         blob.upload_from_filename(str(path))
         n += 1
-    print(f"[state_sync] push: {n} files to gs://{bkt.name}/{pref}/")
+    print(f"[state_sync] push: {n} files to gs://{plog.mask_id(bkt.name)}/{pref}/")
     return n
 
 

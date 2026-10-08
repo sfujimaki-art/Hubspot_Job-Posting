@@ -65,6 +65,7 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_stages as DS  # noqa: E402
 from scripts.job_application_sync import deal_master as DM  # noqa: E402
 
@@ -118,16 +119,19 @@ def _req(method: str, url: str, **kw):
 
 def slack_notify(message: str, dry_run: bool = False) -> bool:
     if dry_run:
-        print(f"[slack(dry-run,未送信)] {message[:200]}", flush=True)
+        plog.public(f"[slack(dry-run,未送信)] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="dry-run", message=message)
         return False
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:200]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         return requests.post(url, json={"text": message}, timeout=15).status_code == 200
     except requests.RequestException as e:
-        print(f"[slack送信失敗] {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -414,4 +418,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    finally:
+        plog.flush()
+    sys.exit(rc)
