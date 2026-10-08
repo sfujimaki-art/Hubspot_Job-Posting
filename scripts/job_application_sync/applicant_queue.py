@@ -143,6 +143,13 @@ def _norm_company(s: str) -> str:
       長音の揺れ      「SBS三愛ロジスティックス」↔「SBS三愛ロジスティクス」
       統轄/統括       「○○ 名古屋統轄本部」↔「○○ 名古屋統括本部」(2026-10-05。
                       意味は同じで、取引名とシートで書き方が割れていた)
+      区切りの「_」   「A株式会社 新潟工場」↔「A株式会社_新潟工場」(2026-10-08。
+                      空白は既に落としているので、空白の代わりの「_」も落とす)
+      法人格の位置    「A株式会社」↔「株式会社A」、「A」↔「A株式会社」(2026-10-08)
+      末尾の「御中」  「A株式会社御中」↔「A株式会社」(2026-10-08)
+        ★2026-10-08 実測（顧客管理シート 1,971行・AWの未突合 146件）:
+          この3つを足しても、シートの行どうしで新たに同じキーになる組は0、
+          すでに突合している通知の行が変わるものも0。未突合のうち19件が突合する。
 
     **事業所名は落とさない**。落とすと別拠点を掴む。実測で
     「ヒノデ産業株式会社」に栃木支店と千葉支店の2候補があり、機械では
@@ -153,10 +160,16 @@ def _norm_company(s: str) -> str:
     t = unicodedata.normalize("NFKC", str(s or ""))
     t = re.sub(r"[※*]\s*.*$", "", t)          # 「※解約済」等の運用メモを落とす
     t = re.sub(r"[\s　]", "", t)               # 空白(全角含む)
-    t = t.replace("＿", "_")                   # 全角アンダースコア
+    t = t.replace("＿", "_").replace("_", "")  # 区切りの「_」(全角含む)
     t = re.sub(r"[ｯッ](?=[クキカコ])", "", t)   # ロジスティックス↔ロジスティクス
     t = t.replace("統轄", "統括")              # 統轄↔統括 (同じ意味の表記ゆれ)
+    t = re.sub(r"御中$", "", t)                # 宛名の「御中」
+    t = _LEGAL_FORM.sub("", t)                  # 法人格は前後どちらにあっても落とす
     return t.lower()
+
+
+# 法人格。NFKC 後の文字列に当てる（「㈱」は「(株)」になる）。
+_LEGAL_FORM = re.compile(r"株式会社|有限会社|合同会社|合資会社|合名会社|\(株\)|\(有\)")
 
 
 def _split_multi(s: str) -> list[str]:
@@ -300,8 +313,10 @@ class AccountResolver:
                 self._add_mail(_norm(g(c["reclog"])), r)
             if g(c["comp"]).strip():
                 self.idx_comp[_norm(g(c["comp"]))] = r
-                self.idx_comp_norm.setdefault(
-                    _norm_company(g(c["comp"])), []).append(r)
+                # 法人格だけの名前は正規化で空になる。空のキーで突き合わせない
+                _k = _norm_company(g(c["comp"]))
+                if _k:
+                    self.idx_comp_norm.setdefault(_k, []).append(r)
         return self
 
     def _login_of(self, row: list):
@@ -344,7 +359,7 @@ class AccountResolver:
         ci = self.cols["comp"]
         want = _norm_company(item.company)
         exact = [r for r in cands
-                 if _norm_company(r[ci] if len(r) > ci else "") == want]
+                 if want and _norm_company(r[ci] if len(r) > ci else "") == want]
         if len(exact) == 1:
             return exact[0], False
         if self._same_login(cands):
