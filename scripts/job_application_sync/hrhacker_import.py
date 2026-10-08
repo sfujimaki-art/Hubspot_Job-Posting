@@ -88,6 +88,78 @@ HR_CSV_COLUMNS: dict[str, str] = {
     "公開終了日時": "end_date",        # idx 82
     "公開": "original_status",         # idx 83 (値: 公開/非公開/公開開始前/公開終了)
 }
+# 求人票の本文・画像 (2026-10-08): 求人文面管理 (HR_HR /app/job-copy) が本文・給与・画像の
+# 変化を版として比べるため、CSV の求人票の列を 2 つのプロパティにまとめて書く。
+# HubSpot のプロパティ履歴がそのまま版の履歴になるので、値が変わったときだけ書く。
+# 載せるのは求人票として公開される列だけ。制作メモ・電話番号・連絡先/通知先メール・
+# フォーム設定・ID・公開日時/状態は入れない (社内メモと連絡先を求人票の履歴に混ぜない)。
+COPY_TEXT_COLUMNS: tuple[str, ...] = (
+    "案件名", "仕事内容", "通勤経路", "最寄り駅", "キャッチコピー", "メリット",
+    "仕事情報補足1のタイトル", "仕事情報補足2のタイトル", "仕事情報補足3のタイトル", "仕事情報補足4のタイトル",
+    "仕事情報補足1の内容", "仕事情報補足2の内容", "仕事情報補足3の内容", "仕事情報補足4の内容",
+    "雇用形態", "Indeed表示職種名", "応募資格", "給与形態", "基本給与 最小", "基本給与 最大",
+    "タスクの所要時間", "タスクの単位", "平均稼働時間", "平均稼働日数", "固定残業代", "想定残業時間",
+    "条件付き給与1 条件", "条件付き給与1 深夜帯", "条件付き給与1 最小給与", "条件付き給与1 最大給与",
+    "条件付き給与2 条件", "条件付き給与2 深夜帯", "条件付き給与2 最小給与", "条件付き給与2 最大給与",
+    "条件付き給与3 条件", "条件付き給与3 深夜帯", "条件付き給与3 最小給与", "条件付き給与3 最大給与",
+    "給与補足", "試用・研修の有無", "試用・研修時の雇用条件", "試用・研修期の雇用形態",
+    "試用・研修期の給与のタイプ", "試用・研修期の基本給与 最小", "試用・研修期の基本給与 最大",
+    "試用・研修期のタスクの所要時間", "試用・研修期のタスクの単位", "試用・研修期の平均稼働時間",
+    "試用・研修期の平均稼働日数", "試用・研修期の固定残業代", "試用・研修期の想定残業時間",
+    "試用・研修の詳細情報", "勤務時間", "勤務時間帯",
+    "自由項目1のタイトル", "自由項目2のタイトル", "自由項目3のタイトル", "自由項目4のタイトル",
+    "自由項目1の内容", "自由項目2の内容", "自由項目3の内容", "自由項目4の内容",
+    "受動喫煙対策", "受動喫煙についての補足情報", "応募方法", "応募後のプロセス", "採用予定人数",
+)
+COPY_IMAGE_COLUMNS: tuple[str, ...] = ("画像1", "画像2", "画像3")
+PROP_COPY_BODY = "hrh_kyuujinhyou_honbun"     # 求人票の本文（HRハッカー）
+PROP_COPY_IMAGES = "hrh_kyuujinhyou_gazou"    # 求人票の画像（HRハッカー）
+# HubSpot の文字列プロパティの上限 (65,536 文字) を超える値は、切り詰めず書かない
+# (切った値を書くと、変わっていない本文が「変わった」履歴になる)。
+COPY_MAX_CHARS = 65_000
+
+
+def _clean(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def compose_copy_body(raw: dict, header: list[str]) -> Optional[str]:
+    """求人票の文章系の列を決まった順の全文にする. CSV にその列が 1 つも無ければ None.
+
+    1 列 = 「列名：値」。値が複数行なら「列名：」の次の行から値。空の列は出さない。
+    """
+    present = [c for c in COPY_TEXT_COLUMNS if c in header]
+    if not present:
+        return None
+    blocks = []
+    for col in present:
+        v = _clean(raw.get(col))
+        if not v:
+            continue
+        blocks.append(f"{col}：\n{v}" if "\n" in v else f"{col}：{v}")
+    return "\n".join(blocks)
+
+
+def compose_copy_images(raw: dict, header: list[str]) -> Optional[str]:
+    """画像1〜3 を並び順のまま 1 行ずつ。空の枠は「なし」。CSV に画像列が無ければ None."""
+    if not all(c in header for c in COPY_IMAGE_COLUMNS):
+        return None
+    return "\n".join(f"{c}：{_clean(raw.get(c)) or 'なし'}" for c in COPY_IMAGE_COLUMNS)
+
+
+def copy_props(row: dict, existing_props: Optional[dict]) -> dict:
+    """本文・画像のうち、今の HubSpot の値と違うものだけを返す (同じ値は書かない)."""
+    p: dict = {}
+    for key, prop in (("copy_body", PROP_COPY_BODY), ("copy_images", PROP_COPY_IMAGES)):
+        value = row.get(key)
+        if value is None or len(value) > COPY_MAX_CHARS:
+            continue
+        current = (existing_props or {}).get(prop)
+        if (current or "") != value:
+            p[prop] = value
+    return p
+
+
 # CSVエンコーディング: Shift-JIS (BOMなし) — Phase 0b 28382 実測で確定
 HR_CSV_ENCODING = "shift_jis"
 
@@ -152,10 +224,13 @@ def load_hr_csv(path: str | Path, encoding: str = HR_CSV_ENCODING) -> list[dict]
     rows: list[dict] = []
     with open(path, encoding=encoding, newline="") as f:
         reader = csv.DictReader(f)
+        header = list(reader.fieldnames or [])
         for raw in reader:
             row: dict = {}
             for csv_col, key in HR_CSV_COLUMNS.items():
                 row[key] = (raw.get(csv_col) or "").strip()
+            row["copy_body"] = compose_copy_body(raw, header)
+            row["copy_images"] = compose_copy_images(raw, header)
             rows.append(row)
     return rows
 
@@ -176,6 +251,8 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
     target_props = ["id_hrhakkaa", "hs_name", "url_hrhakkaa",
                     "id_shop_hrhakkaa",
                     PROP_HS_KYUUJIN_STATUS, PROP_MEDIA_ORIG_STATUS,
+                    # 本文・画像は値が変わったときだけ書くため、今の値を読む
+                    PROP_COPY_BODY, PROP_COPY_IMAGES,
                     # ステージ保護判定に必要 (2026-08-06): 現ステージが
                     # 選考進行中/採用決定なら機械は上書きしない
                     "hs_pipeline_stage"]
@@ -268,6 +345,9 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
         if ms is not None:
             p[prop] = ms
 
+    # 求人票の本文・画像: 値が変わったときだけ (プロパティ履歴 = 版の履歴)
+    p.update(copy_props(row, existing_props))
+
     return p
 
 
@@ -342,6 +422,9 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
     p[PROP_KONKAI_CSV_FLAG] = "true"
     p[PROP_LAST_SYNCED] = now_iso
     p[PROP_DOUKI_FILENAME] = source_filename
+
+    # 求人票の本文・画像 (最初の版)
+    p.update(copy_props(row, None))
 
     return p
 
