@@ -177,12 +177,14 @@ def test_HRとAWで入れる場所が変わる(monkeypatch):
                  mails={"exact": {"shop@example.com": "kanri+sample@example.com"},
                         "lower": {"shop@example.com": "kanri+sample@example.com"},
                         "ok": True})
-    by = {r["入れる鍵"]: r for r in rows}
-    assert "HRハッカー店舗ID" in by["S1"]["入れる場所"]
-    assert "S1" in by["S1"]["入れる場所"], "入れるべき値そのものを提示する"
-    aw = by["shop@example.com"]["入れる場所"]
+    by = {r["媒体"]: r for r in rows}
+    assert "HRハッカー店舗ID" in by["HRハッカー"]["入れる場所"]
+    assert "S1" in by["HRハッカー"]["入れる場所"], "入れるべき値そのものを提示する"
+    aw = by["AirWork"]["入れる場所"]
     assert "管理用メールアドレス" in aw
-    assert "kanri+sample@example.com" in aw, "本番の紐付けが引く値をそのまま出す"
+    # ★2026-10-08: 一覧は公開の Actions 成果物になる。メールは伏せ、引き方を添える
+    assert "kanri+sample@example.com" not in aw and "ka…" in aw
+    assert "顧客管理シート" in aw and "HubSpot求人リンク" in aw
 
 
 def test_会社名の候補が付く(monkeypatch):

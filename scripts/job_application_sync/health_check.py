@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import re
 import os
 import sys
 import time
@@ -393,6 +395,28 @@ def _manage_mail_hint() -> dict:
     return res
 
 
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _mask(v) -> str:
+    """ログインID・メールの伏字。先頭2文字だけ残す (applicant_sync.mask_secret と同じ規則)。"""
+    v = str(v or "")
+    return (v[:2] + "…") if len(v) > 2 else "…"
+
+
+def _scrub(text, secrets=()) -> str:
+    """既知のログインID・管理用メールと、メール形式の文字列をすべて伏せる。
+
+    ★2026-10-08: 要対応リストは公開リポジトリの Actions 成果物 (CSV) になり、
+      「入れる鍵」「入れる場所」に AWログインIDと管理用メールがそのまま出ていた。
+    """
+    t = str(text)
+    for v in sorted({str(x) for x in secrets if x and len(str(x)) >= 3},
+                    key=len, reverse=True):
+        t = t.replace(v, _mask(v))
+    return _EMAIL.sub(lambda m: _mask(m.group(0)), t)
+
+
 def check_recent_listings_linked() -> dict:
     """最近作られた求人が取引に紐付いているか。
 
@@ -751,6 +775,7 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
     funnel["要対応の鍵"] = len(groups)
 
     keyrows = []
+    secrets: set = set()   # AWログインID・管理用メール。行を出す直前にまとめて伏せる
     for (kind, _k), g in groups.items():
         keyval = g["鍵"]
         note = ""
@@ -811,6 +836,7 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
                 kubun = "顧客管理シートに未登録（先にシートを直す）"
                 place = ("このAWログインIDは顧客管理シートに1行も無い。"
                          "取引ではなく先にシートへ行を足す（宛先はシート管理者）")
+            secrets.update(x for x in (keyval, km, km_low) if x)
         if g["死"]:
             # 鍵は既にどこかに在る。無い場所へ入れるのではなく**移す**作業。
             kubun = "終了した取引にだけ紐付いている（生きている取引へ鍵を入れ替える）"
@@ -820,6 +846,11 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
                         if kind == "hr" else
                         "管理用メールアドレス に同じアドレスを追記")
                      + "してください")
+        if kind == "aw":
+            # ★ID・メールは伏せて出すので、正しい値の引き方を添える
+            place += ("（ログインID・メールは公開ログに出さないため先頭2文字のみ。"
+                      "正しい値は「HubSpot求人リンク」の求人のAWログインIDと、"
+                      "顧客管理シートの同じ行の管理用メールで確認）")
 
         names = [(props[x].get("hs_name") or "")[:40] for x in g["求人"]]
         urls = [(props[x].get("url_hrhakkaa") or props[x].get("url_airwork") or "")
@@ -830,6 +861,9 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
             "対応区分": kubun,
             "媒体": g["媒体"],
             "入れる鍵": keyval,
+            # 伏せた鍵でも前回との差分が取れるよう、鍵から作った番号を差分キーにする
+            "鍵の照合番号": (hashlib.sha256(keyval.encode("utf-8")).hexdigest()[:10]
+                             if keyval else ""),
             "入れる場所": place,
             "応募数": len(g["応募"]),
             "影響する求人数": len(g["求人"]),
@@ -869,7 +903,7 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
         cur["_apps"] |= r.pop("_apps")
         cur["影響する求人数"] += r["影響する求人数"]
         cur["作業回数"] += 1
-        for col, sep in (("媒体", " / "), ("入れる鍵", " / "),
+        for col, sep in (("媒体", " / "), ("入れる鍵", " / "), ("鍵の照合番号", " / "),
                          ("対応区分", " ＋ "), ("入れる場所", " ／ "),
                          ("現在の紐付け先(終了した取引)", " / "),
                          ("求人名の例", " / ")):
@@ -883,6 +917,11 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
     for r in merged.values():
         r["応募数"] = len(r.pop("_apps"))
         rows.append(r)
+    # 畳んだ後に伏せる (伏字同士は先頭2文字で衝突し、畳む時の重複判定を壊すため)
+    for r in rows:
+        for k, v in r.items():
+            if isinstance(v, str):
+                r[k] = _scrub(v, secrets)
     funnel["要対応の顧客(会社に畳んだ後)"] = len(rows)
 
     # 応募が多い順 = 放置の実害が大きい順。上位数件をSlackに出すのでここで決まる
@@ -971,7 +1010,7 @@ def check_unlinked_listings_by_customer() -> dict:
         # ★Slackに出す列を明示する。先頭N列という暗黙のルールだと、列を足した
         #   瞬間に「対応区分」や「入れる場所」が通知から消える (2026-08-17)。
         "slack_cols": ["会社名", "対応区分", "入れる鍵", "応募数", "影響する求人数"],
-        "item_key": "入れる鍵",
+        "item_key": "鍵の照合番号",
         "action": "「会社名」で納品管理PL(リクロジ_納品管理)の取引を開き、"
                   "「入れる場所」のとおりに「入れる鍵」を入れる。"
                   "会社名が空の行は「HubSpot求人リンク」を開けば求人が分かる。"

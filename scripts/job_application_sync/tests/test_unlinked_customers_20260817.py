@@ -346,10 +346,11 @@ def test_シートに無いAWは別区分にする(monkeypatch):
           listing2deal={},
           listing_props={"L1": _listing("L1", login="known@example.com"),
                          "L2": _listing("L2", login="unknown@example.com")})
+    # ★2026-10-08: 鍵は伏せて出す (公開の Actions 成果物になるため)
     rows = {r["入れる鍵"]: r for r in hc.collect_unlinked_customers()["rows"]}
-    assert rows["known@example.com"]["対応区分"] == "取引に管理用メールを入れる"
-    assert "kanri+sample@example.com" in rows["known@example.com"]["入れる場所"]
-    assert rows["unknown@example.com"]["対応区分"] == "顧客管理シートに未登録（先にシートを直す）"
+    assert rows["kn…"]["対応区分"] == "取引に管理用メールを入れる"
+    assert "ka…" in rows["kn…"]["入れる場所"]
+    assert rows["un…"]["対応区分"] == "顧客管理シートに未登録（先にシートを直す）"
 
 
 def test_索引を作れなければシートに未登録と断定しない(monkeypatch):

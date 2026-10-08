@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime
@@ -70,6 +71,40 @@ def _mask(v) -> str:
     """ログインIDを公開のActionsログに出さない (2026-10-05)。先頭2文字だけ残す。"""
     v = str(v or "")
     return (v[:2] + "…") if len(v) > 2 else "…"
+
+
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _scrub(text, secrets=()) -> str:
+    """例外文に埋め込まれたログインID等を伏せる (2026-10-08)。
+
+    ★aw_csv_fetcher の例外文は `login_id=...` を生のまま含む。公開リポジトリの
+      Actions ログに出る直前で、既知の値とメール形式の文字列をまとめて伏せる。
+    """
+    t = str(text or "")
+    for v in sorted({str(x) for x in secrets if x and len(str(x)) >= 3},
+                    key=len, reverse=True):
+        t = t.replace(v, _mask(v))
+    return _EMAIL.sub(lambda m: _mask(m.group(0)), t)
+
+
+def _summary_lines(results: list) -> list:
+    """顧客別 実行結果サマリの行。ログインIDと理由は伏せる。"""
+    lines = []
+    for r in results:
+        raw = r.get("login_id") or ""
+        lid = _mask(raw) if raw else "?"
+        cname = r.get("company_name", "")
+        if r.get("status") == "ok":
+            res = r.get("result") or {}
+            lines.append(f"  ✅ OK   {lid} {cname} "
+                         f"新規={res.get('creates_planned', res.get('creates', '?'))} "
+                         f"更新={res.get('updates_planned', res.get('updates', '?'))}")
+        else:
+            why = _scrub(r.get("error") or "不明", [raw])[:120]
+            lines.append(f"  ❌ NG   {lid} {cname} 理由={why}")
+    return lines
 
 def _extract_xlsx_from_zip(zip_or_xlsx: Path) -> Path:
     """ZIP なら中の .xlsx を temp に展開して返す。既に xlsx ならそのまま返す。
@@ -622,18 +657,8 @@ async def orchestrate(parallel: int = 5,
     # 顧客別 実行結果サマリ (エラー時も必ず結果を可視化する — 2026-07-07 ユーザー要望)
     # 「上手くいったのか失敗したのか」をログを開かずに判別できるようにする。
     print("[orchestrate-summary] 顧客別 実行結果:", flush=True)
-    for r in sanitized:
-        lid = r.get("login_id", "?")
-        cname = r.get("company_name", "")
-        if r.get("status") == "ok":
-            res = r.get("result") or {}
-            print(f"  ✅ OK   {lid} {cname} "
-                  f"新規={res.get('creates_planned', res.get('creates', '?'))} "
-                  f"更新={res.get('updates_planned', res.get('updates', '?'))}",
-                  flush=True)
-        else:
-            print(f"  ❌ NG   {lid} {cname} 理由={r.get('error', '不明')[:120]}",
-                  flush=True)
+    for line in _summary_lines(sanitized):
+        print(line, flush=True)
 
     print(
         f"[orchestrate-done] ok={ok} ng={ng} total={total} log={log_path}",
