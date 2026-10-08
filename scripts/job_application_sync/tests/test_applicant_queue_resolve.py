@@ -6,12 +6,12 @@
    C列は「担当者 <実ドメイン>, 担当者 <リクロジのエイリアス>」の形で、
    どちらが先かは行によって違う。1つ目しか見ていなかったため、
    会社名だけが頼りになり事業所を決められず未突合になっていた。
-   実測: 未突合35件 → 13件が新たに突合 (ヒノデ産業→栃木支店 等)。
+   実測: 未突合35件 → 13件が新たに突合 (ミホン産業→栃木支店 等)。
 
 2. **共用メールキーでは勝手に1社を選ばない**
    顧客管理シート 2,017行のうち59キーが2社以上で共用されている。
    従来は dict の後勝ちで「シートの後ろの行」が根拠なく勝っていた。
-   例 cZq81Kp+AAa11Bb@example.com = 東日本WMS 西部PC/中部PC/東部PC。
+   例 cZq81Kp+AAa11Bb@example.com = 例示WMS 西部PC/中部PC/東部PC。
    会社名で1社に絞れなければ突合しない (未突合として人へ回す)。
    誤配より未突合が安全。うち14キーは解約済と稼働中が混在しており、
    後勝ちで解約済が勝つと稼働中の顧客の応募が恒久SKIPされる。
@@ -80,9 +80,9 @@ def _item(company: str, emails: list[str]) -> QueueItem:
 # 1. C列の全メール抽出
 # --------------------------------------------------------------------------
 def test_all_emails_出現順に全部拾う():
-    s = "高橋 <y-takahashi@example.co.jp>, 高橋 <cZq81Kp+CCc22Dd@example.com>"
+    s = "高橋 <y-sample@example.co.jp>, 高橋 <cZq81Kp+CCc22Dd@example.com>"
     assert _all_emails(s) == [
-        "y-takahashi@example.co.jp", "cZq81Kp+CCc22Dd@example.com"]
+        "y-sample@example.co.jp", "cZq81Kp+CCc22Dd@example.com"]
 
 
 def test_all_emails_重複は1つに畳む():
@@ -103,18 +103,18 @@ def test_all_emails_空なら空リスト():
 # 2. 2つ目以降のメールで突合できる
 # --------------------------------------------------------------------------
 def test_2つ目のエイリアスで事業所まで決まる():
-    """ヒノデ産業の実例。1つ目=実ドメイン(シートに無い)、2つ目=エイリアス。
+    """ミホン産業の実例。1つ目=実ドメイン(シートに無い)、2つ目=エイリアス。
 
-    会社名「ヒノデ産業株式会社」だけでは栃木支店か決められないが、
+    会社名「ミホン産業株式会社」だけでは栃木支店か決められないが、
     エイリアスが栃木支店の行にしか無いので一意に決まる。
     """
-    rows = [_row("ヒノデ産業株式会社　栃木支店",
+    rows = [_row("ミホン産業株式会社　栃木支店",
                  alias="cZq81Kp+CCc22Dd@example.com")]
     acc = _resolver(rows).resolve(
-        _item("ヒノデ産業株式会社",
-              ["y-takahashi@example.co.jp", "cZq81Kp+CCc22Dd@example.com"]))
+        _item("ミホン産業株式会社",
+              ["y-sample@example.co.jp", "cZq81Kp+CCc22Dd@example.com"]))
     assert acc is not None
-    assert acc.company == "ヒノデ産業株式会社　栃木支店"
+    assert acc.company == "ミホン産業株式会社　栃木支店"
     assert "2件目以降" in acc.matched_by
 
 
@@ -138,26 +138,26 @@ def test_どのメールでも引けなければ未突合():
 # 3. 共用キーで勝手に1社を選ばない (誤配防止)
 # --------------------------------------------------------------------------
 def test_共用キーは会社名で絞れなければ突合しない():
-    """東日本WMSの実例。同じエイリアスが3事業所にぶら下がっている。
+    """例示WMSの実例。同じエイリアスが3事業所にぶら下がっている。
 
-    会社名「株式会社東日本WMS」はどの事業所とも一致しないので、
+    会社名「株式会社例示WMS」はどの事業所とも一致しないので、
     機械では決められない → None (人へ回す)。
     従来は dict の後勝ちで西部PCが根拠なく選ばれていた。
     """
     shared = "cZq81Kp+AAa11Bb@example.com"
-    rows = [_row("株式会社東日本WMS東部PC", alias=shared),
-            _row("株式会社東日本WMS中部PC", alias=shared),
-            _row("株式会社東日本WMS西部PC", alias=shared)]
+    rows = [_row("株式会社例示WMS東部PC", alias=shared),
+            _row("株式会社例示WMS中部PC", alias=shared),
+            _row("株式会社例示WMS西部PC", alias=shared)]
     assert _resolver(rows).resolve(
-        _item("株式会社東日本WMS", [shared])) is None
+        _item("株式会社例示WMS", [shared])) is None
 
 
 def test_共用キーでも会社名が完全一致すれば決まる():
     shared = "shared@example.com"
-    rows = [_row("株式会社東日本WMS東部PC", alias=shared),
-            _row("株式会社東日本WMS西部PC", alias=shared)]
-    acc = _resolver(rows).resolve(_item("株式会社東日本WMS西部PC", [shared]))
-    assert acc is not None and acc.company == "株式会社東日本WMS西部PC"
+    rows = [_row("株式会社例示WMS東部PC", alias=shared),
+            _row("株式会社例示WMS西部PC", alias=shared)]
+    acc = _resolver(rows).resolve(_item("株式会社例示WMS西部PC", [shared]))
+    assert acc is not None and acc.company == "株式会社例示WMS西部PC"
 
 
 def test_共用キーで解約済が後勝ちしない():
@@ -167,9 +167,9 @@ def test_共用キーで解約済が後勝ちしない():
     絞れないなら None を返し、人が判断する。
     """
     shared = "marukyo@example.com"
-    rows = [_row("丸協運輸株式会社 東京営業所", alias=shared, closed=False),
-            _row("丸協運輸株式会社堺センター", alias=shared, closed=True)]
-    acc = _resolver(rows).resolve(_item("丸協運輸株式会社", [shared]))
+    rows = [_row("例示丸運輸株式会社 東京営業所", alias=shared, closed=False),
+            _row("例示丸運輸株式会社堺センター", alias=shared, closed=True)]
+    acc = _resolver(rows).resolve(_item("例示丸運輸株式会社", [shared]))
     assert acc is None, "絞れないのに解約済を掴んではいけない"
 
 

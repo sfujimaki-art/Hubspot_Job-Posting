@@ -56,7 +56,11 @@ from scripts.job_application_sync.listing_stage import (  # noqa: E402
     PROTECTED_STAGES, STATUS_TO_STAGE)
 
 BASE = "https://api.hubapi.com"
-PORTAL_ID = "23708633"    # リクロジ事業部。HubSpotレコードURLの組み立てに使う
+# HubSpotレコードURLの組み立てに使うポータルID。env HUBSPOT_PORTAL_ID で上書きできる
+# (notify_empty_anmokuchi と同じ変数名)。既定値は残す: ワークフローはこの env を
+# 渡していないので、外すと要対応リストの求人URLが壊れる。ポータルIDは HubSpot の
+# どのレコードURLにも出る値で、公開しても単独では何も開けない (2026-10-09)。
+PORTAL_ID = os.environ.get("HUBSPOT_PORTAL_ID", "").strip() or "23708633"
 RECENT_DAYS = 14          # 「最近作られた」の窓
 UNLINKED_DAYS = 30        # 「直近に応募が来た」の窓 (顧客単位の要対応リスト)
 SEARCH_CAP = 10000        # Search API の上限
@@ -888,7 +892,7 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
     # ★「顧客63件」は顧客数ではなく鍵の数だった (2026-08-17 是正)。
     #   実測: 会社名が引けた30行の実会社数は22社。1社が複数店舗IDを持つ
     #   (不二興産 1521249/1521250 等) / HRとAWの両方で未紐付け
-    #   (北星食品藤沢工場 = HR 1207059 + AW 別担当者のアドレス) で行が割れていた。
+    #   (見本食品藤沢工場 = HR 1234567 + AW 別担当者のアドレス) で行が割れていた。
     #   同じ取引を2回開かせる指示になるので、会社名が判明した行は畳む。
     #   会社名が引けない行は同一かどうか判定できないので畳まない(推測しない)。
     merged: dict = {}
@@ -1282,7 +1286,7 @@ def main(argv=None):
                     if alt:
                         parts.append(f"求人={alt}")
                 # ★項目の区切りは " | "。値の中で " / " を使っている列があるため
-                #   (入れる鍵が複数店舗IDのとき「1439800 / 1439813」)、
+                #   (入れる鍵が複数店舗IDのとき「1000001 / 1000002」)、
                 #   同じ記号だと列の境目が読めなくなる。
                 msg.append("　　- " + " | ".join(parts))
             if len(items) > 5:

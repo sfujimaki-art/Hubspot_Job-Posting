@@ -583,7 +583,7 @@ def sync(sheet_id: str, cutoff_iso: str, dry_run: bool = True,
         hdr = header
     body = {"values": [[r.get(c, "") for c in hdr] for r in new]}
     # RAW 必須 (2026-08-03): USER_ENTERED は手入力扱いで値を型変換するため
-    # 電話番号 07066452004 が数値化され先頭0が落ちる(顧客が発信できなくなる)。
+    # 電話番号 07000003333 が数値化され先頭0が落ちる(顧客が発信できなくなる)。
     # 応募IDの長い数値が指数表記になる事故も防ぐ。RAW は文字列をそのまま格納。
     resp = _exec(svc.spreadsheets().values().append(
         spreadsheetId=sheet_id, range=_a1("A1"),

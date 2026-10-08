@@ -332,7 +332,7 @@ jobs:
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
           echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI anmokuchi=$RC_ANMOKU memo=$RC_MEMO appt=$RC_APPT drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
-          # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
+          # いちばん危険 (見本テックの誤転記55件はdriftでしか気づけない)。
           NG=""
           [ $RC_CODE   -ne 0 ] && NG="$NG 取引先コードの補完"
           [ $RC_ROLLUP -ne 0 ] && NG="$NG 求人メモの取引への集約"
