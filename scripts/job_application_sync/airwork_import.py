@@ -8,7 +8,7 @@
 - 参照ベース: scripts/job_application_sync/hrhacker_import.py (A-1)
 
 ================================================================================
-Phase 0b 確定事項 (2026-06-26 株式会社山口 client_code=9999999 実測)
+Phase 0b 確定事項 (2026-06-26 株式会社見本 client_code=9999999 実測)
 ================================================================================
 - AW出力形式は **XLSX (Excel)** であり CSV ではない (ZIP圧縮で配布される)
 - 265列 / 1シート ("Sheet1") / 1行目ヘッダ
@@ -77,8 +77,10 @@ from dotenv import load_dotenv
 
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
     from . import listing_stage as _stage
+    from . import private_log as plog
 except ImportError:  # pragma: no cover
     import listing_stage as _stage  # type: ignore
+    import private_log as plog  # type: ignore
 
 try:
     import openpyxl  # type: ignore
@@ -184,7 +186,7 @@ AW_CSV_ENCODING = "utf-8-sig"
 # ----------------------------------------------------------------------------
 # RL_DETECT_COLUMN:
 #   None        → 【RL】判定を完全 disable (常に False = 全件 未判定)
-#                  Phase 0b 2026-06-26 株式会社山口 XLSX 実測で
+#                  Phase 0b 2026-06-26 株式会社見本 XLSX 実測で
 #                  「【RL】はまだない」とユーザー報告
 #   文字列キー  → 内部キー (AW_*_COLUMNS の値側) を指定して contains/exact 判定
 #                  (旧 CSV 経路で "rl_flag" を有効にしたい場合などに使用)
@@ -743,9 +745,11 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     print(f"=== airwork_import (dry_run={dry_run}) ===")
-    print(f"INPUT: {input_path}")
+    # ★ファイル名にログインIDが入る (aw_{login_id}_{ts}.zip)。公開ログには拡張子だけ (2026-10-09)
+    print(f"INPUT: *{Path(input_path).suffix} (ファイル名は非公開ログ)")
+    plog.detail("airwork_import_input", path=input_path, login_id=login_id)
     # ★ログインIDは公開のActionsログに出さない (2026-10-05)。先頭2文字だけ
-    print(f"login_id: {(str(login_id)[:2] + '…') if login_id else '(なし)'}")
+    print(f"login_id: {plog.mask_name(login_id) or '(なし)'}")
 
     rows = load_aw_input(input_path, login_id=login_id, sheet=sheet,
                          strict_client_code=strict_client_code)
@@ -849,10 +853,13 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         })
         print(f"  更新: OK={u_ok} NG={u_ng}")
         print(f"  作成: OK={c_ok} NG={c_ng}")
+        # HubSpot のエラー文は値 (会社名など) を含みうるので件数だけ。本文は非公開ログ
         if u_err:
-            print(f"  更新エラー: {u_err[:3]}")
+            print(f"  更新エラー: {len(u_err)}件 (内容は非公開ログ)")
+            plog.detail("airwork_import_update_errors", errors=u_err[:20])
         if c_err:
-            print(f"  作成エラー: {c_err[:3]}")
+            print(f"  作成エラー: {len(c_err)}件 (内容は非公開ログ)")
+            plog.detail("airwork_import_create_errors", errors=c_err[:20])
         # ③新規LISTINGに暗黙知テンプレNoteを付与 (best-effort, 既ピン留めはskip)
         try:
             from scripts.job_application_sync.notes import attach_template_notes
@@ -950,4 +957,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

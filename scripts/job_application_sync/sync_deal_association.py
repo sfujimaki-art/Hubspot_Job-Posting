@@ -41,6 +41,7 @@ _ENV = _REPO / ".env"
 if _ENV.exists():
     load_dotenv(_ENV)
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
 from scripts.job_application_sync.hs_paging import (  # noqa: E402
     list_all, search_all_by_id)
@@ -387,8 +388,11 @@ def associate_batch(pairs: list, sleep: float = 0.25) -> tuple:
                 try:
                     done |= _send([pair])
                 except Exception as e1:  # noqa: BLE001
-                    print(f"    ★紐付け失敗 求人={pair[0]} 取引={pair[1]}: "
-                          f"{str(e1)[:120]}", flush=True)
+                    # 取引IDは公開ログに出さない (2026-10-09)
+                    print(f"    ★紐付け失敗 求人={pair[0]} 取引={plog.mask_id(pair[1])}: "
+                          f"{type(e1).__name__} (内容は非公開ログ)", flush=True)
+                    plog.detail("deal_assoc_failed", listing_id=pair[0],
+                                deal_id=pair[1], error=str(e1)[:500])
                 time.sleep(sleep)
         ok |= done
         fail += len(chunk) - len(done)
@@ -397,9 +401,10 @@ def associate_batch(pairs: list, sleep: float = 0.25) -> tuple:
 
 
 def _write_review(rows: list, out_dir: Path) -> Path | None:
-    """別会社にまたがる求人の一覧。CI の成果物「要対応リスト」に乗る名前で出す。
+    """別会社にまたがる求人の一覧 (ローカルCSV)。
 
-    ★公開リポジトリの成果物なので、取引名(=顧客名)は入れずIDとコードだけ。
+    ★2026-10-09: CI の公開成果物にはしない。同じ行を非公開シートのタブ
+      「要対応_求人の紐付け先が別会社にまたがる」へ書く (run 内)。
     """
     if not rows:
         return None
@@ -440,6 +445,8 @@ def run(dry_run: bool = True, limit=None,
     rp = _write_review(review, out_dir)
     if rp:
         print(f"[review] 別会社にまたがる求人 {len(review)}件 → {rp}", flush=True)
+    # 旧: CI 成果物 (public)。非公開シートのタブを毎回全置換する。0件なら既存タブだけ空にする
+    plog.replace_list(REVIEW_TAB, review, create=bool(review))
 
     created = {}
     fail = 0
@@ -505,8 +512,14 @@ def _args(argv=None):
     return p.parse_args(argv)
 
 
+REVIEW_TAB = "要対応_求人の紐付け先が別会社にまたがる"
+
+
 if __name__ == "__main__":
     a = _args()
-    res = run(dry_run=a.dry_run, limit=a.limit)
+    try:
+        res = run(dry_run=a.dry_run, limit=a.limit)
+    finally:
+        plog.flush()
     # 紐付けの失敗を黙って成功にしない (CI の rc に出す)
     sys.exit(1 if res.get("associate_failed") else 0)

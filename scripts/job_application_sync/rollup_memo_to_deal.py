@@ -61,7 +61,9 @@ try:  # script実行/パッケージ両対応の二重import
     from scripts.job_application_sync.notes import (      # noqa: E402
         ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE, TRANSFER_SIGNATURE, patch_note)
     from scripts.job_application_sync.hs_paging import search_all_by_id  # noqa: E402
+    from scripts.job_application_sync import private_log as plog  # noqa: E402
 except ImportError:  # pragma: no cover
+    import private_log as plog  # type: ignore
     from rollup_merge import merge_bodies  # type: ignore
     from notes import (ROLLUP_SIGNATURE, TEMPLATE_SIGNATURE,  # type: ignore
                        TRANSFER_SIGNATURE, patch_note)
@@ -284,8 +286,11 @@ def apply_rollup_writes(todo: list) -> dict:
                 created += 1
         except Exception as exc:  # noqa: BLE001
             failed += 1
-            print(f"  ★失敗 deal={row['集約先ID']}: {type(exc).__name__}: "
-                  f"{str(exc)[:90]}", flush=True)
+            # 取引IDは公開ログに出さない (2026-10-09)
+            print(f"  ★失敗 deal={plog.mask_id(row['集約先ID'])}: {type(exc).__name__} "
+                  f"(内容は非公開ログ)", flush=True)
+            plog.detail("rollup_memo_failed", deal_id=row["集約先ID"],
+                        error=f"{type(exc).__name__}: {str(exc)[:500]}")
         time.sleep(0.1)
     return {"created": created, "updated": updated, "failed": failed,
             "created_notes": created_notes}
@@ -689,9 +694,12 @@ def main(argv=None):
         print(f"正規化で値が変わったケース: {len(CHANGED):,}件 "
               f"({len(uniq):,}種) → {cp.resolve()}")
     big = sorted(groups.items(), key=lambda x: -len(x[1]))[:2]
+    # メモ本文は顧客の情報なので公開ログには長さだけ (2026-10-09)。本文は非公開ログへ
     for (kind, kid), entries in big:
-        print(f"\n===== 例: {kind}={kid} (元求人{len(entries)}件) =====")
-        print(build_rollup_body(entries)[:900])
+        body = build_rollup_body(entries)
+        print(f"\n===== 例: {kind}={plog.mask_id(kid)} (元求人{len(entries)}件) "
+              f"本文{len(body):,}字 (本文は非公開ログ) =====")
+        plog.detail("rollup_memo_example", kind=kind, id=kid, body=body[:900])
     if not a.actual:
         print("\n(既定はCSV出力のみ。--actual で取引へNote作成)")
         return
@@ -705,4 +713,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

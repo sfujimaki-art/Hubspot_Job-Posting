@@ -47,6 +47,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_stages as DS       # noqa: E402
 from scripts.job_application_sync.hs_paging import post_retry    # noqa: E402
 
@@ -158,9 +159,12 @@ def probe(sheet_ids: list) -> dict:
             "CUSTOMER_SHEET_SA_JSON が未設定です。転記に使うSAで測らないと"
             "意味がありません (別のSAで測ると共有状況を読み違えます)")
     info = json.loads(Path(sa).read_text(encoding="utf-8"))
-    # ★SAのアドレスはログに出す。どのSAで測ったかが分からないと結果を信用できない。
-    #   これは自社のサービスアカウントであり、顧客の情報ではない。
-    print(f"測定に使うサービスアカウント: {info.get('client_email')}", flush=True)
+    # ★どのSAで測ったかが分からないと結果を信用できないので、見分けが付く
+    #   程度に伏せて出す。全文は非公開ログへ (2026-10-09: 公開ログに
+    #   サービスアカウントのメールを出さない)。
+    print(f"測定に使うサービスアカウント: {plog.mask_id(info.get('client_email'))}",
+          flush=True)
+    plog.detail("probe_service_account", client_email=info.get("client_email"))
 
     cred = service_account.Credentials.from_service_account_file(
         sa, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
@@ -234,4 +238,8 @@ def parse_args(argv=None):
 
 if __name__ == "__main__":
     a = parse_args()
-    sys.exit(main(open_only=not a.all_status))
+    try:
+        rc = main(open_only=not a.all_status)
+    finally:
+        plog.flush()
+    sys.exit(rc)

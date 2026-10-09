@@ -62,6 +62,7 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_master as DM  # noqa: E402
 from scripts.job_application_sync import deal_stages as DS  # noqa: E402
 from scripts.job_application_sync.hs_paging import search_all_by_id  # noqa: E402
@@ -219,8 +220,11 @@ def main(argv=None) -> int:
 
     print(f"=== 一次対応の8項目が空の取引 ({'send' if a.send else 'dry-run'}) ===", flush=True)
     print(f"納品管理PL {len(deals):,}件 → 対象 {len(targets)}件", flush=True)
+    # 担当者名は公開ログに出さない (2026-10-09)。内訳は非公開ログへ
     for owner, ds in groups.items():
-        print(f"  {owner}: {len(ds)}件", flush=True)
+        print(f"  {plog.mask_name(owner)}: {len(ds)}件", flush=True)
+    plog.detail("empty_anmokuchi_by_owner",
+                counts={owner: len(ds) for owner, ds in groups.items()})
     print(f"CSV: {csv_path}", flush=True)
 
     webhook = os.environ.get(ENV_WEBHOOK, "").strip()
@@ -240,4 +244,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    finally:
+        plog.flush()
+    sys.exit(rc)

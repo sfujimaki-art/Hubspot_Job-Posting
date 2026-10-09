@@ -54,9 +54,9 @@
 これがそれを同じ会社の取引すべてへ配る。**会社を経由するので事業所も契約も
 区別されない。** 実測した誤りは全てこれで説明がつく:
 
-    あさひ産業 群馬営業所   → 本社の RL00000033 (同じ会社に本社契約が多数)
-    デルタテック川越      → 茨城の RL00001207 (同一会社の2事業所が混在)
-    ルミナ・メンテナンス   → 別法人(全国梱包運輸倉庫)の RL00001235
+    例示産業A 群馬営業所   → 本社の RL99990033 (同じ会社に本社契約が多数)
+    例示テック川越      → 茨城の RL99991207 (同一会社の2事業所が混在)
+    例示メンテナンス   → 別法人(例示梱包倉庫)の RL99991235
                             (この取引は MERGE_OBJECTS の履歴も持つ)
 
 正常な経路は 316165404 の レコード作成(actionTypeId 0-14) で、計上から取引を
@@ -94,6 +94,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_stages as DS      # noqa: E402
 from scripts.job_application_sync.hs_paging import post_retry   # noqa: E402
 
@@ -233,9 +234,9 @@ def plan_updates(nouhin: dict, links: dict, keijo: dict, now=None) -> dict:
             #   犯人は無効化済みのワークフロー 1611321133
             #   「請求先&取引先コード転写 会社⇒取引」で、会社に紐づく取引"全部"へ
             #   同じコードを配る作りだったため、事業所も契約も区別されなかった。
-            #     あさひ産業 群馬営業所 → 本社の RL00000033
-            #     デルタテック川越   → 茨城の RL00001207
-            #     ルミナ・メンテナンス → 別法人(全国梱包運輸倉庫)の RL00001235
+            #     例示産業A 群馬営業所 → 本社の RL99990033
+            #     例示テック川越   → 茨城の RL99991207
+            #     例示メンテナンス → 別法人(例示梱包倉庫)の RL99991235
             #   計上側は契約単位で発番されており、そちらが正しい。
             if cands and own not in cands:
                 mismatch.append({"deal_id": did, "取引名": name,
@@ -266,13 +267,15 @@ def plan_updates(nouhin: dict, links: dict, keijo: dict, now=None) -> dict:
 def slack(message: str) -> bool:
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:300]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         return requests.post(url, json={"text": message},
                              timeout=15).status_code == 200
     except requests.RequestException as e:  # noqa: BLE001
-        print(f"[slack送信失敗] {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -312,8 +315,13 @@ def main(dry_run: bool, limit, do_slack: bool,
           f"コード割れ {len(plan['conflict']):,}件 / "
           f"既存値と食い違い {len(plan['mismatch']):,}件 / "
           f"{STALE_DAYS}日超の要対応 {len(plan['stale']):,}件", flush=True)
+    # 取引ID・取引名・取引先コードは公開ログに出さない (2026-10-09)。全件は非公開ログへ
     for w in plan["write"][:6]:
-        print(f"    {w['deal_id']} {w['取引名'][:30]:<32} -> {w['code']}")
+        print(f"    {plog.mask_id(w['deal_id'])} {plog.mask_name(w['取引名']):<8} "
+              f"-> {plog.mask_id(w['code'])}")
+    for w in plan["write"]:
+        plog.detail("deal_code_plan", deal_id=w["deal_id"], name=w["取引名"],
+                    code=w["code"], before=w.get("before", ""), dry_run=dry_run)
 
     items = plan["write"][:limit] if limit else plan["write"]
     ok = ng = 0
@@ -326,8 +334,9 @@ def main(dry_run: bool, limit, do_slack: bool,
             print(f"[gate] {why}", flush=True)
             return 2
         if proceed_after:
-            print(f"[gate] 承認: {operator} / 実行可能時刻 {proceed_after}",
+            print(f"[gate] 承認: {plog.mask_name(operator)} / 実行可能時刻 {proceed_after}",
                   flush=True)
+            plog.detail("deal_code_gate", operator=operator, proceed_after=proceed_after)
         for w in items:
             r = requests.patch(f"{BASE}/crm/v3/objects/0-3/{w['deal_id']}",
                                headers=_headers(),
@@ -340,7 +349,10 @@ def main(dry_run: bool, limit, do_slack: bool,
                              "after": w["code"]})
             else:
                 ng += 1
-                print(f"  [NG] {w['deal_id']}: {r.text[:120]}", flush=True)
+                print(f"  [NG] {plog.mask_id(w['deal_id'])}: HTTP {r.status_code} "
+                      f"(本文は非公開ログ)", flush=True)
+                plog.detail("deal_code_ng", deal_id=w["deal_id"],
+                            status=r.status_code, body=r.text[:500])
             time.sleep(0.06)
         print(f"  更新OK {ok:,} / NG {ng:,}", flush=True)
 
@@ -444,3 +456,5 @@ if __name__ == "__main__":
                   "　▶ 確認: Job Daily の deal_hygiene のログ "
                   "(backfill_deal_code_of_customer)")
         raise
+    finally:
+        plog.flush()

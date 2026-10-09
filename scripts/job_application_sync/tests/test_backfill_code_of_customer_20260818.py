@@ -60,8 +60,8 @@ def _keijo(code):
 # --------------------------------------------------------------------------
 def test_計上が1つなら書く():
     p = BC.plan_updates({"D1": _deal()}, {"D1": ["K1"]},
-                        {"K1": _keijo("RL00001867")}, now=NOW)
-    assert [w["code"] for w in p["write"]] == ["RL00001867"]
+                        {"K1": _keijo("RL99991867")}, now=NOW)
+    assert [w["code"] for w in p["write"]] == ["RL99991867"]
     assert p["waiting"] == 0
 
 
@@ -103,17 +103,17 @@ def test_既存値が計上と食い違えば計上で上書きする():
     犯人は無効化済みの 1611321133「請求先&取引先コード転写 会社⇒取引」で、
     会社に紐づく取引"全部"へ同じコードを配るため事業所も契約も区別しない。
     計上は契約単位の発番なのでそちらが正しい (2026-08-18 承認)。"""
-    p = BC.plan_updates({"D1": _deal(code="RL00001235")}, {"D1": ["K1"]},
-                        {"K1": _keijo("RL00001236")}, now=NOW)
-    assert [w["code"] for w in p["write"]] == ["RL00001236"]
-    assert p["mismatch"][0]["現在値"] == "RL00001235"
+    p = BC.plan_updates({"D1": _deal(code="RL99991235")}, {"D1": ["K1"]},
+                        {"K1": _keijo("RL99991236")}, now=NOW)
+    assert [w["code"] for w in p["write"]] == ["RL99991236"]
+    assert p["mismatch"][0]["現在値"] == "RL99991235"
 
 
 def test_上書き時は前値を残す():
     """★ロールバックできなければ本番で走らせてはいけない."""
-    p = BC.plan_updates({"D1": _deal(code="RL00000033")}, {"D1": ["K1"]},
-                        {"K1": _keijo("RL00001133")}, now=NOW)
-    assert p["write"][0]["before"] == "RL00000033"
+    p = BC.plan_updates({"D1": _deal(code="RL99990033")}, {"D1": ["K1"]},
+                        {"K1": _keijo("RL99991133")}, now=NOW)
+    assert p["write"][0]["before"] == "RL99990033"
 
 
 def test_新規補完には前値が無い():
@@ -125,8 +125,8 @@ def test_新規補完には前値が無い():
 
 def test_コードが割れていれば既存値があっても触らない():
     """割れている21件は上書き対象にもしない (機械では正解が決まらない)."""
-    p = BC.plan_updates({"D1": _deal(code="RL00001706")}, {"D1": ["K1", "K2"]},
-                        {"K1": _keijo("RL00001713"), "K2": _keijo("RL00001714")},
+    p = BC.plan_updates({"D1": _deal(code="RL99991706")}, {"D1": ["K1", "K2"]},
+                        {"K1": _keijo("RL99991713"), "K2": _keijo("RL99991714")},
                         now=NOW)
     assert not p["write"] and len(p["conflict"]) == 1
 
@@ -209,13 +209,13 @@ def test_同じコードで新旧が繋がる():
          "NEW": _deal(stage=LIVE, name="サブスク継続②＿A社"),
          "OPT": _deal(stage=LIVE, name="求人追加＿A社")}
     links = {"OLD": ["K1"], "NEW": ["K2"], "OPT": ["K3"]}
-    kj = {"K1": _keijo("RL00001469"), "K2": _keijo("RL00001469"),
-          "K3": _keijo("RL00001469")}
+    kj = {"K1": _keijo("RL99991469"), "K2": _keijo("RL99991469"),
+          "K3": _keijo("RL99991469")}
     p = BC.plan_updates(n, links, kj, now=NOW)
     by_code = {}
     for w in p["write"]:
         by_code.setdefault(w["code"], []).append(w["deal_id"])
-    assert sorted(by_code["RL00001469"]) == ["NEW", "OLD", "OPT"], \
+    assert sorted(by_code["RL99991469"]) == ["NEW", "OLD", "OPT"], \
         "本体・オプション・跡地が1つの契約として束ねられる"
 
 

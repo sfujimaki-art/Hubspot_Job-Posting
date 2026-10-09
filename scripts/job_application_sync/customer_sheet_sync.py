@@ -43,6 +43,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 load_dotenv(_REPO / ".env")
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import deal_master as DM  # noqa: E402
 
 BASE = "https://api.hubapi.com"
@@ -551,7 +552,8 @@ def sync(sheet_id: str, cutoff_iso: str, dry_run: bool = True,
     new = [r for r in built if r[KEY_COL] and r[KEY_COL] not in existing]
     tab_state = ("既存" if header else
                  "既存(空)" if header is not None else "新規作成")
-    summary = {"sheet_id": sheet_id[:12] + "...", "対象応募": len(rows),
+    # シートIDは公開ログに出さない (2026-10-09)。全体は非公開ログへ
+    summary = {"sheet_id": plog.mask_id(sheet_id), "対象応募": len(rows),
                "既存(スキップ)": len(rows) - len(new) - len(noid),
                "追記": len(new), "ID無し(要調査)": len(noid),
                "タブ": tab_state, "dry_run": dry_run}
@@ -581,7 +583,7 @@ def sync(sheet_id: str, cutoff_iso: str, dry_run: bool = True,
         hdr = header
     body = {"values": [[r.get(c, "") for c in hdr] for r in new]}
     # RAW 必須 (2026-08-03): USER_ENTERED は手入力扱いで値を型変換するため
-    # 電話番号 07066452004 が数値化され先頭0が落ちる(顧客が発信できなくなる)。
+    # 電話番号 07000003333 が数値化され先頭0が落ちる(顧客が発信できなくなる)。
     # 応募IDの長い数値が指数表記になる事故も防ぐ。RAW は文字列をそのまま格納。
     resp = _exec(svc.spreadsheets().values().append(
         spreadsheetId=sheet_id, range=_a1("A1"),
@@ -603,6 +605,9 @@ def sync(sheet_id: str, cutoff_iso: str, dry_run: bool = True,
     summary["書込完了"] = len(new)
     print(f"[customer_sheet_sync] 書込={len(new)}行 "
           f"range={up.get('updatedRange')}", flush=True)
+    plog.detail("customer_sheet_written", sheet_id=sheet_id, rows=len(new),
+                range=up.get("updatedRange"),
+                applicant_ids=[r[KEY_COL] for r in new][:100])
     _mark_transferred([r[KEY_COL] for r in new])
     return summary
 
@@ -634,8 +639,11 @@ def run_all(dry_run: bool = True) -> dict:
         except Exception as e:  # noqa: BLE001 — 1社の異常で全体を止めない
             fail += 1
             errors.append(f"{sid[:10]}…: {type(e).__name__}: {str(e)[:60]}")
-            print(f"[customer_sheet_sync] ❌ {sid[:10]}… "
-                  f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+            # 例外文はシートIDを含みうるので公開ログは型名だけ
+            print(f"[customer_sheet_sync] ❌ {plog.mask_id(sid)} "
+                  f"{type(e).__name__} (内容は非公開ログ)", flush=True)
+            plog.detail("customer_sheet_failed", sheet_id=sid,
+                        error=f"{type(e).__name__}: {str(e)[:500]}")
         time.sleep(0.3)
     res = {"sheets": len(allow), "ok": ok, "fail": fail, "wrote": wrote,
            "errors": errors, "cutoff": cutoff, "dry_run": dry_run}
@@ -666,4 +674,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

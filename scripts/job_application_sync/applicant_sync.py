@@ -49,6 +49,7 @@ from scripts.job_application_sync import applicant_queue as aq  # noqa: E402
 from scripts.job_application_sync import applicant_import as ai  # noqa: E402
 from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af  # noqa: E402
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 
 MAX_ATTEMPTS = 3
 LOCK_STALE_SEC = 15 * 60
@@ -190,18 +191,23 @@ class Ledger:
 # ============================================================================
 def slack_notify(message: str, dry_run: bool = False) -> bool:
     # dry-run 時は実送信せず表示のみ (テストのSlackノイズ防止)
+    # ★本文は会社名を含むので公開ログには出さない (2026-10-09)。非公開ログへ。
     if dry_run:
-        print(f"[slack(dry-run,未送信)] {message}", flush=True)
+        plog.public(f"[slack(dry-run,未送信)] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="dry-run", message=message)
         return False
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         r = requests.post(url, json={"text": message}, timeout=15)
         return r.status_code == 200
     except requests.RequestException as e:
-        print(f"[slack送信失敗] {e}: {message}", flush=True)
+        # 例外文は Webhook の URL を含みうるので型名だけ
+        plog.public(f"[slack送信失敗] {type(e).__name__} (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
 
 
@@ -254,7 +260,7 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
 
     ★以前は `len(missing)`(要求した数)を返していたため、ログには常に
       「求人fetch=24」と出るのに実際は7種しか取れていない、という状態を
-      誰も検知できなかった。2026-08-06 に全国梱包運輸倉庫 真岡営業所で
+      誰も検知できなかった。2026-08-06 に例示梱包倉庫 真岡営業所で
       応募97件が宙に浮いたが、その原因は「欲しかった求人IDのうち17種が
       AirWorkのエクスポートに含まれていなかった」ことで、**その事実が
       ログにもSlackにも一切残らなかった**のが実質的な問題だった。
@@ -429,11 +435,13 @@ def _process_aw_account_raw(
                 known_missing = [j for j in missing if j in known]
                 missing = [j for j in missing if j not in known]
                 if known_missing:
-                    print(f"  自己修復: {company[:18]} 求人の一覧に無いと確認済みの"
+                    print(f"  自己修復: {plog.mask_name(company)} 求人の一覧に無いと確認済みの"
                           f"求人ID {len(known_missing)}件は取り直さない", flush=True)
                 if missing:
-                    print(f"  自己修復: {company[:18]} 求人LISTING欠落"
+                    print(f"  自己修復: {plog.mask_name(company)} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
+                    plog.detail("aw_selfheal_acquire", company=company,
+                                missing_job_ids=missing)
                     absent: list = []
                     jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
                                                    absent_out=absent)
@@ -474,8 +482,10 @@ def _process_aw_account_raw(
                       error_rows=n_err, total=len(results))
         if n_err:
             result["error"] = (f"{bid}: 取込エラー {n_err}/{len(results)}行")
-            print(f"  ⚠️ {company[:18]}: 取込エラー {n_err}/{len(results)}行 "
+            print(f"  ⚠️ {plog.mask_name(company)}: 取込エラー {n_err}/{len(results)}行 "
                   f"(ok={ok})", flush=True)
+            plog.detail("aw_import_error_rows", company=company,
+                        error_rows=n_err, total=len(results), ok=ok)
         return result
     result["error"] = last_err or "有効なB系IDなし"
     return result
@@ -607,8 +617,8 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 # ★恒久除外にしない (2026-08-07)。
                 #   5分間隔なので3回失敗＝**15分で永久に見放す**設計だった。
                 #   2026-08-04 に媒体側のレイアウト変更で「DLボタン未検出」が
-                #   全社横断で発生し、フジタ/SKテック/郡山明星/ハンダ/
-                #   日産物流富山/オプス の6社が15分で除外された。ボタンを
+                #   全社横断で発生し、A社/B社/C社/D社/
+                #   E社/F社 の6社が15分で除外された。ボタンを
                 #   直しても**自動では戻らない**(実測: 8/04以降ずっと未処理)。
                 #   媒体側の一時障害と恒久的な設定不備を区別できないので、
                 #   時間を置いて必ず再試行する。
@@ -676,10 +686,11 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         summary["unresolved"] = len(need_action)
         summary["out_of_scope"] = len(out_of_scope)
         if out_of_scope:
-            media_names = ", ".join(sorted({
-                (u.company or "")[:12] for u in out_of_scope})[:4])
+            media_names = sorted({(u.company or "") for u in out_of_scope})
             print(f"[applicant_sync] スコープ外の媒体 {len(out_of_scope)}件 "
-                  f"(取込対象外。例: {media_names})", flush=True)
+                  f"/ {len(media_names)}社 (取込対象外。社名は非公開ログ)", flush=True)
+            plog.detail("out_of_scope_media", n=len(out_of_scope),
+                        companies=media_names[:50])
         if need_action:
             samp = ", ".join(f"{u.company[:14]}({u.login_id[:20]})"
                              for u in need_action[:5])
@@ -787,8 +798,9 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                         f"顧客管理シートに入っていません (応募{len(group)}件)\n"
                         f"→ シートに入れると、次の回から自動で取り込みます。"
                         f"入るまでこの社はログインせず、この通知も繰り返しません")
-                    print(f"  ❌ {company[:18]}: 認証なし (応募{len(group)}件・"
+                    print(f"  ❌ {plog.mask_name(company)}: 認証なし (応募{len(group)}件・"
                           f"ログインせず→Slack報告)", flush=True)
+                    plog.detail("aw_no_auth", company=company, applicants=len(group))
                 continue
             if ledger.meta("aw_noauth", ck).get("auth"):
                 ledger.set_meta("aw_noauth", ck, auth="")   # 認証が入った
@@ -838,10 +850,14 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 summary["linked"] += res.get("linked", 0)
                 summary["unlinked"] += res.get("unlinked", 0)
                 summary["no_listing_old"] += res.get("no_listing_old", 0)
-                print(f"  ✅ {company[:18]}: 応募{len(group)}件 "
+                print(f"  ✅ {plog.mask_name(company)}: 応募{len(group)}件 "
                       f"linked={res.get('linked')} unlinked={res.get('unlinked')} "
                       f"一覧に無い求人への古い応募={res.get('no_listing_old', 0)} "
                       f"dup={res.get('dup')} 求人fetch={res.get('jobs_fetched')} (login={res.get('login_id')})", flush=True)
+                plog.detail("aw_account_ok", company=company, applicants=len(group),
+                            linked=res.get("linked"), unlinked=res.get("unlinked"),
+                            no_listing_old=res.get("no_listing_old", 0),
+                            dup=res.get("dup"), jobs_fetched=res.get("jobs_fetched"))
             else:
                 ledger.set_meta("aw_fail", ck, failed=True)
                 # 失敗 → リトライ回数を数え、上限超過で Slack 報告
@@ -854,11 +870,13 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                     slack_notify(dry_run=dry_run, message=
                         f"⚠️ 応募登録失敗: {company} / 理由={res['error']} / "
                         f"{atts}回試行済 / 要手動確認")
-                    print(f"  ❌ {company[:18]}: {res['error']} "
+                    print(f"  ❌ {plog.mask_name(company)}: {plog.redact(res['error'])} "
                           f"({atts}回→Slack報告)", flush=True)
                 else:
-                    print(f"  ⏳ {company[:18]}: {res['error']} "
+                    print(f"  ⏳ {plog.mask_name(company)}: {plog.redact(res['error'])} "
                           f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
+                plog.detail("aw_account_failed", company=company, error=res["error"],
+                            attempts=atts)
         # 自己修復の仕上げ: 今回求人を習得した場合、過去に取りこぼした(対象外)応募を
         # 習得した求人IDに絞ったピンポイントrelinkで即救出する。全走査+sortは
         # HubSpot検索のページング途切れで取りこぼすため、IDで直接引く(確実・軽量)。
@@ -903,7 +921,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     #   応募の取り込みは5分ごと、求人の取り込みは日3回。**同じ朝でも応募の
     #   ほうが先に走る**ため、その日に新しく掲載された求人へ来た応募は
     #   「求人が無い」状態でHubSpotに入る。
-    #   実例: 武田さんの応募 07:47:32 → 求人の作成 07:51:09 (3分37秒差)。
+    #   実例: ある応募者の応募 07:47:32 → 求人の作成 07:51:09 (3分37秒差)。
     #   relink は日1回だったため紐付いたのは22:24で、現場は16:56に
     #   「求人票が紐づいていない」と報告していた。**約15時間、現場は
     #   紐づいていない画面を見ていた**。
@@ -1274,17 +1292,24 @@ def _parse_args(argv=None):
     return p.parse_args(argv)
 
 
-if __name__ == "__main__":
+def _main() -> None:
     a = _parse_args()
     if a.relink:
         relink(dry_run=a.dry_run)
-        sys.exit(0)
+        return
     if a.propagate:
         propagate_from_listing(dry_run=a.dry_run)
-        sys.exit(0)
+        return
     if a.reconcile:
         reconcile(dry_run=a.dry_run)
-        sys.exit(0)
+        return
     run(dry_run=a.dry_run, limit_accounts=a.limit_accounts,
         media_filter=a.media, hr_date_from=a.hr_date_from,
         hr_date_to=a.hr_date_to, source=a.source, hr_cutoff_iso=a.hr_cutoff)
+
+
+if __name__ == "__main__":
+    try:
+        _main()
+    finally:
+        plog.flush()

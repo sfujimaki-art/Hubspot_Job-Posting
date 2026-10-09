@@ -47,6 +47,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 # 並列ジョブの依存 (別タスクで実装される / orchestrator 自体は import に依存しない)
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync.fetchers.account_loader import (  # type: ignore  # noqa: E402
     iter_aw_accounts,
     resolve_accounts_for_mails,
@@ -90,12 +91,15 @@ def _scrub(text, secrets=()) -> str:
 
 
 def _summary_lines(results: list) -> list:
-    """顧客別 実行結果サマリの行。ログインIDと理由は伏せる。"""
+    """顧客別 実行結果サマリの行。ログインID・会社名・理由は伏せる。
+
+    ★2026-10-09: 会社名も伏せる (公開ログ)。全文は非公開ログ (private_log)。
+    """
     lines = []
     for r in results:
         raw = r.get("login_id") or ""
         lid = _mask(raw) if raw else "?"
-        cname = r.get("company_name", "")
+        cname = plog.mask_name(r.get("company_name", ""))
         if r.get("status") == "ok":
             res = r.get("result") or {}
             lines.append(f"  ✅ OK   {lid} {cname} "
@@ -471,7 +475,8 @@ async def orchestrate(parallel: int = 5,
             r = await process_one(sem, acc, out_dir, dry_run, headless, phase="collect")
             done_count["n"] += 1
             print(f"[collect {done_count['n']}/{total}] {r['status']} "
-                  f"login_id={_mask(r.get('login_id'))} ({r.get('company','')[:18]})",
+                  f"login_id={_mask(r.get('login_id'))} "
+                  f"({plog.mask_name(r.get('company', ''))})",
                   flush=True)
             return r
         results = await asyncio.gather(*[_wrapped_c(a) for a in accounts])
@@ -498,6 +503,11 @@ async def orchestrate(parallel: int = 5,
             ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[collect-done] ok={ok} ng={ng} not_ready={nr}(再キュー) "
               f"queue残={len(new_q)} log={log_path}", flush=True)
+        for r in results:
+            if r.get("status") != "ok":
+                plog.detail("aw_collect_result", login_id=r.get("login_id"),
+                            company=r.get("company_name") or r.get("company"),
+                            status=r.get("status"), error=r.get("error", ""))
         return {"ok": ok, "ng": ng, "not_ready": nr, "total": total,
                 "log": str(log_path)}
 
@@ -584,7 +594,7 @@ async def orchestrate(parallel: int = 5,
         print(
             f"[done {done_count['n']}/{total}] {marker}"
             f"login_id={_mask(r.get('login_id'))} "
-            f"({r.get('company','')[:20]})",
+            f"({plog.mask_name(r.get('company', ''))})",
             flush=True,
         )
         return r
@@ -659,6 +669,11 @@ async def orchestrate(parallel: int = 5,
     print("[orchestrate-summary] 顧客別 実行結果:", flush=True)
     for line in _summary_lines(sanitized):
         print(line, flush=True)
+    for r in sanitized:
+        plog.detail("aw_account_result", phase=phase, login_id=r.get("login_id"),
+                    company=r.get("company_name") or r.get("company"),
+                    status=r.get("status"), error=r.get("error", ""),
+                    result=r.get("result"))
 
     print(
         f"[orchestrate-done] ok={ok} ng={ng} total={total} log={log_path}",
@@ -732,4 +747,7 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    main()
+    try:
+        main()
+    finally:
+        plog.flush()

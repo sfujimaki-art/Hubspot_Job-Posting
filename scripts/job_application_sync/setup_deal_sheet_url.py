@@ -10,7 +10,7 @@
       取引あたりのシート種類数   1種:432  2種:1
       契約あたりのシート種類数   1種:312  2種:2   ← 99.4% が「1契約=1シート」
 
-例外2契約 (RL00000787 / RL00000450) も「シートが2つ」ではなく、**古い取引と
+例外2契約 (RL99990787 / RL99990450) も「シートが2つ」ではなく、**古い取引と
 新しい取引でシートが変わった**ケースだった。契約単位で持つべき裏付けになる。
 
 求人票に置いていると:
@@ -63,9 +63,11 @@ for _s in (sys.stdout, sys.stderr):
 try:
     from scripts.job_application_sync.hs_paging import iter_all, post_retry  # noqa: E402
     from scripts.job_application_sync import deal_stages as DS  # noqa: E402
+    from scripts.job_application_sync import private_log as plog  # noqa: E402
 except ImportError:
     from hs_paging import iter_all, post_retry  # type: ignore
     import deal_stages as DS  # type: ignore
+    import private_log as plog  # type: ignore
 
 import os
 
@@ -280,8 +282,10 @@ def main(argv=None) -> int:
           f"  既に値がある(触らない): {len(plan['skip_has']):,}件\n"
           f"  人へ回す(2種類混在) : {len(plan['defer']):,}件", flush=True)
     for d in plan["defer"]:
-        print(f"   取引 {d['deal_id']} {d['code']} {d['name'][:30]}: "
-              f"{len(d['sheets'])}種のシート", flush=True)
+        print(f"   取引 {plog.mask_id(d['deal_id'])} {plog.mask_id(d['code'])} "
+              f"{plog.mask_name(d['name'])}: {len(d['sheets'])}種のシート", flush=True)
+        plog.detail("deal_sheet_url_defer", deal_id=d["deal_id"], code=d["code"],
+                    name=d["name"], sheets=len(d["sheets"]))
 
     res = apply_writes(plan["write"], a.actual)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -297,4 +301,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    finally:
+        plog.flush()
+    sys.exit(rc)

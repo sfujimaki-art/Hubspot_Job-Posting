@@ -50,12 +50,17 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):  # pragma: no cover
         pass
 
+from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync.hs_paging import post_retry, search_all  # noqa: E402
 from scripts.job_application_sync.listing_stage import (  # noqa: E402
     PROTECTED_STAGES, STATUS_TO_STAGE)
 
 BASE = "https://api.hubapi.com"
-PORTAL_ID = "23708633"    # リクロジ事業部。HubSpotレコードURLの組み立てに使う
+# HubSpotレコードURLの組み立てに使うポータルID。env HUBSPOT_PORTAL_ID で上書きできる
+# (notify_empty_anmokuchi と同じ変数名)。既定値は残す: ワークフローはこの env を
+# 渡していないので、外すと要対応リストの求人URLが壊れる。ポータルIDは HubSpot の
+# どのレコードURLにも出る値で、公開しても単独では何も開けない (2026-10-09)。
+PORTAL_ID = os.environ.get("HUBSPOT_PORTAL_ID", "").strip() or "23708633"
 RECENT_DAYS = 14          # 「最近作られた」の窓
 UNLINKED_DAYS = 30        # 「直近に応募が来た」の窓 (顧客単位の要対応リスト)
 SEARCH_CAP = 10000        # Search API の上限
@@ -119,12 +124,14 @@ def _window_start_ms(days: int) -> tuple:
 def slack_notify(message: str) -> bool:
     url = os.environ.get("SLACK_APPLICANT_ALERT_WEBHOOK", "")
     if not url:
-        print(f"[slack未設定] {message[:300]}", flush=True)
+        plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
+        plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
     try:
         r = requests.post(url, json={"text": message}, timeout=15)
     except requests.RequestException as e:
-        print(f"[slack送信失敗] {type(e).__name__}: {e}", flush=True)
+        plog.public(f"[slack送信失敗] {type(e).__name__} (例外文はURLを含みうるため非公開ログ)")
+        plog.detail("slack_unsent", reason=type(e).__name__, message=message)
         return False
     if r.status_code != 200:
         # ★失効(403)・削除(404)・payload拒否(400)を無音にしない。
@@ -885,7 +892,7 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
     # ★「顧客63件」は顧客数ではなく鍵の数だった (2026-08-17 是正)。
     #   実測: 会社名が引けた30行の実会社数は22社。1社が複数店舗IDを持つ
     #   (不二興産 1521249/1521250 等) / HRとAWの両方で未紐付け
-    #   (北星食品藤沢工場 = HR 1207059 + AW 別担当者のアドレス) で行が割れていた。
+    #   (見本食品藤沢工場 = HR 1234567 + AW 別担当者のアドレス) で行が割れていた。
     #   同じ取引を2回開かせる指示になるので、会社名が判明した行は畳む。
     #   会社名が引けない行は同一かどうか判定できないので畳まない(推測しない)。
     merged: dict = {}
@@ -1074,8 +1081,8 @@ def publish_to_sheet(rows: list, title: str) -> str:
                        [cols] + [[str(r.get(c, "")) for c in cols] for r in rows],
                        value_input_option="RAW")
         return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
-    except Exception as e:  # noqa: BLE001
-        print(f"      (共有シートへの書き出しに失敗: {type(e).__name__}: {e})",
+    except Exception as e:  # noqa: BLE001  例外文はシートIDを含みうるので型名だけ
+        print(f"      (共有シートへの書き出しに失敗: {type(e).__name__})",
               flush=True)
         return ""
 
@@ -1171,7 +1178,7 @@ def main(argv=None):
         mark = "OK" if r["value"] == r["want"] else ("ERR" if r["value"] < 0 else "NG")
         print(f"[{mark}] {r['name']}: {r['value']}")
         for d in r["detail"]:
-            print(f"      {d}")
+            print(f"      {_public_line(d)}")
 
     bad = [r for r in results if r["value"] != r["want"]]
     out = Path(a.out_dir)
@@ -1184,7 +1191,7 @@ def main(argv=None):
     #   通知は「誰が・何を・どこに入れるか」が分かる形にする。
     #   日付は JST。runner は UTC なので、そのままだと現場が見る日付の
     #   **前日**のファイル名になる (cron 40 16 * * * = JST 翌01:40)。
-    csv_paths, sheet_urls = {}, {}
+    csv_paths, sheet_urls, private_tabs = {}, {}, {}
     today = _jst_today().strftime("%Y-%m-%d")
     for r in results:
         items = r.get("items") or []
@@ -1212,7 +1219,17 @@ def main(argv=None):
         u = publish_to_sheet(items, f"要対応_{r['name'][:60]}")
         if u:
             sheet_urls[r["name"]] = u
-            print(f"      共有シート: {u}")
+            print("      共有シート: 書き出しました (URLは非公開)")
+        # ★2026-10-09: 公開の Actions 成果物の代わりに、非公開の顧客管理シート
+        #   (JAS_SHEET_ID) のタブへ全置換で書く。
+        tab = private_tab(r["name"])
+        if plog.replace_list(tab, items):
+            private_tabs[r["name"]] = tab
+            print(f"      非公開シートのタブへ書き出しました ({len(items):,}行)")
+    # 今回0件になった一覧は、既存タブを「該当なし」で上書きする (作りはしない)
+    for r in results:
+        if r["value"] == r["want"] and not r.get("items"):
+            plog.replace_list(private_tab(r["name"]), [], create=False)
 
     # ★前回との差分。これが無いと同じ顔ぶれが毎日通知され、現場が直した分が
     #   効いているのかも分からない (「3項目が恒久NGだと誰も見なくなる」の再来)。
@@ -1249,8 +1266,10 @@ def main(argv=None):
             #   (件数だけの停止検知や、母数0で判定できなかった日) にまで
             #   「対象一覧はここ」と出すと、開いても何も無いページへ飛ばす。
             if items and csv_paths.get(r["name"]):
-                where = (sheet_urls.get(r["name"]) or _artifact_hint()
-                         or csv_paths[r["name"]])
+                where = (sheet_urls.get(r["name"])
+                         or (f"顧客管理シートのタブ「{private_tabs[r['name']]}」"
+                             if private_tabs.get(r["name"]) else "")
+                         or _artifact_hint() or csv_paths[r["name"]])
                 msg.append(f"　▶ 対象一覧: {where}")
             if items:
                 msg.append("　▶ 上位5件 (応募が多い順 = 放置の実害が大きい順):")
@@ -1267,7 +1286,7 @@ def main(argv=None):
                     if alt:
                         parts.append(f"求人={alt}")
                 # ★項目の区切りは " | "。値の中で " / " を使っている列があるため
-                #   (入れる鍵が複数店舗IDのとき「1439800 / 1439813」)、
+                #   (入れる鍵が複数店舗IDのとき「1000001 / 1000002」)、
                 #   同じ記号だと列の境目が読めなくなる。
                 msg.append("　　- " + " | ".join(parts))
             if len(items) > 5:
@@ -1289,6 +1308,28 @@ def main(argv=None):
     if slack_ok is False:
         rc = 1
     return rc
+
+
+def private_tab(name: str) -> str:
+    """要対応の一覧を書く非公開シートのタブ名 (チェック名から決める)。"""
+    return f"要対応_{name}"[:90]
+
+
+_EXAMPLE = re.compile(r"^(\s*例:\s*)(.+)$")
+
+
+def _public_line(d) -> str:
+    """detail の1行を公開ログ用にする。
+
+    「例: 求人名」の行は求人名 (= 会社名・担当者名を含む) を伏せる。
+    ほかの行もメール形式の値は伏せる (例外文に混ざることがある)。
+    Slack にはこれまでどおり元の行を送る (Slack は非公開)。
+    """
+    s = str(d)
+    m = _EXAMPLE.match(s)
+    if m:
+        return m.group(1) + plog.mask_name(m.group(2))
+    return plog.redact(s)
 
 
 def _item_keys(r: dict) -> list:
@@ -1319,4 +1360,8 @@ def _diff_items(prev_keys, r: dict) -> dict:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    finally:
+        plog.flush()
+    sys.exit(rc)

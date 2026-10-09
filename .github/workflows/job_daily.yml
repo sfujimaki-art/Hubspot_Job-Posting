@@ -261,10 +261,10 @@ jobs:
           SHEETS_AUTH_MODE: sa
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
-          # ★Slackの「対象一覧」がアーティファクトのURLを名乗ってよいのは、
-          #   下の Upload ステップが実在するときだけ。health_check.py は
-          #   この env が在るときだけ実行ページURLを案内する。
-          HEALTH_ARTIFACT_NAME: 要対応リスト
+          # ★要対応リストは成果物にしない (2026-10-09)。リポジトリは public で
+          #   成果物も誰でも取れるため、非公開の顧客管理シート (JAS_SHEET_ID) の
+          #   タブへ書く (private_log.replace_list)。HEALTH_ARTIFACT_NAME は
+          #   成果物があるときだけ渡す env なので外した。
           PYTHONIOENCODING: utf-8
         run: |
           # schedule実行は常に本番。手動dispatchは inputs.dry_run に従う。
@@ -332,7 +332,7 @@ jobs:
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
           echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI anmokuchi=$RC_ANMOKU memo=$RC_MEMO appt=$RC_APPT drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
-          # いちばん危険 (SKテックの誤転記55件はdriftでしか気づけない)。
+          # いちばん危険 (見本テックの誤転記55件はdriftでしか気づけない)。
           NG=""
           [ $RC_CODE   -ne 0 ] && NG="$NG 取引先コードの補完"
           [ $RC_ROLLUP -ne 0 ] && NG="$NG 求人メモの取引への集約"
@@ -349,18 +349,3 @@ jobs:
             echo "::error title=取引まわりの日次処理が失敗::失敗した処理:$NG"
             exit 1
           fi
-      # health_check が出す「要対応リスト」を成果物として残す。
-      # ★これが無いとSlackの「対象一覧」が runner の使い捨てパスを指すだけで
-      #   **誰も開けない**。通知を見た人がその場で対象を取れる状態にする。
-      #   if: always() — 上のステップが失敗しても、そこまでに出たリストは要る。
-      #   name は Deal hygiene の HEALTH_ARTIFACT_NAME と一致させること。
-      - name: Upload 要対応リスト
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: 要対応リスト
-          path: |
-            data/job_application_sync/要対応_*.csv
-            data/job_application_sync/RPOアドレス*.csv
-          if-no-files-found: ignore
-          retention-days: 30
