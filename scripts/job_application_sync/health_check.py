@@ -1220,7 +1220,7 @@ def main(argv=None):
         if u:
             sheet_urls[r["name"]] = u
             print("      共有シート: 書き出しました (URLは非公開)")
-        # ★2026-10-09: 公開の Actions 成果物の代わりに、非公開の顧客管理シート
+        # ★2026-10-09: 公開の Actions 成果物の代わりに、非公開の集約シート
         #   (JAS_SHEET_ID) のタブへ全置換で書く。
         tab = private_tab(r["name"])
         if plog.replace_list(tab, items):
@@ -1267,7 +1267,7 @@ def main(argv=None):
             #   「対象一覧はここ」と出すと、開いても何も無いページへ飛ばす。
             if items and csv_paths.get(r["name"]):
                 where = (sheet_urls.get(r["name"])
-                         or (f"顧客管理シートのタブ「{private_tabs[r['name']]}」"
+                         or (f"集約シートのタブ「{private_tabs[r['name']]}」"
                              if private_tabs.get(r["name"]) else "")
                          or _artifact_hint() or csv_paths[r["name"]])
                 msg.append(f"　▶ 対象一覧: {where}")

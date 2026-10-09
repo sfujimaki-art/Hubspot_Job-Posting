@@ -258,7 +258,7 @@ def main(argv=None):
     print(f"人の確認が要る : {len(ambiguous):,}件")
     print(f"案(CSV): {p.resolve()}")
     # ★2026-10-09: 公開の Actions 成果物 (RPOアドレス*.csv) の代わりに、
-    #   非公開の顧客管理シートのタブへ全置換で書く (取引名・メールを含むため)。
+    #   非公開の集約シートのタブへ全置換で書く (取引名・メールを含むため)。
     plog.replace_list(PLAN_TAB, plan, create=bool(plan))
     q_tab_ok = plog.replace_list(AMBIGUOUS_TAB, ambiguous, create=bool(ambiguous))
     if ambiguous:
@@ -279,7 +279,7 @@ def main(argv=None):
             lines.append("▶ 放置すると: この顧客の求人が取引に紐付かず、"
                          "応募の一次対応の要否・担当者・応募先取引名が空のまま入る")
             lines.append("▶ 対象一覧: "
-                         + (f"顧客管理シートのタブ「{AMBIGUOUS_TAB}」" if q_tab_ok
+                         + (f"集約シートのタブ「{AMBIGUOUS_TAB}」" if q_tab_ok
                             else str(q.resolve())))
             for x in ambiguous[:5]:
                 lines.append(f"　- {x.get('取引名','')[:30]} "

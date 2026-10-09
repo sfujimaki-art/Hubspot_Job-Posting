@@ -260,9 +260,10 @@ jobs:
           GOOGLE_SA_JSON: /tmp/sa.json
           SHEETS_AUTH_MODE: sa
           JAS_SHEET_ID: ${{ secrets.JAS_SHEET_ID }}
+          JAS_APPLICANT_QUEUE_SHEET_ID: ${{ secrets.JAS_APPLICANT_QUEUE_SHEET_ID }}
           SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
           # ★要対応リストは成果物にしない (2026-10-09)。リポジトリは public で
-          #   成果物も誰でも取れるため、非公開の顧客管理シート (JAS_SHEET_ID) の
+          #   成果物も誰でも取れるため、非公開の集約シート (JAS_APPLICANT_QUEUE_SHEET_ID) の
           #   タブへ書く (private_log.replace_list)。HEALTH_ARTIFACT_NAME は
           #   成果物があるときだけ渡す env なので外した。
           PYTHONIOENCODING: utf-8
