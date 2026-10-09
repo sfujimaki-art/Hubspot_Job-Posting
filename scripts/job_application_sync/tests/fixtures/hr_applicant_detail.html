@@ -6,11 +6,46 @@
 <div class="content">
 <form method="post" accept-charset="utf-8" action="https://hr-hacker.com/admin/applicants/edit/900001">
   <input type="hidden" name="_method" value="PUT">
-  <input type="text" name="name" id="name" value="山田太郎">
-  <input type="text" name="name_kana" id="name-kana" value="ヤマダタロウ">
-  <input type="tel" name="tel" id="tel" value="090-0000-0000">
-  <input type="email" name="email" id="email" value="taro@example.com">
+  <input type="hidden" name="branch_id" value="55">
+  <input type="hidden" name="_csrf_token" value="fake-token">
   <ul class="box_fill_list">
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">氏名</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="name" id="name" value="山田太郎"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">フリガナ</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="name_kana" id="name-kana" value="ヤマダタロウ"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">生年月日</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="birthday" id="birthday" value="1990-01-01"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">性別</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><label for="sex-1"><input type="radio" name="sex_id" id="sex-1" value="1">男性</label>
+<label for="sex-2"><input type="radio" name="sex_id" id="sex-2" value="2" checked="checked">女性</label></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">面接日時</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="interview_at" id="interview-at" value=""></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">応募経路</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="route_id" id="route-id"><option value="">選択してください</option><option value="1">Indeed</option><option value="2" selected="selected">求人ボックス</option></select></div></div>
+      </div>
+    </li>
     <li class="box_fill_list_item box_fill_list_item_memo">
       <div class="box_fill_list_item_inner">
         <div class="box_fill_list_item_left"><p class="name">面接可能日時（3候補）</p></div>
@@ -54,6 +89,102 @@
         </div></div></div>
       </div>
     </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">現在の職業</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="occupation_id" id="occupation-id"><option value="">選択してください</option><option value="1">会社員</option><option value="2">学生</option></select></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">勤務可能期間</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><textarea name="work_period" id="work-period">3ヶ月以上</textarea></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">連絡希望日</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><textarea name="contact_desired_date" id="contact-desired-date">平日夕方</textarea></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">見学会希望日</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><textarea name="tour_desired_date" id="tour-desired-date"></textarea></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">電話番号</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="tel" name="tel" id="tel" value="090-0000-0000"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">メールアドレス</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="email" name="email" id="email" value="taro@example.com"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">連絡方法</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="contact_method" id="contact-method"><option value="1" selected>電話</option><option value="2">メール</option></select></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">郵便番号</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="zip" name="zip" id="zip" value="000-0000"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">都道府県</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="prefecture_id" id="prefecture-id"><option value="">選択してください</option><option value="13" selected>東京都</option><option value="14">神奈川県</option></select></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">市区町村</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="city" id="city" value="新宿区"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">町域</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="town" id="town" value=""></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">番地</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="address_line" id="address-line" value="1-2-3"></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">建物</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><input type="text" name="building" id="building" value=""></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">見学会希望</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="is_tour_desired" id="is-tour-desired"><option value="0" selected>なし</option><option value="1">あり</option></select></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">希望面接形態</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="is_interview_desired" id="is-interview-desired"><option value="0">来社</option><option value="1" selected>オンライン</option></select></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">選考ステータス</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><select name="selection_id" id="selection-id"><option value="1">未対応</option><option value="2" selected>面接調整中</option></select></div></div>
+      </div>
+    </li>
     <li class="box_fill_list_item box_fill_list_item_vtext box_fill_list_item_reason">
       <div class="box_fill_list_item_inner">
         <div class="box_fill_list_item_left"><p class="name">選考理由</p></div>
@@ -63,6 +194,7 @@
       </div>
     </li>
   </ul>
+  <input type="text" id="search-box" value="検索語">
   <input type="submit" class="btn btn-outline-secondary" value="更新">
 </form>
 <table class="history">

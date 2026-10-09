@@ -41,14 +41,17 @@ def test_詳細ページから質問文と回答を取る():
 
 def test_学歴や選考理由の欄はqaやmemoに混ざらない():
     d = hrf.parse_applicant_detail(DETAIL_HTML)
-    flat = str(d)
+    flat = str((d["qa"], d["memo"], d["selection_history"]))
     assert "○○大学" not in flat and "本文に出ない選考理由" not in flat
 
 
 def test_空の回答と空の履歴は飛ばす():
     d = hrf.parse_applicant_detail(EMPTY_HTML)
-    assert d == {"qa": [], "memo": "", "selection_history": []}
+    assert d["qa"] == [] and d["memo"] == "" and d["selection_history"] == []
+    assert d["fields"] == [{"name": "free_text_1", "label": "質問A", "value": ""},
+                           {"name": "memo", "label": "メモ", "value": ""}]
     assert hrf.format_page_values(d) == {}
+    assert hrf.format_all_fields(d) == ""
 
 
 def test_ログイン画面は専用の例外():
@@ -72,6 +75,109 @@ def test_書き込み用テキストの整形():
         "2026-10-01 10:00／未対応\n2026-10-02 15:30／面接調整中／日程を相談中")
 
 
+EXPECTED_FIELDS = [
+    ("name", "氏名", "山田太郎"),
+    ("name_kana", "フリガナ", "ヤマダタロウ"),
+    ("birthday", "生年月日", "1990-01-01"),
+    ("sex_id", "性別", "女性"),                       # radio: checked の label
+    ("interview_at", "面接日時", ""),
+    ("route_id", "応募経路", "求人ボックス"),          # select: selected の text
+    ("free_text_1", "面接可能日時（3候補）", "10/20 午前"),
+    ("free_text_2", "メールアドレス（indeed メール以外）", "taro.sub@example.com"),
+    ("free_text_3", "", "経験は3年です。\n土日も可能です。"),
+    ("school_career", "学歴", "○○大学 卒業"),
+    ("memo", "メモ （社内用）", "折り返し希望。\n夕方以降に電話。"),
+    ("occupation_id", "現在の職業", ""),               # selected なし / 「選択してください」
+    ("work_period", "勤務可能期間", "3ヶ月以上"),
+    ("contact_desired_date", "連絡希望日", "平日夕方"),
+    ("tour_desired_date", "見学会希望日", ""),
+    ("tel", "電話番号", "090-0000-0000"),
+    ("email", "メールアドレス", "taro@example.com"),
+    ("contact_method", "連絡方法", "電話"),
+    ("zip", "郵便番号", "000-0000"),
+    ("prefecture_id", "都道府県", "東京都"),
+    ("city", "市区町村", "新宿区"),
+    ("town", "町域", ""),
+    ("address_line", "番地", "1-2-3"),
+    ("building", "建物", ""),
+    ("is_tour_desired", "見学会希望", "なし"),
+    ("is_interview_desired", "希望面接形態", "オンライン"),
+    ("selection_id", "選考ステータス", "面接調整中"),
+    ("cause", "選考理由", "本文に出ない選考理由"),
+]
+
+
+def test_全項目fieldsをページ順に取る():
+    d = hrf.parse_applicant_detail(DETAIL_HTML)
+    assert d["fields"] == [{"name": n, "label": lb, "value": v}
+                           for n, lb, v in EXPECTED_FIELDS]
+    names = [f["name"] for f in d["fields"]]
+    # hidden / _method / csrf / 送信ボタン / name の無い検索欄は入らない
+    for skipped in ("_method", "branch_id", "_csrf_token"):
+        assert skipped not in names
+    assert "検索語" not in str(d["fields"])
+    # qa は従来どおり
+    assert len(d["qa"]) == 3
+
+
+def test_radioとcheckboxとselectの読み方():
+    html = """<form action="https://hr-hacker.com/admin/applicants/edit/1">
+    <ul><li class="box_fill_list_item"><div class="box_fill_list_item_left"><p class="name">希望</p></div>
+    <div><input type="checkbox" name="a[]" id="a1" value="1" checked><label for="a1">朝</label>
+    <input type="checkbox" name="a[]" id="a2" value="2"><label for="a2">昼</label>
+    <label><input type="checkbox" name="a[]" id="a3" value="3" checked> 夜</label></div></li>
+    <li class="box_fill_list_item"><div class="box_fill_list_item_left"><p class="name">区分</p></div>
+    <div><input type="radio" name="k" value="1">甲<input type="radio" name="k" value="2" checked>乙</div></li>
+    <li class="box_fill_list_item"><div class="box_fill_list_item_left"><p class="name">未選択</p></div>
+    <div><select name="s"><option value="">選択してください</option><option value="1">X</option></select></div></li>
+    </form>"""
+    d = hrf.parse_applicant_detail(html)
+    assert d["fields"] == [
+        {"name": "a[]", "label": "希望", "value": "朝、夜"},
+        {"name": "k", "label": "区分", "value": "乙"},
+        {"name": "s", "label": "未選択", "value": ""},
+    ]
+
+
+def test_全項目の書き込み用テキスト():
+    d = hrf.parse_applicant_detail(DETAIL_HTML)
+    assert hrf.format_all_fields(d) == (
+        "氏名：山田太郎\n"
+        "フリガナ：ヤマダタロウ\n"
+        "生年月日：1990-01-01\n"
+        "性別：女性\n"
+        "応募経路：求人ボックス\n"
+        "面接可能日時（3候補）：10/20 午前\n"
+        "メールアドレス（indeed メール以外）：taro.sub@example.com\n"
+        "free_text_3：経験は3年です。\n"
+        "　土日も可能です。\n"
+        "学歴：○○大学 卒業\n"
+        "メモ （社内用）：折り返し希望。\n"
+        "　夕方以降に電話。\n"
+        "勤務可能期間：3ヶ月以上\n"
+        "連絡希望日：平日夕方\n"
+        "電話番号：090-0000-0000\n"
+        "メールアドレス：taro@example.com\n"
+        "連絡方法：電話\n"
+        "郵便番号：000-0000\n"
+        "都道府県：東京都\n"
+        "市区町村：新宿区\n"
+        "番地：1-2-3\n"
+        "見学会希望：なし\n"
+        "希望面接形態：オンライン\n"
+        "選考ステータス：面接調整中\n"
+        "選考理由：本文に出ない選考理由")
+    assert hrf.format_page_values(d)["all_fields"] == hrf.format_all_fields(d)
+
+
+def test_all_fieldsを対応先に向けるとまとめて1プロパティ(monkeypatch):
+    monkeypatch.setitem(hrf.PAGE_FIELD_MAP, "all_fields", ("hr_all_test", "fill_empty"))
+    d = hrf.parse_applicant_detail(DETAIL_HTML)
+    assert hrf.active_page_fields({"hr_all_test"}) == {"all_fields": "hr_all_test"}
+    props = hrf.page_props_from_parsed(d, {"all_fields": "hr_all_test"})
+    assert props == {"hr_all_test": hrf.format_all_fields(d)}
+
+
 def test_メールの回答はmeeruadoresuと混ぜない(monkeypatch):
     """CSVのメール(meeruadoresu)と、自由項目の回答は別物。qaにだけ入る。"""
     monkeypatch.setitem(hrf.PAGE_FIELD_MAP, "qa", ("hr_qa_test", "fill_empty"))
@@ -92,7 +198,7 @@ def test_初期の対応表():
         assert hrf.CSV_FIELD_MAP[col] == (None, "hr_copy"), col
     for col in ("更新日", "店舗ID", "店舗名", "自由項目1", "自由項目2", "自由項目3"):
         assert col not in hrf.CSV_FIELD_MAP
-    assert set(hrf.PAGE_FIELD_MAP) == {"qa", "memo", "selection_history"}
+    assert set(hrf.PAGE_FIELD_MAP) == {"qa", "memo", "selection_history", "all_fields"}
     assert all(v == (None, "fill_empty") for v in hrf.PAGE_FIELD_MAP.values())
 
 

@@ -59,10 +59,12 @@ CSV_FIELD_MAP: dict = {
 #   qa                : 「質問文：回答」を1行ずつ (自由項目1-3)
 #   memo              : メモ欄
 #   selection_history : 「日時／選考種別／選考理由」を1行ずつ
+#   all_fields        : 編集フォームの全項目を「見出し：値」で1行ずつ (まとめて1つのプロパティへ)
 PAGE_FIELD_MAP: dict = {
     "qa": (None, FILL_EMPTY),
     "memo": (None, FILL_EMPTY),
     "selection_history": (None, FILL_EMPTY),
+    "all_fields": (None, FILL_EMPTY),
 }
 
 HR_ID_COLUMN = "応募者id"
@@ -146,6 +148,15 @@ def _squash(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+def _squash_value(s: Optional[str]) -> str:
+    return (s or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+# 値として拾わない入力の種類 / 「未選択」を表す選択肢の文言
+_SKIP_TYPES = {"hidden", "submit", "button", "reset", "image", "file", "password"}
+_PLACEHOLDERS = {"選択してください", "選択して下さい", "-", "ー", "---"}
+
+
 class _DetailParser(HTMLParser):
     """編集フォームから 質問文+回答 / メモ / 選考履歴 を拾う。
 
@@ -164,18 +175,50 @@ class _DetailParser(HTMLParser):
         self._name_buf: list = []
         self._ta: Optional[str] = None
         self._ta_buf: list = []
+        self._ta_label = ""
         self.free: dict = {}          # N -> (質問文, 回答)
         self.memo = ""
         self._in_history = False
         self._row: Optional[list] = None
         self._cell: Optional[list] = None
         self.history: list = []
+        # --- 全項目 (fields) 用
+        self._in_form = False
+        self._ctrls: list = []        # 出てきた順の部品 (dict)
+        self._groups: dict = {}       # radio/checkbox の name -> 部品
+        self._sel: Optional[dict] = None
+        self._opt: Optional[dict] = None
+        self._labels: list = []       # {"for", "buf", "done"}
+        self._open_labels: list = []
+        self._last_input: Optional[dict] = None   # 直後の文字を見出し代わりに拾う対象
+
+    def _skip_name(self, name: str, typ: str = "") -> bool:
+        n = name.lower()
+        return (not name or n == "_method" or "csrf" in n or "token" in n
+                or typ in _SKIP_TYPES)
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         cls = (a.get("class") or "").split()
+        self._last_input = None
         if tag == "form" and "/admin/applicants/edit/" in (a.get("action") or ""):
             self.is_edit_form = True
+            self._in_form = True
+        elif tag == "li" and "box_fill_list_item" in cls:
+            self.last_question = ""
+        elif tag == "label" and self._in_form:
+            lb = {"for": a.get("for") or "", "buf": []}
+            self._labels.append(lb)
+            self._open_labels.append(lb)
+        elif tag == "input" and self._in_form:
+            self._start_input(a)
+        elif tag == "select" and self._in_form and not self._skip_name(a.get("name") or ""):
+            self._sel = {"name": a["name"], "label": self.last_question,
+                         "kind": "select", "opts": []}
+            self._ctrls.append(self._sel)
+        elif tag == "option" and self._sel is not None:
+            self._opt = {"selected": "selected" in a, "value": a.get("value"), "buf": []}
+            self._sel["opts"].append(self._opt)
         elif tag == "input" and (a.get("type") or "").lower() == "password":
             self.has_password = True
         elif tag == "p" and "name" in cls:
@@ -185,8 +228,9 @@ class _DetailParser(HTMLParser):
             self._name_buf.append(" ")
         elif tag == "textarea":
             n = a.get("name") or ""
-            if re.fullmatch(r"free_text_[1-3]", n) or n == "memo":
+            if n and (self._in_form or re.fullmatch(r"free_text_[1-3]", n) or n == "memo"):
                 self._ta, self._ta_buf = n, []
+                self._ta_label = self.last_question
         elif tag == "table" and "history" in cls:
             self._in_history = True
         elif tag == "tr" and self._in_history:
@@ -194,7 +238,36 @@ class _DetailParser(HTMLParser):
         elif tag == "td" and self._row is not None:
             self._cell = []
 
+    def _start_input(self, a: dict) -> None:
+        typ = (a.get("type") or "text").lower()
+        name = a.get("name") or ""
+        if self._skip_name(name, typ):
+            return
+        if typ in ("radio", "checkbox"):
+            g = self._groups.get(name)
+            if g is None:
+                g = {"name": name, "label": self.last_question, "kind": "choice", "items": []}
+                self._groups[name] = g
+                self._ctrls.append(g)
+            item = {"id": a.get("id") or "", "checked": "checked" in a,
+                    "wrap": self._open_labels[-1] if self._open_labels else None,
+                    "adj": []}
+            g["items"].append(item)
+            self._last_input = item
+        else:
+            self._ctrls.append({"name": name, "label": self.last_question, "kind": "text",
+                                "value": _squash_value(a.get("value"))})
+
     def handle_endtag(self, tag):
+        self._last_input = None
+        if tag == "form":
+            self._in_form = False
+        elif tag == "label" and self._open_labels:
+            self._open_labels.pop()
+        elif tag == "option":
+            self._opt = None
+        elif tag == "select":
+            self._sel = None
         if tag == "p" and self._in_name_p:
             self._in_name_p = False
             self.last_question = _squash("".join(self._name_buf))
@@ -202,8 +275,11 @@ class _DetailParser(HTMLParser):
             body = "".join(self._ta_buf).replace("\r\n", "\n").replace("\r", "\n").strip()
             if self._ta == "memo":
                 self.memo = body
-            else:
+            elif re.fullmatch(r"free_text_[1-3]", self._ta):
                 self.free[int(self._ta[-1])] = (self.last_question, body)
+            if self._in_form and not self._skip_name(self._ta):
+                self._ctrls.append({"name": self._ta, "label": self._ta_label,
+                                    "kind": "text", "value": body})
             self._ta = None
         elif tag == "td" and self._cell is not None and self._row is not None:
             self._row.append(_squash("".join(self._cell)))
@@ -216,6 +292,13 @@ class _DetailParser(HTMLParser):
             self._in_history = False
 
     def handle_data(self, data):
+        for lb in self._open_labels:
+            lb["buf"].append(data)
+        if self._opt is not None:
+            self._opt["buf"].append(data)
+        if self._last_input is not None and data.strip():
+            self._last_input["adj"].append(data)
+            self._last_input = None
         if self._in_name_p:
             self._name_buf.append(data)
         if self._ta is not None:
@@ -224,9 +307,42 @@ class _DetailParser(HTMLParser):
             self._cell.append(data)
 
 
+    def fields(self) -> list:
+        """編集フォームの名前付き部品 -> [{"name","label","value"}] (ページ順)。"""
+        by_id = {}
+        for lb in self._labels:
+            if lb["for"] and lb["for"] not in by_id:
+                by_id[lb["for"]] = _squash("".join(lb["buf"]))
+        out = []
+        for c in self._ctrls:
+            if c["kind"] == "text":
+                v = c["value"]
+            elif c["kind"] == "select":
+                picked = [o for o in c["opts"] if o["selected"]]
+                texts = [_squash("".join(o["buf"])) for o in picked
+                         if o["value"] != "" and _squash("".join(o["buf"])) not in _PLACEHOLDERS]
+                v = "、".join(t for t in texts if t)
+            else:
+                texts = []
+                for it in c["items"]:
+                    if not it["checked"]:
+                        continue
+                    t = by_id.get(it["id"]) if it["id"] else ""
+                    if not t and it["wrap"] is not None:
+                        t = _squash("".join(it["wrap"]["buf"]))
+                    if not t:
+                        t = _squash("".join(it["adj"]))
+                    if t:
+                        texts.append(t)
+                v = "、".join(texts)
+            out.append({"name": c["name"], "label": _squash(c["label"]), "value": v})
+        return out
+
+
 def parse_applicant_detail(html: str) -> Optional[dict]:
     """応募者詳細ページ(編集フォーム) -> {"qa": [(質問, 回答)], "memo": str,
-    "selection_history": [(日時, 種別, 理由)]}。
+    "selection_history": [(日時, 種別, 理由)],
+    "fields": [{"name", "label", "value"}]}。fields は編集フォームの名前付き部品ぜんぶ (ページ順)。
 
     - ログイン画面なら HrLoginPageError (呼び出し側で再ログインして取り直す)
     - どちらでもない (想定外のページ) なら None
@@ -245,7 +361,25 @@ def parse_applicant_detail(html: str) -> Optional[dict]:
         if not ans:
             continue
         qa.append((q or f"自由項目{n}", ans))
-    return {"qa": qa, "memo": p.memo, "selection_history": list(p.history)}
+    return {"qa": qa, "memo": p.memo, "selection_history": list(p.history),
+            "fields": p.fields()}
+
+
+def format_all_fields(parsed: dict) -> str:
+    """fields -> 「見出し：値」を1行ずつ。値が空の項目は飛ばす。
+
+    複数行の値は2行目以降を全角スペースでインデントする。見出しが空なら name 属性を使う。
+    """
+    lines = []
+    for f in parsed.get("fields", []):
+        v = (f.get("value") or "").strip()
+        if not v:
+            continue
+        head = f.get("label") or f.get("name") or ""
+        first, *rest = v.split("\n")
+        lines.append(f"{head}：{first}")
+        lines.extend("　" + r for r in rest)
+    return "\n".join(lines)
 
 
 def format_page_values(parsed: dict) -> dict:
@@ -261,6 +395,9 @@ def format_page_values(parsed: dict) -> dict:
                      for row in parsed.get("selection_history", []))
     if hist.strip():
         out["selection_history"] = hist
+    allf = format_all_fields(parsed)
+    if allf:
+        out["all_fields"] = allf
     return out
 
 
