@@ -60,6 +60,10 @@ LOGIN_URL = "https://hr-hacker.com/admin"
 DASHBOARD_URL = "https://hr-hacker.com/admin/dashboards/"
 JOB_OFFERS_URL = "https://hr-hacker.com/admin/job-offers"
 EXPORT_LIST_URL = "https://hr-hacker.com/admin/job-offers/csv-export-list"
+BRANCHES_URL = "https://hr-hacker.com/admin/branches"
+BRANCHES_DOWNLOAD_BTN = "#js-search-form > div.btnArea.my-4 > button"
+BRANCHES_REQUIRED_HEADERS = ("店舗id", "都道府県", "市区町村")
+BRANCHES_ENCODING = "cp932"
 
 # storage_state 保存先 (認証Cookie含む — .gitignore 済み)
 STORAGE_STATE_PATH = REPO / "data" / "job_application_sync" / "hr_storage_state.json"
@@ -166,6 +170,64 @@ async def fetch_hr_csv(
             if ctx is not None:
                 await ctx.close()
             await browser.close()
+
+
+def validate_branches_header(path: Path) -> None:
+    """店舗一覧CSVの見出し行に必須列があるか確認する (無ければ RuntimeError)."""
+    with open(path, "r", encoding=BRANCHES_ENCODING, errors="replace", newline="") as f:
+        header_line = f.readline()
+    header = [h.strip().strip('"') for h in header_line.strip().split(",")]
+    missing = [h for h in BRANCHES_REQUIRED_HEADERS if h not in header]
+    if missing:
+        raise RuntimeError(
+            f"店舗一覧CSVの見出しに必須列がありません: {missing} "
+            "(HRハッカー側の仕様変更の可能性)"
+        )
+
+
+async def fetch_hr_branches(
+    output_dir: Path,
+    headless: bool = True,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Path:
+    """HRハッカーの店舗一覧CSV (/admin/branches) を取得して output_dir に保存する.
+
+    検索ボタンのクリックで即ダウンロードが始まる (生成待ちポーリングは不要)。
+    """
+    user = user or os.environ.get("HRHACKER_USER", "")
+    password = password or os.environ.get("HRHACKER_PASS", "")
+    if not user or not password:
+        raise RuntimeError("HRHACKER_USER / HRHACKER_PASS が未設定")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    from playwright.async_api import async_playwright  # noqa: WPS433
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        ctx = None
+        try:
+            ctx, page = await _establish_session(browser, user, password)
+            await _dismiss_onboarding(page)
+            await page.goto(BRANCHES_URL, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            await _dismiss_onboarding(page)
+            async with page.expect_download(timeout=180_000) as dl_info:
+                await page.click(BRANCHES_DOWNLOAD_BTN)
+            dl = await dl_info.value
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = output_dir / f"hr_branches_{ts}.csv"
+            await dl.save_as(str(out_path))
+        finally:
+            if ctx is not None:
+                await ctx.close()
+            await browser.close()
+    validate_branches_header(out_path)
+    return out_path
 
 
 # ----------------------------------------------------------------------------
@@ -513,11 +575,18 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--headless", dest="headless", action="store_true", default=False)
     ap.add_argument("--headful", dest="headless", action="store_false")
     ap.add_argument("--timeout-min", type=int, default=20)
+    ap.add_argument("--branches", action="store_true",
+                    help="求人CSVではなく店舗一覧CSV (/admin/branches) を取得する")
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv)
+    if args.branches:
+        path = asyncio.run(fetch_hr_branches(
+            output_dir=Path(args.output), headless=args.headless))
+        print(f"saved: {path}")
+        return
     path = asyncio.run(
         fetch_hr_csv(
             output_dir=Path(args.output),

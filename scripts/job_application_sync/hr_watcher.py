@@ -346,6 +346,7 @@ def run(csv_path: Optional[str] = None,
         deal_finder=None,           # shop_ids → deals list (find_deals_by_shop_ids 互換)
         account_finder=None,        # login_id → account dict or None
         aw_orchestrate_fn=None,     # (target_login_ids, dry_run, ...) → result dict
+        branches_fetcher=None,      # 引数なし → 店舗一覧CSVパス (実取得時は既定で fetch_hr_branches)
         ) -> dict:
     """hr_watcher メイン.
 
@@ -376,8 +377,10 @@ def run(csv_path: Optional[str] = None,
     else:
         rows = None
 
+    real_fetch = False
     if csv_path is None and rows is None:
         if csv_fetcher is None:
+            real_fetch = True
             # 実取得: hr_csv_fetcher を呼ぶ
             from scripts.job_application_sync.fetchers.hr_csv_fetcher import (  # noqa: E402
                 fetch_hr_csv,
@@ -452,9 +455,30 @@ def run(csv_path: Optional[str] = None,
     if hrhacker_run_fn is None:
         from scripts.job_application_sync import hrhacker_import as hi  # noqa: E402
         hrhacker_run_fn = hi.run
+    # 勤務地 (店舗一覧): ベストエフォート。失敗しても取込は勤務地なしで続ける
+    branch_locations = None
+    if real_fetch or branches_fetcher is not None:
+        try:
+            if branches_fetcher is not None:
+                branches_path = branches_fetcher()
+            else:
+                from scripts.job_application_sync.fetchers.hr_csv_fetcher import (  # noqa: E402
+                    fetch_hr_branches,
+                )
+                branches_path = asyncio.run(fetch_hr_branches(
+                    output_dir=REPO / "scratchpad" / "csv_fetched" / "hr_branches"))
+            from scripts.job_application_sync import hrhacker_import as _hi  # noqa: E402
+            branch_locations = _hi.load_branch_locations(branches_path)
+            summary["branch_locations"] = len(branch_locations)
+        except Exception as e:  # noqa: BLE001
+            branch_locations = None
+            summary["branches_error"] = type(e).__name__
+            plog.public(f"[hr_watcher] 店舗一覧の取得に失敗 ({type(e).__name__}): "
+                        "勤務地なしで取込を続ける")
+    run_kwargs = {"branch_locations": branch_locations} if branch_locations is not None else {}
     import_ok = True
     try:
-        hr_summary = hrhacker_run_fn(csv_path, dry_run=dry_run)
+        hr_summary = hrhacker_run_fn(csv_path, dry_run=dry_run, **run_kwargs)
         summary["hrhacker_summary"] = hr_summary
         # 例外が無くても書込に失敗した行があれば再試行できるよう控えを進めない
         if isinstance(hr_summary, dict) and (

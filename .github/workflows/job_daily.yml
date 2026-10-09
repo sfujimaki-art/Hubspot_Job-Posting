@@ -181,8 +181,17 @@ jobs:
               python scripts/job_application_sync/fetchers/hr_csv_fetcher.py \
                 --output scratchpad/csv_fetched/hr --headless
               HRCSV=$(ls -t scratchpad/csv_fetched/hr/*.csv | head -n 1)
+              # 勤務地 (都道府県/市区町村): 店舗一覧を別フォルダに取得し、空の項目だけ補完する。
+              # 店舗一覧が取れなくても本文・画像の埋め戻しは続ける。
+              BRCSV=""
+              if python scripts/job_application_sync/fetchers/hr_csv_fetcher.py --branches \
+                   --output scratchpad/csv_fetched/hr_branches --headless; then
+                BRCSV=$(ls -t scratchpad/csv_fetched/hr_branches/*.csv | head -n 1)
+              else
+                echo "::warning::店舗一覧の取得に失敗(勤務地なしで本文・画像のみ埋め戻す)"
+              fi
               python scripts/job_application_sync/hrhacker_import.py \
-                --csv "$HRCSV" --copy-only $FLAG
+                --csv "$HRCSV" --copy-only $FLAG ${BRCSV:+--branches-csv "$BRCSV"}
               ;;
             aw-create)
               python scripts/job_application_sync/fetchers/aw_orchestrator.py \
