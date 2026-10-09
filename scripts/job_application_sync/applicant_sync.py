@@ -50,6 +50,7 @@ from scripts.job_application_sync import applicant_import as ai  # noqa: E402
 from scripts.job_application_sync.fetchers import account_loader as al  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af  # noqa: E402
 from scripts.job_application_sync import private_log as plog  # noqa: E402
+from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E402
 
 MAX_ATTEMPTS = 3
 LOCK_STALE_SEC = 15 * 60
@@ -508,8 +509,67 @@ async def _fetch_hr_csv(out_dir: Path, date_from: str, date_to: str) -> Path:
     return await hf.fetch_hr_applicants(out_dir, date_from, date_to, headless=True)
 
 
+def _report_hr_extras(results, page_fields, detail, dstats, ledger, cli) -> None:
+    """CSVの追加項目の取りこぼし件数と、詳細ページの書込み (公開ログには件数だけ)。"""
+    dropped = sorted({n for r in results for n in r.dropped_props})
+    n_dropped_rows = sum(1 for r in results if r.dropped_props)
+    if dropped:
+        plog.public(f"[applicant_sync] HR追加項目: HubSpotに無いプロパティ "
+                    f"{len(dropped)}種を {n_dropped_rows}行で書かず")
+        plog.detail("hr_props_dropped", names=dropped, rows=n_dropped_rows)
+    if detail is None or ledger is None:
+        return
+    appt_of = {r.hr_applicant_id: r.appointment_id for r in results
+               if r.hr_applicant_id and r.appointment_id}
+    written = nothing = errors = no_appt = 0
+    for hr_id, parsed in detail.parsed.items():
+        appt = appt_of.get(hr_id)
+        if not appt:
+            no_appt += 1          # 取込に失敗した人。次回また取る (失敗回数には数えない)
+            continue
+        out = hrf.apply_page_fields(cli, appt, parsed, page_fields)
+        if out == "error":
+            errors += 1
+            hrf.record_detail_failure(ledger, hr_id)
+        else:
+            written += out == "written"
+            nothing += out == "nothing"
+            hrf.record_detail_done(ledger, hr_id)
+    for hr_id in detail.failed:
+        hrf.record_detail_failure(ledger, hr_id)
+    plog.public(
+        f"[applicant_sync] HR詳細ページ: 対象={dstats.get('selected', 0)} "
+        f"取得={len(detail.parsed)} 書込={written} 変更なし={nothing} "
+        f"未取得={len(detail.failed) + len(detail.not_reached)} "
+        f"書込失敗={errors} 取込なし={no_appt} 諦め累計={dstats.get('gave_up', 0)} "
+        f"再ログイン={detail.relogins} 中断={detail.stopped or 'なし'}")
+
+
+async def _fetch_hr_csv_with_details(out_dir: Path, date_from: str, date_to: str,
+                                     select_ids):
+    from scripts.job_application_sync.fetchers import hr_applicant_fetcher as hf
+    return await hf.fetch_hr_applicants_with_details(
+        out_dir, date_from, date_to, select_ids, headless=True)
+
+
+def _select_hr_detail_ids(csv_path, ledger, stats: dict) -> list:
+    """CSVの応募者のうち、詳細ページをまだ取っていない人 (新しい応募から) を選ぶ。"""
+    rows = [r for r in ai.load_applicants_csv(str(csv_path)) if r.hr_applicant_id]
+    rows.sort(key=lambda r: r.apply_date, reverse=True)
+    picked, done, gave_up = hrf.select_detail_ids(
+        ledger, [r.hr_applicant_id for r in rows], _detail_max_per_run())
+    stats.update(candidates=len(rows), done_before=done, gave_up=gave_up,
+                 selected=len(picked))
+    return picked
+
+
+def _detail_max_per_run() -> int:
+    return int(os.environ.get("JAS_HR_DETAIL_MAX", "20"))
+
+
 def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
-                     date_from: str = "", date_to: str = "") -> dict:
+                     date_from: str = "", date_to: str = "",
+                     ledger=None) -> dict:
     """HR応募を日付範囲で1マスター取得→登録。
     date_from/to 未指定なら queue項目の日付範囲(最大60日にcap)から算出。"""
     token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
@@ -529,11 +589,30 @@ def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
         cap = (_date(y, m, d) - timedelta(days=60)).isoformat()
         date_from = date_from or max(ds[0], cap)
     result["date_from"], result["date_to"] = date_from, date_to
+    cli = None
+    page_fields: dict = {}
+    dstats: dict = {}
+    detail = None
     try:
-        csv_path = asyncio.run(_fetch_hr_csv(out_dir, date_from, date_to))
+        if dry_run:
+            csv_path = asyncio.run(_fetch_hr_csv(out_dir, date_from, date_to))
+        else:
+            cli = ai.RealHubSpotClient(token)
+            # 詳細ページで取る項目のうち、対応先が決まっていて HubSpot に実在するもの。
+            # 無ければ詳細ページは取りに行かない (Actions の時間を使わない)
+            page_fields = hrf.active_page_fields(cli.known_appointment_props())
+            select = None
+            if page_fields and ledger is not None:
+                def select(p):
+                    return _select_hr_detail_ids(p, ledger, dstats)
+            csv_path, detail = asyncio.run(_fetch_hr_csv_with_details(
+                out_dir, date_from, date_to, select))
     except Exception as e:  # noqa: BLE001
         result["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         return result
+    if not dry_run:
+        plog.public(f"[applicant_sync] HR詳細ページ: "
+                    f"{'取得あり' if page_fields else 'スキップ (対応プロパティなし)'}")
     rows = ai.load_applicants_csv(str(csv_path))
     # 応募日時(時刻付き)を分析用に記録 (2026-08-05)。本流に影響しない副産物
     ai.append_apply_time_log(str(csv_path))
@@ -541,10 +620,10 @@ def process_hr_batch(items, out_dir: Path, dry_run: bool = True,
         result.update(ok=True, unlinked=len(rows), total=len(rows),
                       csv=csv_path.name)
         return result
-    cli = ai.RealHubSpotClient(token)
     results = ai.run_import(rows, cli)
     from collections import Counter
     st = Counter(r.status for r in results)
+    _report_hr_extras(results, page_fields, detail, dstats, ledger, cli)
     n_err = st.get("error", 0)
     # ★AW側と同じ判定に揃える (2026-08-08)。
     #   2026-08-07 に AW(process_aw_account) だけ是正し、HRを直し忘れていた。
@@ -705,7 +784,8 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             print(f"[applicant_sync] HR: {len(hr_items)}件を1マスターで処理",
                   flush=True)
             res = process_hr_batch(hr_items, out_dir, dry_run,
-                                   date_from=hr_date_from, date_to=hr_date_to)
+                                   date_from=hr_date_from, date_to=hr_date_to,
+                                   ledger=ledger)
             # HRハッカーの管理アカウントのID・パスワードも公開ログに出さない
             res["error"] = scrub_secrets(res.get("error", ""),
                                          [os.environ.get("HRHACKER_USER", ""),

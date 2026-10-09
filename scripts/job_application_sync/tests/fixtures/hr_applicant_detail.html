@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>応募者編集 | HRハッカー (架空の見本)</title></head>
+<body>
+<!-- 架空データ。実ページの構造だけを再現した試験用。実在の人物・連絡先ではない。 -->
+<div class="content">
+<form method="post" accept-charset="utf-8" action="https://hr-hacker.com/admin/applicants/edit/900001">
+  <input type="hidden" name="_method" value="PUT">
+  <input type="text" name="name" id="name" value="山田太郎">
+  <input type="text" name="name_kana" id="name-kana" value="ヤマダタロウ">
+  <input type="tel" name="tel" id="tel" value="090-0000-0000">
+  <input type="email" name="email" id="email" value="taro@example.com">
+  <ul class="box_fill_list">
+    <li class="box_fill_list_item box_fill_list_item_memo">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">面接可能日時（3候補）</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><div class="form-actions">
+          <textarea name="free_text_1" class="form-control" rows="5" id="free-text-1">10/20 午前</textarea>
+        </div></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item box_fill_list_item_memo">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">メールアドレス（indeed メール以外）</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><div class="form-actions">
+          <textarea name="free_text_2" class="form-control" rows="5" id="free-text-2">taro.sub@example.com</textarea>
+        </div></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item box_fill_list_item_memo">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name"></p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><div class="form-actions">
+          <textarea name="free_text_3" class="form-control" rows="5" id="free-text-3">
+経験は3年です。
+土日も可能です。</textarea>
+        </div></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item box_fill_list_item_memo">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">学歴</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><div class="form-actions">
+          <textarea name="school_career" class="form-control" rows="5" id="school-career">○○大学 卒業</textarea>
+        </div></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item box_fill_list_item_memo">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">メモ<br>（社内用）</p></div>
+        <div class="box_fill_list_item_right"><div class="box_fill_item"><div class="form-actions">
+          <textarea name="memo" class="form-control" rows="5" id="memo">折り返し希望。
+夕方以降に電話。</textarea>
+        </div></div></div>
+      </div>
+    </li>
+    <li class="box_fill_list_item box_fill_list_item_vtext box_fill_list_item_reason">
+      <div class="box_fill_list_item_inner">
+        <div class="box_fill_list_item_left"><p class="name">選考理由</p></div>
+        <div class="box_fill_list_item_right"><div class="form-group">
+          <textarea name="cause" class="form-control" rows="5" id="cause">本文に出ない選考理由</textarea>
+        </div></div>
+      </div>
+    </li>
+  </ul>
+  <input type="submit" class="btn btn-outline-secondary" value="更新">
+</form>
+<table class="history">
+  <tbody>
+    <tr><th>日時</th><th>選考種別</th><th>選考理由</th></tr>
+    <tr><td>2026-10-01 10:00</td><td>未対応</td><td></td></tr>
+    <tr><td>2026-10-02 15:30</td><td>面接調整中</td><td>日程を相談中</td></tr>
+  </tbody>
+</table>
+</div>
+</body>
+</html>

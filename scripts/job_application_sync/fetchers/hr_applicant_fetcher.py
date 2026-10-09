@@ -36,15 +36,20 @@ import argparse
 import asyncio
 import os
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from urllib.parse import urlencode
 
 try:  # パッケージ経由 (job_application_sync.fetchers / scripts.job_application_sync.fetchers)
     from . import hr_csv_fetcher as _hrf
 except ImportError:  # 直接実行 (python hr_applicant_fetcher.py)
     from scripts.job_application_sync.fetchers import hr_csv_fetcher as _hrf
+from scripts.job_application_sync.hr_applicant_fields import (  # noqa: E402
+    HrLoginPageError, parse_applicant_detail,
+)
 
 # ----------------------------------------------------------------------------
 # 定数
@@ -125,27 +130,116 @@ def default_date_range(today: Optional[date] = None) -> tuple[str, str]:
 
 
 # ----------------------------------------------------------------------------
+# 詳細ページ取得 (CSVと同じブラウザセッションで、1人ずつ)
+# ----------------------------------------------------------------------------
+DETAIL_URL = "https://hr-hacker.com/admin/applicants/edit/{id}"
+DETAIL_MAX_PER_RUN = 20
+DETAIL_SLEEP_S = 1.0          # リクエストの間隔 (下限 1.0 秒)
+DETAIL_BUDGET_S = 120.0       # 詳細取得に使う合計時間の上限
+DETAIL_TIMEOUT_MS = 30_000    # 1リクエストのタイムアウト
+_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
+
+
+@dataclass
+class DetailResult:
+    """詳細ページ取得の結果。parsed は {応募者id: parse_applicant_detail の結果}。
+
+    取れなかったものは failed (=「未取得」。空として書くことは絶対にしない)。
+    not_reached は時間切れ・ログイン失敗で、手を付けなかったもの (失敗回数には数えない)。
+    """
+    parsed: dict = field(default_factory=dict)
+    failed: list = field(default_factory=list)
+    not_reached: list = field(default_factory=list)
+    relogins: int = 0
+    stopped: str = ""          # "" / "budget" / "login"
+
+
+def detail_url(hr_id: str) -> str:
+    if not _ID_RE.match(hr_id or ""):
+        raise ValueError("応募者idの形式が不正です")
+    return DETAIL_URL.format(id=hr_id)
+
+
+async def fetch_details(
+    get_page: Callable[[str, int], Awaitable[tuple]],
+    ids: list,
+    *,
+    relogin: Optional[Callable[[], Awaitable[Callable]]] = None,
+    max_n: int = DETAIL_MAX_PER_RUN,
+    sleep_s: float = DETAIL_SLEEP_S,
+    budget_s: float = DETAIL_BUDGET_S,
+    timeout_ms: int = DETAIL_TIMEOUT_MS,
+    sleeper: Callable[[float], Awaitable] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> DetailResult:
+    """応募者の詳細ページを1人ずつ取って解析する。
+
+    get_page(url, timeout_ms) -> (status, html)。ブラウザの page.request.get を包んだもの。
+    relogin() は同じ仕組みでセッションを張り直し、新しい get_page を返す (1回の実行で1回だけ)。
+    ログイン画面が返ったら relogin して同じ人を取り直す。それでもだめなら打ち切り、
+    残りは「未取得」(not_reached)。
+    """
+    res = DetailResult()
+    sleep_s = max(sleep_s, 1.0)
+    todo = list(ids)[:max(max_n, 0)]
+    start = clock()
+    relogin_used = False
+    for idx, hr_id in enumerate(todo):
+        if idx:
+            await sleeper(sleep_s)
+        if clock() - start >= budget_s:     # 待ち時間も予算に含めて判定
+            res.stopped = "budget"
+            res.not_reached = todo[idx:]
+            return res
+        parsed = None
+        for attempt in (1, 2):
+            try:
+                status, html = await get_page(detail_url(hr_id), timeout_ms)
+            except Exception:  # noqa: BLE001  タイムアウト・通信失敗は「未取得」
+                parsed = None
+                break
+            try:
+                parsed = parse_applicant_detail(html) if status == 200 else None
+            except HrLoginPageError:
+                if relogin is None or relogin_used:
+                    res.stopped = "login"
+                    res.not_reached = todo[idx:]
+                    return res
+                relogin_used = True
+                res.relogins += 1
+                try:
+                    get_page = await relogin()
+                except Exception:  # noqa: BLE001
+                    res.stopped = "login"
+                    res.not_reached = todo[idx:]
+                    return res
+                continue          # 張り直したセッションで同じ人をもう一度
+            break
+        if parsed is None:
+            res.failed.append(hr_id)
+        else:
+            res.parsed[hr_id] = parsed
+    return res
+
+
+# ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
-async def fetch_hr_applicants(
+async def fetch_hr_applicants_with_details(
     output_dir: Path,
     date_from: str,
     date_to: str,
+    select_ids: Optional[Callable[[Path], list]] = None,
     headless: bool = True,
     user: Optional[str] = None,
     password: Optional[str] = None,
-) -> Path:
-    """HRハッカー応募者CSVを同期fetchで取得し output_dir に保存、パスを返す.
+    max_n: int = DETAIL_MAX_PER_RUN,
+    budget_s: float = DETAIL_BUDGET_S,
+) -> tuple:
+    """応募者CSVを取得して保存し、続けて同じセッションで詳細ページを取る。
 
-    Args:
-        output_dir: 保存先ディレクトリ (なければ作成)
-        date_from:  応募日 開始 (YYYY-MM-DD, 必須 — 絞りなしは 500)
-        date_to:    応募日 終了 (YYYY-MM-DD, 必須)
-        headless:   True=非表示Chromium / False=デバッグ表示
-        user, password: 明示指定がなければ環境変数 HRHACKER_USER/PASS から取得
-
-    Returns:
-        保存した CSV ファイルパス (Shift-JIS bytes そのまま保存)
+    select_ids(csv_path) が詳細を取る応募者idのリストを返す。None なら詳細は取らない
+    (ログインし直しもしない)。 -> (CSVのパス, DetailResult)
     """
     url = build_applicant_csv_url(date_from, date_to)  # 先に検証 (fail fast)
 
@@ -187,11 +281,62 @@ async def fetch_hr_applicants(
             out_path = output_dir / f"hr_applicants_{date_from}_{date_to}_{ts}.csv"
             out_path.write_bytes(body)
             print(f"[hr_applicants] 保存: {out_path} ({len(body):,} bytes)")
-            return out_path
+
+            # 5. 詳細ページ (同じセッション。2回目のログインはしない)
+            detail = DetailResult()
+            ids = select_ids(out_path) if select_ids else []
+            if ids:
+                state = {"page": page}
+
+                def _wrap(pg):
+                    async def _get(u, timeout_ms):
+                        r = await pg.request.get(u, timeout=timeout_ms)
+                        final = getattr(r, "url", "") or ""
+                        if _hrf.classify_sso_url(final) == "login":
+                            return r.status, "<input type=\"password\">"
+                        return r.status, (await r.body()).decode("utf-8", errors="replace")
+                    return _get
+
+                async def _relogin():
+                    nonlocal ctx
+                    await ctx.close()
+                    ctx, state["page"] = await _hrf._establish_session(
+                        browser, user, password)
+                    return _wrap(state["page"])
+
+                detail = await fetch_details(
+                    _wrap(page), ids, relogin=_relogin,
+                    max_n=max_n, budget_s=budget_s)
+            return out_path, detail
         finally:
             if ctx is not None:
                 await ctx.close()
             await browser.close()
+
+
+async def fetch_hr_applicants(
+    output_dir: Path,
+    date_from: str,
+    date_to: str,
+    headless: bool = True,
+    user: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Path:
+    """HRハッカー応募者CSVを同期fetchで取得し output_dir に保存、パスを返す.
+
+    Args:
+        output_dir: 保存先ディレクトリ (なければ作成)
+        date_from:  応募日 開始 (YYYY-MM-DD, 必須 — 絞りなしは 500)
+        date_to:    応募日 終了 (YYYY-MM-DD, 必須)
+        headless:   True=非表示Chromium / False=デバッグ表示
+        user, password: 明示指定がなければ環境変数 HRHACKER_USER/PASS から取得
+
+    Returns:
+        保存した CSV ファイルパス (Shift-JIS bytes そのまま保存)
+    """
+    path, _ = await fetch_hr_applicants_with_details(
+        output_dir, date_from, date_to, None, headless, user, password)
+    return path
 
 
 # ----------------------------------------------------------------------------
