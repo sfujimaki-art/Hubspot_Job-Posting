@@ -1221,7 +1221,7 @@ def main(argv=None):
             sheet_urls[r["name"]] = u
             print("      共有シート: 書き出しました (URLは非公開)")
         # ★2026-10-09: 公開の Actions 成果物の代わりに、非公開の集約シート
-        #   (JAS_SHEET_ID) のタブへ全置換で書く。
+        #   (JAS_APPLICANT_QUEUE_SHEET_ID) のタブへ全置換で書く。
         tab = private_tab(r["name"])
         if plog.replace_list(tab, items):
             private_tabs[r["name"]] = tab
