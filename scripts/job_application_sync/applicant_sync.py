@@ -509,6 +509,16 @@ async def _fetch_hr_csv(out_dir: Path, date_from: str, date_to: str) -> Path:
     return await hf.fetch_hr_applicants(out_dir, date_from, date_to, headless=True)
 
 
+def _report_clipped() -> None:
+    """65,536文字超で切り詰めた件数 (公開ログは件数だけ。プロパティ名は非公開側)。"""
+    clipped = hrf.take_clipped()
+    if clipped:
+        plog.public(f"[applicant_sync] HR追加項目: 65,536文字超で切り詰め "
+                    f"{len(clipped)}件")
+        plog.detail("hr_props_clipped", names=sorted(set(clipped)),
+                    count=len(clipped))
+
+
 def _report_hr_extras(results, page_fields, detail, dstats, ledger, cli) -> None:
     """CSVの追加項目の取りこぼし件数と、詳細ページの書込み (公開ログには件数だけ)。"""
     dropped = sorted({n for r in results for n in r.dropped_props})
@@ -517,6 +527,7 @@ def _report_hr_extras(results, page_fields, detail, dstats, ledger, cli) -> None
         plog.public(f"[applicant_sync] HR追加項目: HubSpotに無いプロパティ "
                     f"{len(dropped)}種を {n_dropped_rows}行で書かず")
         plog.detail("hr_props_dropped", names=dropped, rows=n_dropped_rows)
+    _report_clipped()
     if detail is None or ledger is None:
         return
     appt_of = {r.hr_applicant_id: r.appointment_id for r in results
@@ -537,6 +548,7 @@ def _report_hr_extras(results, page_fields, detail, dstats, ledger, cli) -> None
             hrf.record_detail_done(ledger, hr_id)
     for hr_id in detail.failed:
         hrf.record_detail_failure(ledger, hr_id)
+    _report_clipped()   # 詳細ページ分 (書込み時に切ったもの)
     plog.public(
         f"[applicant_sync] HR詳細ページ: 対象={dstats.get('selected', 0)} "
         f"取得={len(detail.parsed)} 書込={written} 変更なし={nothing} "

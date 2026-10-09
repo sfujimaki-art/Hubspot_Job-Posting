@@ -517,3 +517,41 @@ def test_対応先なしなら詳細ページは取らない_ブラウザ呼び�
                                 ledger=Ledger(path=tmp_path / "l.json"))
     assert seen["select"] is None
     assert res["ok"] is True
+
+
+# ---------------------------------------------------------------- 65,536文字の上限
+def test_clip_70000文字は上限以内で注記付き():
+    out, hit = hrf.clip_for_hubspot("あ" * 70000)
+    assert hit is True
+    assert len(out) <= 65536
+    assert out.endswith("\n（以下省略。全文は HRハッカーの応募者詳細で確認）")
+    assert out.startswith("あ" * 100)
+
+
+def test_clip_ちょうど65536文字と短い値はそのまま():
+    v = "い" * 65536
+    assert hrf.clip_for_hubspot(v) == (v, False)
+    assert hrf.clip_for_hubspot("短い") == ("短い", False)
+    out, hit = hrf.clip_for_hubspot("う" * 65537)
+    assert hit and len(out) == 65536
+
+
+def test_詳細ページの長すぎる値は切って送る(monkeypatch):
+    monkeypatch.setitem(hrf.PAGE_FIELD_MAP, "memo", ("hr_memo_test", "fill_empty"))
+    hrf.take_clipped()
+    parsed = {"memo": "ア" * 70000}
+    cl = ai.DryRunClient()
+    cl.existing_appt_props = {"A1": {"hr_memo_test": ""}}
+    assert hrf.apply_page_fields(cl, "A1", parsed, {"memo": "hr_memo_test"}) == "written"
+    sent = cl.updated_appts[0]["properties"]["hr_memo_test"]
+    assert len(sent) <= 65536 and sent.endswith("応募者詳細で確認）")
+    assert hrf.take_clipped() == ["hr_memo_test"]
+
+
+def test_CSVの長すぎる値も切る():
+    hrf.take_clipped()
+    col = next(c for c, (p, _) in hrf.CSV_FIELD_MAP.items() if p)
+    prop = hrf.CSV_FIELD_MAP[col][0]
+    out = hrf.csv_extra_from_raw({col: "x" * 70000})
+    assert len(out[prop]) <= 65536
+    assert hrf.take_clipped() == [prop]

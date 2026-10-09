@@ -69,6 +69,38 @@ PAGE_FIELD_MAP: dict = {
 
 HR_ID_COLUMN = "応募者id"
 
+# HubSpot の文字列プロパティは 65,536 文字まで。超えるとレコードごと書込みを拒否される
+HUBSPOT_TEXT_MAX = 65536
+CLIP_SUFFIX = "\n（以下省略。全文は HRハッカーの応募者詳細で確認）"
+
+# 切り詰めたプロパティ名の溜め場 (値・応募者idは持たない)。ログ出力側が take_clipped で取り出す
+_clipped_props: list = []
+
+
+def clip_for_hubspot(value: str, limit: int = HUBSPOT_TEXT_MAX) -> tuple:
+    """長すぎる文字列を、末尾の注記つきで limit 文字以内に切る。 -> (文字列, 切ったか)。"""
+    if len(value) <= limit:
+        return value, False
+    keep = max(limit - len(CLIP_SUFFIX), 0)
+    return value[:keep] + CLIP_SUFFIX, True
+
+
+def _clip_prop(prop: str, value):
+    """書込み用の値を切る。切ったらプロパティ名を記録する (文字列以外はそのまま)。"""
+    if not isinstance(value, str):
+        return value
+    v, hit = clip_for_hubspot(value)
+    if hit:
+        _clipped_props.append(prop)
+    return v
+
+
+def take_clipped() -> list:
+    """これまでに切ったプロパティ名 (重複あり) を返して空にする。"""
+    out = list(_clipped_props)
+    _clipped_props.clear()
+    return out
+
 
 # ---------------------------------------------------------------- 方針の引き当て
 def policy_for(prop: str) -> str:
@@ -110,7 +142,7 @@ def csv_extra_from_raw(raw: dict) -> dict:
             continue
         v = str(raw.get(col) or "").strip()
         if v:
-            out[prop] = v
+            out[prop] = _clip_prop(prop, v)
     return out
 
 
@@ -412,7 +444,7 @@ def page_props_from_parsed(parsed: dict, fields: dict) -> dict:
         v = vals.get(f)
         if v:
             out[prop] = f"{out[prop]}\n{v}" if prop in out else v
-    return out
+    return {prop: _clip_prop(prop, v) for prop, v in out.items()}
 
 
 def apply_page_fields(client, appointment_id: str, parsed: dict, fields: dict) -> str:
