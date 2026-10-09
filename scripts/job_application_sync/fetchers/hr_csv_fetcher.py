@@ -210,15 +210,23 @@ async def fetch_hr_branches(
         try:
             ctx, page = await _establish_session(browser, user, password)
             await _dismiss_onboarding(page)
+            # 2026-10-09 の読み取り確認で動いた手順と同じにする (遷移後に onboarding を
+            # もう一度閉じたり networkidle を待ったりすると、初回の本番実行でボタンを
+            # 押せずに 30 秒で止まった)。
             await page.goto(BRANCHES_URL, wait_until="domcontentloaded")
             try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
+                async with page.expect_download(timeout=180_000) as dl_info:
+                    await page.click(BRANCHES_DOWNLOAD_BTN, timeout=60_000)
+                dl = await dl_info.value
             except Exception:
-                pass
-            await _dismiss_onboarding(page)
-            async with page.expect_download(timeout=180_000) as dl_info:
-                await page.click(BRANCHES_DOWNLOAD_BTN)
-            dl = await dl_info.value
+                # 値は出さず、原因を絞るための件数だけ出す
+                path_ok = page.url.split("?")[0].endswith("/admin/branches")
+                found = await page.locator(BRANCHES_DOWNLOAD_BTN).count()
+                visible = await page.locator(BRANCHES_DOWNLOAD_BTN).first.is_visible() if found else False
+                forms = await page.locator("#js-search-form").count()
+                print(f"[hr_branches] ボタンを押せなかった: ページ到達={path_ok} "
+                      f"ボタン={found}件 表示={visible} 検索フォーム={forms}件", flush=True)
+                raise
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = output_dir / f"hr_branches_{ts}.csv"
             await dl.save_as(str(out_path))
