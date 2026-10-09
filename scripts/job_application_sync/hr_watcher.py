@@ -407,12 +407,19 @@ def run(csv_path: Optional[str] = None,
     summary["prev_snapshot_jobs"] = len(prev.get("jobs", {}))
     summary["curr_snapshot_jobs"] = len(curr.get("jobs", {}))
 
-    # 今回スナップショット保存 (差分0でも保存して次回の基準にする)
-    snap_path = save_snapshot(snapshot_dir, curr)
-    summary["snapshot_path"] = str(snap_path)
+    # スナップショットの保存タイミング (2026-10-09):
+    #   差分0件 / 初回暴発ガード中断 → ここで保存 (従来どおり)。
+    #   差分あり → A-1 (HubSpot取込) が成功した後でだけ保存する。
+    #   旧実装は取込の前に保存していたため、取込が 429 で落ちても次回が「差分0件」になり、
+    #   失敗した差分が二度と再試行されなかった。失敗時は前回の控えを残して次回に再試行する。
+    def _persist_snapshot() -> Path:
+        p = save_snapshot(snapshot_dir, curr)
+        summary["snapshot_path"] = str(p)
+        return p
 
     # ---- W-3: 差分0件 → 終了 ----
     if diff_is_empty(diff):
+        snap_path = _persist_snapshot()
         summary["skipped_aw"] = True
         summary["skip_reason"] = "no_diff"
         log_path = _write_log(summary, "no_diff")
@@ -429,6 +436,7 @@ def run(csv_path: Optional[str] = None,
     MASS_WRITE_THRESHOLD = 500
     is_first_run = len(prev.get("jobs", {})) == 0
     if not dry_run and is_first_run and len(diff["new"]) > MASS_WRITE_THRESHOLD:
+        _persist_snapshot()
         summary["aborted"] = True
         summary["abort_reason"] = (
             f"first_run_mass_write_guard: snapshot欠損 かつ new={len(diff['new'])} "
@@ -444,12 +452,23 @@ def run(csv_path: Optional[str] = None,
     if hrhacker_run_fn is None:
         from scripts.job_application_sync import hrhacker_import as hi  # noqa: E402
         hrhacker_run_fn = hi.run
+    import_ok = True
     try:
         hr_summary = hrhacker_run_fn(csv_path, dry_run=dry_run)
         summary["hrhacker_summary"] = hr_summary
+        # 例外が無くても書込に失敗した行があれば再試行できるよう控えを進めない
+        if isinstance(hr_summary, dict) and (
+                (hr_summary.get("updates_ng") or 0) + (hr_summary.get("creates_ng") or 0)) > 0:
+            import_ok = False
     except Exception as e:
+        import_ok = False
         summary["hrhacker_error"] = str(e)
         print(f"[hr_watcher] ⚠️ A-1 失敗: {type(e).__name__}: {plog.redact(e)}")
+    if import_ok:
+        _persist_snapshot()
+    else:
+        summary["snapshot_kept_previous"] = True
+        print("[hr_watcher] A-1 が完了しなかったため前回の控えを残す (次回に同じ差分を再試行)")
 
     # ---- W-4-b: 影響店舗ID集合 ----
     affected_shop_ids = extract_affected_shop_ids(curr, prev, diff)

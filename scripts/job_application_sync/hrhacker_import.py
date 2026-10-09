@@ -240,6 +240,48 @@ def load_hr_csv(path: str | Path, encoding: str = HR_CSV_ENCODING) -> list[dict]
 # ============================================================================
 # HubSpot LISTING 検索 (id_hrhakkaa による)
 # ============================================================================
+# Search API の間隔と再試行 (2026-10-09)。
+# HubSpot の Search は口座全体で約 5 回/秒、HR_HR アプリと共有 (外部バッチに残るのは
+# 約 2 回/秒)。旧 0.1 秒間隔 (約 10 回/秒) で 327 回検索して 429 になり、取込全体が落ちた。
+SEARCH_INTERVAL_SEC = 0.5
+SEARCH_MAX_RETRIES = 5
+RETRY_AFTER_DEFAULT_SEC = 2.0
+RETRY_AFTER_CAP_SEC = 30.0
+# 検索の総時間の上限。ワークフロー (job_daily) の timeout は 30 分なので、
+# 後続の更新 (batch_update 等) の時間を残すため 20 分で打ち切って明示エラーにする。
+# 通常は 327 回 × 0.5 秒 ≒ 3 分弱。
+SEARCH_TIME_BUDGET_SEC = 20 * 60
+
+
+def _retry_after_sec(resp) -> float:
+    try:
+        v = float((getattr(resp, "headers", None) or {}).get("Retry-After"))
+    except (TypeError, ValueError):
+        v = RETRY_AFTER_DEFAULT_SEC
+    return min(max(v, 0.0), RETRY_AFTER_CAP_SEC)
+
+
+def _search_with_retry(url: str, headers: dict, body: dict):
+    """Search を 1 回呼ぶ. 429 は Retry-After (既定2秒, 上限30秒) 待って、5xx は指数
+    バックオフで、最大 SEARCH_MAX_RETRIES 回まで再試行. それ以外のエラーは raise."""
+    attempt = 0
+    while True:
+        r = requests.post(url, headers=headers, json=body, timeout=30)
+        code = r.status_code
+        if code == 429 or 500 <= code < 600:
+            if attempt >= SEARCH_MAX_RETRIES:
+                r.raise_for_status()
+            wait = (_retry_after_sec(r) if code == 429
+                    else min(RETRY_AFTER_DEFAULT_SEC * (2 ** attempt), RETRY_AFTER_CAP_SEC))
+            attempt += 1
+            plog.public(f"[hrhacker_import] Search HTTP {code} → {wait:.0f}秒待って再試行 "
+                        f"({attempt}/{SEARCH_MAX_RETRIES})")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r
+
+
 def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
     """id_hrhakkaa リスト → {media_job_id: {id, properties}} の辞書を返す.
 
@@ -259,11 +301,17 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
                     # 選考進行中/採用決定なら機械は上書きしない
                     "hs_pipeline_stage"]
     headers = _headers()
+    started = time.monotonic()
+    calls = 0
     # IN operator で 100件ずつ検索
     for i in range(0, len(media_job_ids), 100):
         chunk = [j for j in media_job_ids[i:i + 100] if j]
         if not chunk:
             continue
+        if time.monotonic() - started > SEARCH_TIME_BUDGET_SEC:
+            raise RuntimeError(
+                f"find_hubspot_jobs: 検索の総時間が上限 {SEARCH_TIME_BUDGET_SEC}s を超えた "
+                f"(実行 {calls} 回). ワークフローの timeout 前に中断")
         body = {
             "limit": 200,
             "properties": target_props,
@@ -271,14 +319,13 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
                 {"propertyName": "id_hrhakkaa", "operator": "IN", "values": chunk}
             ]}],
         }
-        r = requests.post(f"{BASE}/crm/v3/objects/0-420/search",
-                          headers=headers, json=body, timeout=30)
-        r.raise_for_status()
+        r = _search_with_retry(f"{BASE}/crm/v3/objects/0-420/search", headers, body)
+        calls += 1
         for o in r.json().get("results", []):
             jid = (o.get("properties") or {}).get("id_hrhakkaa")
             if jid:
                 result[jid] = {"id": o["id"], "properties": o.get("properties") or {}}
-        time.sleep(0.1)
+        time.sleep(SEARCH_INTERVAL_SEC)
     return result
 
 
@@ -612,6 +659,63 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dic
     return summary
 
 
+def run_copy_only(csv_path: str, dry_run: bool = True,
+                  limit: Optional[int] = None) -> dict:
+    """一回限りの埋め戻し: 既存 LISTING の本文・画像 2 プロパティだけを更新する.
+
+    - 新規作成はしない (batch_create / テンプレNote は呼ばない)
+    - 触るのは hrh_kyuujinhyou_honbun / hrh_kyuujinhyou_gazou だけ
+      (ステータス・ステージ・名前・日付・同期管理列は一切書かない)
+    - HubSpot に無い id は件数だけ数えて飛ばす. 値が同じ行は書かない (copy_props)
+    - 公開ログには件数だけ出す (顧客名・ID は出さない)
+    """
+    rows = load_hr_csv(str(csv_path))
+    if limit:
+        rows = rows[:limit]
+    valid_rows = [r for r in rows if r.get("media_job_id")]
+    media_job_ids = list(dict.fromkeys(r["media_job_id"] for r in valid_rows))
+    plog.public(f"=== hrhacker_import --copy-only (dry_run={dry_run}) === CSV {len(rows)} 件")
+
+    summary: dict = {
+        "mode": "copy_only", "dry_run": dry_run, "csv_total_rows": len(rows),
+        "valid_rows": len(valid_rows), "not_found": 0, "unchanged": 0,
+        "updates_planned": 0,
+    }
+    if dry_run and not os.environ.get("HUBSPOT_ACCESS_TOKEN"):
+        summary["search_skipped"] = "dry_run_no_token"
+        plog.public("  (dry-run かつトークン無し: HubSpot 検索を省略)")
+        return summary
+
+    existing = find_hubspot_jobs(media_job_ids)
+    updates: list[dict] = []
+    seen_ids: set[str] = set()
+    for row in valid_rows:
+        hit = existing.get(row["media_job_id"])
+        if hit is None:
+            summary["not_found"] += 1
+            continue
+        if hit["id"] in seen_ids:  # CSV 内の重複行 (batch に同じ id を 2 度入れない)
+            continue
+        props = copy_props(row, hit["properties"])
+        if not props:
+            summary["unchanged"] += 1
+            continue
+        seen_ids.add(hit["id"])
+        updates.append({"id": hit["id"], "properties": props})
+    summary["updates_planned"] = len(updates)
+    plog.public(f"  更新予定 {len(updates)} 件 / 変更なし {summary['unchanged']} 件 / "
+                f"HubSpotに無い {summary['not_found']} 件")
+
+    if not dry_run:
+        u_ok, u_ng, u_err = batch_update(updates)
+        summary.update({"updates_ok": u_ok, "updates_ng": u_ng})
+        plog.public(f"  更新: OK {u_ok} / NG {u_ng}")
+        if u_err:
+            plog.public(f"  更新エラー {len(u_err)} 件 (内容は非公開ログ)")
+            plog.detail("hrhacker_import_copy_only_errors", errors=u_err[:20])
+    return summary
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="HRハッカーCSV取込 (LISTING upsert)")
     p.add_argument("--csv", required=True, help="HR CSV パス")
@@ -622,11 +726,19 @@ def parse_args(argv=None):
                    help="HubSpot API を実行する")
     p.add_argument("--limit", type=int, default=None,
                    help="CSV先頭N件のみ処理 (テスト用)")
+    p.add_argument("--copy-only", action="store_true",
+                   help="一回限りの埋め戻し: 既存 LISTING の本文・画像 2 プロパティだけを更新 "
+                        "(新規作成・他プロパティは一切触らない)")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.copy_only:
+        res = run_copy_only(args.csv, dry_run=not args.actual, limit=args.limit)
+        if res.get("updates_ng"):
+            sys.exit(1)  # 書込に失敗した分があればジョブを失敗にする
+        return
     run(args.csv, dry_run=not args.actual, limit=args.limit)
 
 
