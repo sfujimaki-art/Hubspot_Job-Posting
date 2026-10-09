@@ -16,6 +16,8 @@ def _no_private_sheet(monkeypatch):
     from scripts.job_application_sync import private_log as plog
 
     monkeypatch.delenv("JAS_SHEET_ID", raising=False)
+    monkeypatch.delenv("JAS_APPLICANT_QUEUE_SHEET_ID", raising=False)
+    monkeypatch.delenv("PRIVATE_LOG_SHEET_ID", raising=False)
     plog._take()
     yield
     plog._take()

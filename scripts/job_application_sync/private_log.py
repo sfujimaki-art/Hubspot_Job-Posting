@@ -6,7 +6,7 @@
   それまでのログには顧客の会社名・担当者の姓・取引ID・取引先コード・取引名・
   サービスアカウントのメール・バケット名・シートIDの先頭が出ていた。
   ユーザー決定 (2026-10-09): リポジトリは public のまま、詳しいログは
-  サービスアカウントが既に編集できる非公開スプレッドシート (JAS_SHEET_ID) の
+  サービスアカウントが既に書き込んでいる非公開の集約シート (JAS_APPLICANT_QUEUE_SHEET_ID) の
   タブ「実行ログ」に置く。
 
 使い方
@@ -145,9 +145,14 @@ def _al():
 
 
 def _open_book():
-    sid = os.environ.get("JAS_SHEET_ID", "")
+    # 書き先は集約シート (応募キューのシート。SA が書き込める)。顧客管理シート
+    # (JAS_SHEET_ID) は「アカウント情報」の ID/PW を持ち、SA は読むだけなので使わない
+    # (2026-10-09 本番初回で WorksheetNotFound = タブを作れなかった)。
+    # PRIVATE_LOG_SHEET_ID があればそちらを優先する。
+    sid = (os.environ.get("PRIVATE_LOG_SHEET_ID", "")
+           or os.environ.get("JAS_APPLICANT_QUEUE_SHEET_ID", ""))
     if not sid:
-        raise RuntimeError("JAS_SHEET_ID 未設定")
+        raise RuntimeError("非公開ログのシートID 未設定")
     al = _al()
     gc = al.get_sheets_client()
     return al, al.sheet_retry(gc.open_by_key, sid)

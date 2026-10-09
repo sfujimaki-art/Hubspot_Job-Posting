@@ -100,7 +100,7 @@ def test_flush_ローカル実行では手元のファイルに残す(monkeypatc
 
 def test_flush_認証エラーでも例外を上げない(monkeypatch, capsys):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    monkeypatch.setenv("JAS_SHEET_ID", "1AbCdEfGhIjKlMnOpQrStUvWxYz")
+    monkeypatch.setenv("JAS_APPLICANT_QUEUE_SHEET_ID", "1AbCdEfGhIjKlMnOpQrStUvWxYz")
     monkeypatch.setenv("SHEETS_AUTH_MODE", "sa")
     monkeypatch.delenv("GOOGLE_SA_JSON", raising=False)
     plog.detail("e1", x=1)
