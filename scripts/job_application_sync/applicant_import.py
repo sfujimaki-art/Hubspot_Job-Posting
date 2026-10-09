@@ -56,10 +56,12 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol
+
+from scripts.job_application_sync import hr_applicant_fields as hrf
 
 
 # ---- Association type IDs (Phase 0 実測確定) ------------------------------
@@ -252,6 +254,9 @@ def _convert_raw_media_rows(raw_rows: list[dict], media: str) -> list[dict]:
             g["以下住所"] = " ".join(
                 s for s in (str(r.get(c) or "").strip()
                             for c in ("丁目", "番地", "建物名")) if s)
+            # CSVの他の列は hr_applicant_fields の対応表で使う (後段 load_applicants_csv)
+            g["__hr_raw"] = {k: str(v or "").strip() for k, v in r.items()
+                             if k is not None}
         out.append(g)
     return out
 
@@ -279,6 +284,9 @@ class ApplicantRow:
     pref: str = ""             # 都道府県
     city: str = ""             # 市区町村
     addr_rest: str = ""        # 市区町村以下住所 (丁目番地建物)
+    # HR固有 (hr_applicant_fields の対応表。HRのCSV以外では空)
+    hr_applicant_id: str = ""  # 応募者id (詳細ページ /admin/applicants/edit/<id> のキー)
+    extra: dict = field(default_factory=dict)  # {HubSpotプロパティ名: 値} 空値は入れない
 
 
 @dataclass
@@ -293,6 +301,10 @@ class ProcessResult:
     message: str = ""
     # ②求人由来暗黙知Noteの複製結果 (複製したnote_id / None=skip・該当なし・失敗)
     note_copied: Optional[str] = None
+    # HR: 詳細ページの取得・書込みを appointment_id に結びつけるキー
+    hr_applicant_id: str = ""
+    # 0-421 に無くて書かなかったプロパティ名 (公開ログには件数だけ)
+    dropped_props: list = field(default_factory=list)
 
 
 # ============================================================================
@@ -312,6 +324,11 @@ class HubSpotClient(Protocol):
     def update_appointment(self, appointment_id: str, properties: dict) -> None: ...
     def get_appointment_props(self, appointment_id: str,
                               properties: list) -> dict: ...
+    # 失敗時に {} を返さず例外を上げる版 (「空」と見て上書きしないため)
+    def get_appointment_props_strict(self, appointment_id: str,
+                                     properties: list) -> dict: ...
+    # 0-421 に実在するプロパティ名の集合。取れなければ None
+    def known_appointment_props(self) -> Optional[set]: ...
     def get_oubosaki_props(self, listing_id: str, media: str, login_id: str, media_job_id: str) -> dict: ...
     def copy_listing_note(self, listing_id: str, appointment_id: str) -> Optional[str]: ...
 
@@ -416,6 +433,16 @@ class DryRunClient:
                               properties: list) -> dict:
         # ドライランでは注入辞書(existing_appt_props)から返す (テスト用)。既定{}
         return getattr(self, "existing_appt_props", {}).get(appointment_id, {})
+
+    def get_appointment_props_strict(self, appointment_id: str,
+                                     properties: list) -> dict:
+        if getattr(self, "strict_read_fails", False):
+            raise RuntimeError("read failed (test)")
+        return getattr(self, "existing_appt_props", {}).get(appointment_id, {})
+
+    def known_appointment_props(self) -> Optional[set]:
+        # ドライランでは注入集合(known_props)。未注入=一覧が取れなかった扱い
+        return getattr(self, "known_props", None)
 
     def get_oubosaki_props(self, listing_id: str, media: str,
                            login_id: str, media_job_id: str) -> dict:
@@ -629,6 +656,27 @@ class RealHubSpotClient:
             return r.json().get("properties") or {}
         except Exception:  # noqa: BLE001
             return {}
+
+    def get_appointment_props_strict(self, appointment_id: str,
+                                     properties: list) -> dict:
+        """現在値の取得。失敗は例外 (空と見て人の入力を上書きしないため)。"""
+        url = (f"{self.BASE}/crm/v3/objects/0-421/{appointment_id}"
+               f"?properties={','.join(properties)}")
+        r = self._requests.get(url, headers=self.headers, timeout=30)
+        r.raise_for_status()
+        return r.json().get("properties") or {}
+
+    def known_appointment_props(self) -> Optional[set]:
+        """0-421 に実在するプロパティ名 (名前だけ)。1実行1回。取れなければ None。"""
+        if not hasattr(self, "_known_props"):
+            try:
+                r = self._requests.get(f"{self.BASE}/crm/v3/properties/0-421",
+                                       headers=self.headers, timeout=30)
+                r.raise_for_status()
+                self._known_props = {p["name"] for p in r.json().get("results", [])}
+            except Exception:  # noqa: BLE001
+                self._known_props = None
+        return self._known_props
 
     def _read_deals(self, deal_ids: list) -> dict:
         """取引をまとめて読む {id: props}。失敗は {} (best-effort)。"""
@@ -1030,6 +1078,7 @@ def load_applicants_csv(path: Path) -> list[ApplicantRow]:
         if not (pref or city or addr_rest) and s("住所全体"):
             pref, city, addr_rest = split_jp_address(s("住所全体"))
         age = s("年齢") if s("年齢").isdigit() else compute_age(birthdate, apply_date)
+        hr_raw = r.get("__hr_raw") or {}
         out.append(ApplicantRow(
             name=s("応募者氏名"),
             kana=s("カナ"),
@@ -1047,6 +1096,8 @@ def load_applicants_csv(path: Path) -> list[ApplicantRow]:
             pref=pref if pref in _PREFS else "",
             city=city,
             addr_rest=addr_rest,
+            hr_applicant_id=str(hr_raw.get(hrf.HR_ID_COLUMN) or "").strip(),
+            extra=hrf.csv_extra_from_raw(hr_raw) if hr_raw else {},
         ))
     return out
 
@@ -1151,6 +1202,9 @@ def build_appointment_properties(
             f"(applicant_import 取込時にLISTING検索ヒットゼロ。"
             f"v0.2 §24-1 §24-2 によりタイトル類似度等での自動紐付けは禁止。人間確認要。)"
         )
+    # HRのCSV由来の追加項目 (hr_applicant_fields の対応表)。既存の項目は上書きしない
+    for k, v in (row.extra or {}).items():
+        props.setdefault(k, v)
     # 空文字プロパティは除外 (HubSpot側で「空書込で既存値消去」を避ける)
     return {k: v for k, v in props.items() if v != ""}
 
@@ -1159,6 +1213,23 @@ def build_appointment_properties(
 # 主要処理
 # ============================================================================
 def process_applicant(
+    row: ApplicantRow, client: HubSpotClient, default_login_id: str = ""
+) -> ProcessResult:
+    """1応募行を処理 (本体は _process_applicant)。HR固有の結びつけ情報を結果に付ける。"""
+    dropped: list = []
+    if row.extra:
+        # 0-421 に無いプロパティを書くとレコードごと拒否されるので、実在するものだけにする
+        known = (client.known_appointment_props()
+                 if hasattr(client, "known_appointment_props") else None)
+        kept, dropped = hrf.filter_known_props(row.extra, known)
+        row = replace(row, extra=kept)
+    res = _process_applicant(row, client, default_login_id)
+    res.hr_applicant_id = row.hr_applicant_id
+    res.dropped_props = dropped
+    return res
+
+
+def _process_applicant(
     row: ApplicantRow, client: HubSpotClient, default_login_id: str = ""
 ) -> ProcessResult:
     """1応募行を処理。LISTING検索 → 重複検出 → APPOINTMENT 作成 → Association。
@@ -1223,7 +1294,16 @@ def process_applicant(
             if own:
                 cand["hubspot_owner_id"] = own
         fill = {}
-        if cand:
+        if row.extra:
+            # HRの追加項目つき: 現在値を厳密に読む (読めなければ何も書かない)。
+            # fill_empty は空のときだけ / hr_copy は違うときだけ更新 (空値は書かない)
+            try:
+                cur = client.get_appointment_props_strict(
+                    existing, list(cand) + list(row.extra))
+                fill = hrf.plan_property_updates({**cand, **row.extra}, cur)
+            except Exception:  # noqa: BLE001
+                fill = {}
+        elif cand:
             cur = client.get_appointment_props(existing, list(cand))
             fill = {k: v for k, v in cand.items()
                     if not str(cur.get(k) or "").strip()}
