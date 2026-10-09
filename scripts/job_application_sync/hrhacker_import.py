@@ -162,6 +162,69 @@ def copy_props(row: dict, existing_props: Optional[dict]) -> dict:
     return p
 
 
+# 勤務地 (2026-10-09): 求人CSVの店舗id → HRハッカー店舗一覧の 都道府県/市区町村 を LISTING へ。
+# 求人文面管理で 都道府県 × 職種 に分けて見るため。HubSpot が空のときだけ書く (人の入力は上書きしない)。
+PROP_PREFECTURE = "todoufuken"
+PROP_CITY = "shikuchouson"
+PREFECTURES: frozenset = frozenset((
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+))
+BRANCHES_ENCODING = "cp932"
+
+
+def load_branch_locations(path: str | Path) -> dict[str, tuple[str, Optional[str]]]:
+    """店舗一覧CSV (cp932) → {店舗id: (都道府県, 市区町村 or None)}.
+
+    都道府県が47都道府県名でない行は捨てる。同じ店舗idで値が食い違う場合はその店舗を捨てる。
+    捨てた件数は戻り値の辞書の属性ではなく、公開ログ (件数のみ) に出す。
+    """
+    found: dict[str, tuple[str, Optional[str]]] = {}
+    conflicts: set[str] = set()
+    skipped_invalid = 0
+    with open(path, "r", encoding=BRANCHES_ENCODING, errors="replace", newline="") as f:
+        for r in csv.DictReader(f):
+            sid = _clean(r.get("店舗id"))
+            pref = _clean(r.get("都道府県"))
+            city = _clean(r.get("市区町村")) or None
+            if not sid or pref not in PREFECTURES:
+                skipped_invalid += 1
+                continue
+            val = (pref, city)
+            if sid in found and found[sid] != val:
+                conflicts.add(sid)
+            found[sid] = val
+    for sid in conflicts:
+        found.pop(sid, None)
+    plog.public(f"  店舗一覧: {len(found)} 店舗 / 都道府県が不正で除外 {skipped_invalid} 行 / "
+                f"重複で値が食い違い除外 {len(conflicts)} 店舗")
+    return found
+
+
+def location_props(row: dict, existing_props: Optional[dict],
+                   branch_locations: Optional[dict]) -> dict:
+    """HubSpot で空の 都道府県/市区町村 だけ、店舗一覧の値で埋める (既存値は上書きしない)."""
+    if not branch_locations:
+        return {}
+    sid = _clean(row.get("shop_id"))
+    loc = branch_locations.get(sid) if sid else None
+    if not loc:
+        return {}
+    p: dict = {}
+    for prop, value in ((PROP_PREFECTURE, loc[0]), (PROP_CITY, loc[1])):
+        if not value:
+            continue
+        current = (existing_props or {}).get(prop)
+        if not (current or "").strip():
+            p[prop] = value
+    return p
+
+
 # CSVエンコーディング: Shift-JIS (BOMなし) — Phase 0b 28382 実測で確定
 HR_CSV_ENCODING = "shift_jis"
 
@@ -297,6 +360,8 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
                     PROP_HS_KYUUJIN_STATUS, PROP_MEDIA_ORIG_STATUS,
                     # 本文・画像は値が変わったときだけ書くため、今の値を読む
                     PROP_COPY_BODY, PROP_COPY_IMAGES,
+                    # 勤務地は空のときだけ書くため、今の値を読む
+                    PROP_PREFECTURE, PROP_CITY,
                     # ステージ保護判定に必要 (2026-08-06): 現ステージが
                     # 選考進行中/採用決定なら機械は上書きしない
                     "hs_pipeline_stage"]
@@ -333,7 +398,8 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
 # プロパティビルダ
 # ============================================================================
 def build_update_props(row: dict, existing_props: dict, today_iso: str,
-                       now_iso: str, source_filename: str) -> dict:
+                       now_iso: str, source_filename: str,
+                       branch_locations: Optional[dict] = None) -> dict:
     """既存LISTING更新用プロパティ. 既存値保護を適用.
 
     更新対象 (常に更新):
@@ -397,6 +463,9 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
     # 求人票の本文・画像: 値が変わったときだけ (プロパティ履歴 = 版の履歴)
     p.update(copy_props(row, existing_props))
 
+    # 勤務地: 空のときだけ店舗一覧の値で補完
+    p.update(location_props(row, existing_props, branch_locations))
+
     return p
 
 
@@ -418,7 +487,8 @@ def _hr_date_to_millis(s: object) -> Optional[int]:
 
 
 def build_create_props(row: dict, today_iso: str, now_iso: str,
-                       source_filename: str) -> dict:
+                       source_filename: str,
+                       branch_locations: Optional[dict] = None) -> dict:
     """新規LISTING作成用プロパティ."""
     p: dict = {}
     jid = row.get("media_job_id", "")
@@ -474,6 +544,9 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
 
     # 求人票の本文・画像 (最初の版)
     p.update(copy_props(row, None))
+
+    # 勤務地 (店舗一覧で分かるものだけ)
+    p.update(location_props(row, None, branch_locations))
 
     return p
 
@@ -539,7 +612,8 @@ def batch_create(creates: list[dict]) -> tuple[int, int, list[str], dict]:
 # ============================================================================
 # メイン処理
 # ============================================================================
-def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dict:
+def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None,
+        branch_locations: Optional[dict] = None) -> dict:
     """A-1 メインオーケストレーション. 結果サマリ辞書を返す."""
     csv_path = str(csv_path)
     source_filename = os.path.basename(csv_path)
@@ -585,13 +659,15 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dic
         jid = row["media_job_id"]
         if jid in existing:
             props = build_update_props(row, existing[jid]["properties"],
-                                       today_iso, now_iso, source_filename)
+                                       today_iso, now_iso, source_filename,
+                                       branch_locations)
             updates.append({"id": existing[jid]["id"], "properties": props})
             update_preview.append({"id_hrhakkaa": jid,
                                    "hubspot_id": existing[jid]["id"],
                                    "properties": props})
         else:
-            props = build_create_props(row, today_iso, now_iso, source_filename)
+            props = build_create_props(row, today_iso, now_iso, source_filename,
+                                       branch_locations)
             creates.append({"properties": props})
             create_preview.append({"id_hrhakkaa": jid, "properties": props})
 
@@ -605,6 +681,15 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dic
         "creates_planned": len(creates),
         "dry_run": dry_run,
     }
+    if branch_locations is not None:
+        summary["location_filled"] = sum(
+            1 for u in updates
+            if PROP_PREFECTURE in u["properties"] or PROP_CITY in u["properties"]
+        ) + sum(
+            1 for c in creates
+            if PROP_PREFECTURE in c["properties"] or PROP_CITY in c["properties"]
+        )
+        print(f"  勤務地を補完予定: {summary['location_filled']} 件")
 
     print(f"\n--- 集計 ---")
     print(f"  更新予定: {len(updates)} 件")
@@ -660,11 +745,13 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None) -> dic
 
 
 def run_copy_only(csv_path: str, dry_run: bool = True,
-                  limit: Optional[int] = None) -> dict:
+                  limit: Optional[int] = None,
+                  branch_locations: Optional[dict] = None) -> dict:
     """一回限りの埋め戻し: 既存 LISTING の本文・画像 2 プロパティだけを更新する.
 
     - 新規作成はしない (batch_create / テンプレNote は呼ばない)
     - 触るのは hrh_kyuujinhyou_honbun / hrh_kyuujinhyou_gazou だけ
+      (branch_locations を渡したときは、空の todoufuken / shikuchouson も埋める)
       (ステータス・ステージ・名前・日付・同期管理列は一切書かない)
     - HubSpot に無い id は件数だけ数えて飛ばす. 値が同じ行は書かない (copy_props)
     - 公開ログには件数だけ出す (顧客名・ID は出さない)
@@ -681,6 +768,12 @@ def run_copy_only(csv_path: str, dry_run: bool = True,
         "valid_rows": len(valid_rows), "not_found": 0, "unchanged": 0,
         "updates_planned": 0,
     }
+    if branch_locations is not None:
+        summary["location_filled"] = 0
+        summary["shop_not_in_branches"] = len({
+            _clean(r.get("shop_id")) for r in valid_rows
+            if _clean(r.get("shop_id")) and _clean(r.get("shop_id")) not in branch_locations
+        })
     if dry_run and not os.environ.get("HUBSPOT_ACCESS_TOKEN"):
         summary["search_skipped"] = "dry_run_no_token"
         plog.public("  (dry-run かつトークン無し: HubSpot 検索を省略)")
@@ -697,14 +790,21 @@ def run_copy_only(csv_path: str, dry_run: bool = True,
         if hit["id"] in seen_ids:  # CSV 内の重複行 (batch に同じ id を 2 度入れない)
             continue
         props = copy_props(row, hit["properties"])
+        loc = location_props(row, hit["properties"], branch_locations)
+        props.update(loc)
         if not props:
             summary["unchanged"] += 1
             continue
         seen_ids.add(hit["id"])
+        if loc:
+            summary["location_filled"] += 1
         updates.append({"id": hit["id"], "properties": props})
     summary["updates_planned"] = len(updates)
     plog.public(f"  更新予定 {len(updates)} 件 / 変更なし {summary['unchanged']} 件 / "
                 f"HubSpotに無い {summary['not_found']} 件")
+    if branch_locations is not None:
+        plog.public(f"  勤務地を補完 {summary['location_filled']} 件 / "
+                    f"店舗一覧に無い店舗id {summary['shop_not_in_branches']} 件")
 
     if not dry_run:
         u_ok, u_ng, u_err = batch_update(updates)
@@ -729,17 +829,21 @@ def parse_args(argv=None):
     p.add_argument("--copy-only", action="store_true",
                    help="一回限りの埋め戻し: 既存 LISTING の本文・画像 2 プロパティだけを更新 "
                         "(新規作成・他プロパティは一切触らない)")
+    p.add_argument("--branches-csv", default=None,
+                   help="HRハッカー店舗一覧CSV。渡すと LISTING の空の都道府県/市区町村を補完する")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    branches = load_branch_locations(args.branches_csv) if args.branches_csv else None
     if args.copy_only:
-        res = run_copy_only(args.csv, dry_run=not args.actual, limit=args.limit)
+        res = run_copy_only(args.csv, dry_run=not args.actual, limit=args.limit,
+                            branch_locations=branches)
         if res.get("updates_ng"):
             sys.exit(1)  # 書込に失敗した分があればジョブを失敗にする
         return
-    run(args.csv, dry_run=not args.actual, limit=args.limit)
+    run(args.csv, dry_run=not args.actual, limit=args.limit, branch_locations=branches)
 
 
 if __name__ == "__main__":
