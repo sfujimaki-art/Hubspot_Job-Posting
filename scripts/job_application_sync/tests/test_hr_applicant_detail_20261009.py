@@ -189,17 +189,32 @@ def test_メールの回答はmeeruadoresuと混ぜない(monkeypatch):
 
 
 # ---------------------------------------------------------------- 対応表
-def test_初期の対応表():
+CSV_EXPECTED = {
+    "応募者id": "hr_oubosha_id", "応募経路": "hr_oubo_keiyu",
+    "現在の職業": "hr_genzai_shokugyou", "連絡方法": "hr_renraku_houhou",
+    "見学会希望有無": "hr_kengaku_kibou", "見学会希望日": "hr_kengaku_kibou_bi",
+    "希望面接形態": "hr_mensetsu_keitai", "勤務可能期間": "hr_kinmu_kanou_kikan",
+    "選考ステータス": "hr_senkou_status", "面接予定日": "hr_mensetsu_yotei",
+    "選考理由": "hr_senkou_riyuu",
+}
+PAGE_EXPECTED = {
+    "qa": "hr_shitsumon_kaitou", "memo": "hr_memo",
+    "selection_history": "hr_senkou_rireki", "all_fields": "hr_oubosha_shousai_zen",
+}
+
+
+def test_対応表():
     assert hrf.CSV_FIELD_MAP["学歴"] == ("gakureki", "fill_empty")
     assert hrf.CSV_FIELD_MAP["連絡希望日"] == ("renrakukanouyoubijikantai", "fill_empty")
-    for col in ("応募者id", "応募経路", "現在の職業", "連絡方法", "見学会希望有無",
-                "見学会希望日", "希望面接形態", "勤務可能期間", "選考ステータス",
-                "面接予定日", "選考理由"):
-        assert hrf.CSV_FIELD_MAP[col] == (None, "hr_copy"), col
+    for col, prop in CSV_EXPECTED.items():
+        assert hrf.CSV_FIELD_MAP[col] == (prop, "hr_copy"), col
     for col in ("更新日", "店舗ID", "店舗名", "自由項目1", "自由項目2", "自由項目3"):
         assert col not in hrf.CSV_FIELD_MAP
-    assert set(hrf.PAGE_FIELD_MAP) == {"qa", "memo", "selection_history", "all_fields"}
-    assert all(v == (None, "fill_empty") for v in hrf.PAGE_FIELD_MAP.values())
+    assert set(hrf.CSV_FIELD_MAP) == set(CSV_EXPECTED) | {"学歴", "連絡希望日"}
+    # 勤務可能期間は hr_kinmu_kanou_kikan だけ。学歴は gakureki だけ (重複させない)
+    props = [p for p, _ in hrf.CSV_FIELD_MAP.values()]
+    assert len(props) == len(set(props))
+    assert hrf.PAGE_FIELD_MAP == {k: (v, "fill_empty") for k, v in PAGE_EXPECTED.items()}
 
 
 def test_存在しないプロパティは落とす():
@@ -211,8 +226,10 @@ def test_存在しないプロパティは落とす():
 
 
 def test_詳細ページを取る価値のある項目():
-    assert hrf.active_page_fields({"gakureki"}) == {}          # 現状は未対応 → 空
+    assert hrf.active_page_fields({"gakureki"}) == {}          # 対応先が実在しない → 空
     assert hrf.active_page_fields(None) == {}
+    # 4項目とも実在するなら4項目すべて有効
+    assert hrf.active_page_fields(set(PAGE_EXPECTED.values())) == PAGE_EXPECTED
 
 
 def test_対応先が実在するときだけ詳細項目が有効(monkeypatch):
@@ -234,6 +251,18 @@ def test_方針_fill_emptyは空のときだけ_hr_copyは違うとき(monkeypat
     # hr_copy は同じ値なら更新しない
     assert hrf.plan_property_updates({"hr_job_test": "会社員"},
                                      {"hr_job_test": "会社員"}) == {}
+
+
+def test_更新時_実際の対応表の方針():
+    wanted = {"hr_senkou_status": "面接済", "hr_mensetsu_yotei": "2026-10-25",
+              "hr_oubo_keiyu": "", "gakureki": "大卒",
+              "renrakukanouyoubijikantai": "夕方", "hr_memo": "新メモ"}
+    cur = {"hr_senkou_status": "未対応", "hr_mensetsu_yotei": "2026-10-25",
+           "hr_oubo_keiyu": "Indeed", "gakureki": "高卒(人が入力)",
+           "renrakukanouyoubijikantai": "", "hr_memo": "人のメモ"}
+    # hr_copy: 違えば更新 / 同じ・空は書かない。fill_empty: 空のときだけ
+    assert hrf.plan_property_updates(wanted, cur) == {
+        "hr_senkou_status": "面接済", "renrakukanouyoubijikantai": "夕方"}
 
 
 def test_空の値は書かない(monkeypatch):
@@ -262,12 +291,44 @@ def _csv_with(tmp_path, gakureki="大卒", kibou="夕方以降"):
 def test_CSVから追加項目と応募者idを読む(tmp_path):
     [row] = ai.load_applicants_csv(_csv_with(tmp_path))
     assert row.hr_applicant_id == "900001"
-    assert row.extra == {"gakureki": "大卒", "renrakukanouyoubijikantai": "夕方以降"}
+    # 学歴・連絡希望日 + 応募者idなど HR コピー11項目の一部 (_csv_with が入れた分)
+    assert row.extra == {"gakureki": "大卒", "renrakukanouyoubijikantai": "夕方以降",
+                         "hr_oubosha_id": "900001", "hr_senkou_status": "未対応"}
+
+
+def test_CSV全項目が対応プロパティに入る(tmp_path):
+    """実際の対応表で、CSV由来の13プロパティが具体値で出る。"""
+    cols = HR_RAW_HEADER.split(",")
+    vals = {c: "" for c in cols}
+    vals.update({
+        "応募者id": "900002", "応募求人先": "HR-7001", "応募経路": "Indeed",
+        "名前": "山田太郎", "現在の職業": "会社員", "連絡方法": "電話",
+        "見学会希望有無": "あり", "見学会希望日": "2026-10-20",
+        "希望面接形態": "対面", "学歴": "大卒", "勤務可能期間": "3か月以上",
+        "連絡希望日": "夕方以降", "選考ステータス": "面接調整中",
+        "面接予定日": "2026-10-25", "選考理由": "経験者のため",
+        "応募日時": "2026-10-01 09:00:00",
+        "更新日": "2026-10-02", "店舗ID": "S1", "店舗名": "新宿店",
+        "自由項目1": "回答1"})
+    p = tmp_path / "hr_all.csv"
+    p.write_bytes((HR_RAW_HEADER + "\n" + ",".join(vals[c] for c in cols) + "\n")
+                  .encode("cp932"))
+    [row] = ai.load_applicants_csv(p)
+    assert row.extra == {
+        "hr_oubosha_id": "900002", "hr_oubo_keiyu": "Indeed",
+        "hr_genzai_shokugyou": "会社員", "hr_renraku_houhou": "電話",
+        "hr_kengaku_kibou": "あり", "hr_kengaku_kibou_bi": "2026-10-20",
+        "hr_mensetsu_keitai": "対面", "hr_kinmu_kanou_kikan": "3か月以上",
+        "hr_senkou_status": "面接調整中", "hr_mensetsu_yotei": "2026-10-25",
+        "hr_senkou_riyuu": "経験者のため",
+        "gakureki": "大卒", "renrakukanouyoubijikantai": "夕方以降"}
+    assert len(row.extra) == 13
 
 
 def test_CSVの空欄は追加項目に入らない(tmp_path):
     [row] = ai.load_applicants_csv(_csv_with(tmp_path, gakureki="", kibou=""))
-    assert row.extra == {}
+    # 空欄の学歴・連絡希望日は入らない (応募者id・選考ステータスは値があるので残る)
+    assert row.extra == {"hr_oubosha_id": "900001", "hr_senkou_status": "未対応"}
 
 
 def test_追加項目を差し込んだ作成プロパティ(tmp_path, monkeypatch):
@@ -291,7 +352,8 @@ def test_生成時_実在しないプロパティは書かず結果に記録(tmp
     created = created.get("properties", created)
     assert created["gakureki"] == "大卒"
     assert "renrakukanouyoubijikantai" not in created
-    assert res.dropped_props == ["renrakukanouyoubijikantai"]
+    assert res.dropped_props == ["hr_oubosha_id", "hr_senkou_status",
+                                 "renrakukanouyoubijikantai"]
     assert res.hr_applicant_id == "900001"
 
 
@@ -350,6 +412,27 @@ def test_重複時_現在値が読めなければ何も書かない(tmp_path):
 
 
 # ---------------------------------------------------------------- 詳細ページの書込
+def test_詳細ページ_実際の対応表で4プロパティ(tmp_path):
+    parsed = hrf.parse_applicant_detail(DETAIL_HTML)
+    fields = hrf.active_page_fields(set(PAGE_EXPECTED.values()))
+    props = hrf.page_props_from_parsed(parsed, fields)
+    vals = hrf.format_page_values(parsed)
+    assert props == {
+        "hr_shitsumon_kaitou": vals["qa"], "hr_memo": "折り返し希望。\n夕方以降に電話。",
+        "hr_senkou_rireki": vals["selection_history"],
+        "hr_oubosha_shousai_zen": vals["all_fields"]}
+    assert all(props.values()) and "メールアドレス（indeed メール以外）：" in props["hr_shitsumon_kaitou"]
+    # 4つとも fill_empty: HubSpot が空なら書く、値があれば書かない
+    cl = ai.DryRunClient()
+    cl.existing_appt_props = {"A1": {k: "" for k in props}}
+    assert hrf.apply_page_fields(cl, "A1", parsed, fields) == "written"
+    assert cl.updated_appts == [{"id": "A1", "properties": props}]
+    cl2 = ai.DryRunClient()
+    cl2.existing_appt_props = {"A1": {**{k: "" for k in props}, "hr_memo": "人のメモ"}}
+    assert hrf.apply_page_fields(cl2, "A1", parsed, fields) == "written"
+    assert "hr_memo" not in cl2.updated_appts[0]["properties"]
+
+
 def test_詳細ページ_fill_emptyで書く(monkeypatch):
     monkeypatch.setitem(hrf.PAGE_FIELD_MAP, "memo", ("hr_memo_test", "fill_empty"))
     parsed = hrf.parse_applicant_detail(DETAIL_HTML)
@@ -495,7 +578,9 @@ def test_詳細取得の対象選び_新しい応募から(tmp_path):
 
 
 def test_対応先なしなら詳細ページは取らない_ブラウザ呼び出しなし(tmp_path, monkeypatch):
-    """PAGE_FIELD_MAP が全部 None の現状: select が None のまま取得関数へ渡る。"""
+    """PAGE_FIELD_MAP が全部 None のとき: select が None のまま取得関数へ渡る。"""
+    for k, (_p, pol) in list(hrf.PAGE_FIELD_MAP.items()):
+        monkeypatch.setitem(hrf.PAGE_FIELD_MAP, k, (None, pol))
     from scripts.job_application_sync import applicant_sync as sync
     p = _write_hr_raw_csv(tmp_path, n=2)
     seen = {}

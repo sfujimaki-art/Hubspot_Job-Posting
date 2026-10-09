@@ -14,7 +14,7 @@
                  HubSpot の値と違えば更新する
 
 プロパティ名が None の項目は「まだ対応先が無い」。何も書かない。
-→ 全部 None のままなら、詳細ページの取得も丸ごと省く (Actions の時間を使わない)。
+→ 詳細ページ側が全部 None なら、詳細ページの取得も丸ごと省く (Actions の時間を使わない)。
 
 似た項目でも中身が違うものは重複ではない
   例: CSV の「メールアドレス」(meeruadoresu) と、自由項目の回答
@@ -39,20 +39,21 @@ HR_COPY = "hr_copy"
 # CSV列名 -> (HubSpotプロパティ名 or None, policy)
 # 載せていない列: 更新日 / 店舗ID / 店舗名 (不要)、自由項目1-3 (詳細ページで質問文と対にする)
 CSV_FIELD_MAP: dict = {
+    # 学歴は gakureki だけに入れる (新しいプロパティには重複して入れない)
     "学歴": ("gakureki", FILL_EMPTY),
     "連絡希望日": ("renrakukanouyoubijikantai", FILL_EMPTY),
-    # --- 対応先のプロパティは後で設計・作成する (今は何も書かない) ---
-    "応募者id": (None, HR_COPY),
-    "応募経路": (None, HR_COPY),
-    "現在の職業": (None, HR_COPY),
-    "連絡方法": (None, HR_COPY),
-    "見学会希望有無": (None, HR_COPY),
-    "見学会希望日": (None, HR_COPY),
-    "希望面接形態": (None, HR_COPY),
-    "勤務可能期間": (None, HR_COPY),
-    "選考ステータス": (None, HR_COPY),
-    "面接予定日": (None, HR_COPY),
-    "選考理由": (None, HR_COPY),
+    # --- HR専用のコピー。HubSpot 0-421 に作成済み (すべて文字列型) ---
+    "応募者id": ("hr_oubosha_id", HR_COPY),
+    "応募経路": ("hr_oubo_keiyu", HR_COPY),
+    "現在の職業": ("hr_genzai_shokugyou", HR_COPY),
+    "連絡方法": ("hr_renraku_houhou", HR_COPY),
+    "見学会希望有無": ("hr_kengaku_kibou", HR_COPY),
+    "見学会希望日": ("hr_kengaku_kibou_bi", HR_COPY),
+    "希望面接形態": ("hr_mensetsu_keitai", HR_COPY),
+    "勤務可能期間": ("hr_kinmu_kanou_kikan", HR_COPY),
+    "選考ステータス": ("hr_senkou_status", HR_COPY),
+    "面接予定日": ("hr_mensetsu_yotei", HR_COPY),
+    "選考理由": ("hr_senkou_riyuu", HR_COPY),
 }
 
 # 詳細ページの項目 -> (HubSpotプロパティ名 or None, policy)
@@ -61,10 +62,10 @@ CSV_FIELD_MAP: dict = {
 #   selection_history : 「日時／選考種別／選考理由」を1行ずつ
 #   all_fields        : 編集フォームの全項目を「見出し：値」で1行ずつ (まとめて1つのプロパティへ)
 PAGE_FIELD_MAP: dict = {
-    "qa": (None, FILL_EMPTY),
-    "memo": (None, FILL_EMPTY),
-    "selection_history": (None, FILL_EMPTY),
-    "all_fields": (None, FILL_EMPTY),
+    "qa": ("hr_shitsumon_kaitou", FILL_EMPTY),
+    "memo": ("hr_memo", FILL_EMPTY),
+    "selection_history": ("hr_senkou_rireki", FILL_EMPTY),
+    "all_fields": ("hr_oubosha_shousai_zen", FILL_EMPTY),
 }
 
 HR_ID_COLUMN = "応募者id"
