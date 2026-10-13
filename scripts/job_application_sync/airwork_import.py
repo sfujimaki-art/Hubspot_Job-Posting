@@ -591,14 +591,14 @@ def build_end_missing_props(existing_props: dict, now_iso: str,
                             source_filename: str) -> dict:
     """エクスポートから消えた求人を公開終了にするプロパティ.
 
-    既存の「01」処理 (build_update_props) と同じ項目を同じ値で書く:
-    媒体原ステータス "01"・公開終了・ステージ追従 (選考進行中/採用決定は保護)・
-    最終同期日・同期元ファイル名。検出していないので「今回CSV検出フラグ」は false、
+    既存の「01」処理 (build_update_props) に倣い、公開終了・ステージ追従
+    (選考進行中/採用決定は保護)・最終同期日・同期元ファイル名を書く。
+    媒体原ステータスは媒体で実際に見えた値の項目で、消えた求人では「01」を
+    観測していないので書かない (最後に見えた値を残す)。検出していないので「今回CSV検出フラグ」は false、
     「最終CSV検出日」は触らない (検出した最後の日を残す)。
     タイトル・URL・詳細・管理区分は書かない。AW に公開終了日時の項目は無い。
     """
     p: dict = {
-        PROP_MEDIA_ORIG_STATUS: "01",
         PROP_HS_KYUUJIN_STATUS: "公開終了",
         PROP_KONKAI_CSV_FLAG: "false",
         PROP_LAST_SYNCED: now_iso,

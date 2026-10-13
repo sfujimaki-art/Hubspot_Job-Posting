@@ -114,7 +114,7 @@ def test_完全なエクスポートで消えた公開中は公開終了にな�
     assert ended(h) == {"J2", "J3"}
     p2 = next(p for i, p in h.updates if h.db[i]["id_airwork"] == "J2")
     assert p2["kyuujin_status"] == "公開終了"
-    assert p2["baitai_genjoukyou_airwork"] == "01"
+    assert "baitai_genjoukyou_airwork" not in p2  # 観測していない値は書かない
     assert p2["konkai_csv_kenshutsu_flag"] == "false"
     assert p2["hs_pipeline_stage"] == stage.STAGE_TEISHI
     assert p2["douki_moto_filename"] == "aw_AAA111_1.xlsx"
