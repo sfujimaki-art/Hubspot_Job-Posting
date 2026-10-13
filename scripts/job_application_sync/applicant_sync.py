@@ -469,6 +469,8 @@ def _process_aw_account_raw(
         try:
             _t = time.monotonic()
             with _AW_BROWSER:   # AirWork へのアクセスは 1 社ずつ
+                if not aw_pace.is_blocked():
+                    aw_pace.wait_company_turn()   # 社と社の間を空ける (PC 全体)
                 result["aw_wait_sec"] = result.get("aw_wait_sec", 0) + time.monotonic() - _t
                 _t = time.monotonic()
                 try:
@@ -523,6 +525,8 @@ def _process_aw_account_raw(
                     lids: dict = {}
                     _t = time.monotonic()
                     with _AW_BROWSER:   # AirWork へのアクセスは 1 社ずつ
+                        if not aw_pace.is_blocked():
+                            aw_pace.wait_company_turn()
                         result["aw_wait_sec"] = (result.get("aw_wait_sec", 0)
                                                  + time.monotonic() - _t)
                         _t = time.monotonic()

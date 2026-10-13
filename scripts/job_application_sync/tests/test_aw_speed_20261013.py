@@ -247,6 +247,14 @@ def test_止めている間はAirWorkにアクセスせず_社を失敗にする
     assert fetched == [] and r["ok"] is False and "403" in r["error"]
 
 
+def test_社と社の間は設定した秒数あく(monkeypatch, tmp_path):
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_SEC", 0.5)
+    t0 = time.time()
+    aw_pace.wait_company_turn()
+    aw_pace.wait_company_turn()
+    assert time.time() - t0 >= 0.49
+
+
 # ---- 部分的なエラーは DONE にしない ------------------------------------------------
 
 def test_1行でもエラーがあれば_okにしない(monkeypatch):

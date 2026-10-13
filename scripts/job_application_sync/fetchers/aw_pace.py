@@ -30,6 +30,18 @@ BLOCK_FILE = Path(os.environ.get(
     "JAS_AW_BLOCK_FILE", str(Path(tempfile.gettempdir()) / "jas_aw_blocked_until.txt")))
 BLOCK_COOLDOWN_MIN = float(os.environ.get("JAS_AW_BLOCK_COOLDOWN_MIN", "30"))
 _AW_HOST_SUFFIXES = ("airwork.net", "airregi.jp")
+# ★社と社の間の最低間隔 (秒、PC 全体で共通)。2026-10-13 の実測:
+#   1社ずつでも間を空けずに続けた回 (約4分20秒・AirWork/AirRegi 宛て最大4,467件) で 403、
+#   5社を約2分 (同 1,405件) では 403 なし、1社に数分かけていた回では一度も 403 なし。
+#   既定 30 秒 = 5分で最大10社。
+COMPANY_INTERVAL_SEC = float(os.environ.get("JAS_AW_COMPANY_INTERVAL_SEC", "30"))
+COMPANY_PACE_FILE = Path(os.environ.get(
+    "JAS_AW_COMPANY_PACE_FILE", str(Path(tempfile.gettempdir()) / "jas_aw_company_pace.txt")))
+
+
+def wait_company_turn() -> float:
+    """前の社が AirWork へのアクセスを始めてから COMPANY_INTERVAL_SEC 秒たつまで待つ。"""
+    return wait_turn(min_interval=COMPANY_INTERVAL_SEC, path=COMPANY_PACE_FILE)
 
 
 def blocked_until(path: Path = None) -> float:
