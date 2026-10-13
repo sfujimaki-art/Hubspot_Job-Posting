@@ -30,9 +30,15 @@ v0.2 §24 やってはいけない設計 (遵守ガード)
 
   1. 媒体間でタイトル名寄せを行わない (id_airwork 1次キー + ログインID複合)
   2. 媒体間で本文類似度名寄せを行わない
-  3. AW は XLSX 未検出を「公開終了」と判断しない (§15, §24-3)
-     → HubSpot側のステータスは絶対に変更しない。本スクリプトはXLSX内の
-       レコードのみ処理する。
+  3. AW は XLSX 未検出を、そのままでは「公開終了」と判断しない (§15, §24-3)
+     → 2026-10-13 ユーザー決定で例外を1つ追加: **その口座のエクスポートが
+       完全に取れたと言えるとき** (最後までダウンロードしてパースでき、行数が
+       0でなく、媒体求人IDの欠けた行も --limit も無い) に限り、同じ口座
+       (airwork_account_login_id が一致) で HubSpot 上「公開中」なのに
+       エクスポートに1回載っていない求人を「公開終了」にする。エクスポートが
+       完全と言えないとき・口座IDが空のとき・別口座の求人は従来どおり一切
+       触らない。後でエクスポートに「02」で載れば既存の更新処理で公開中に戻る。
+       止める場合は環境変数 JAS_AW_END_MISSING=0。
   4. AW新規は最初から「弊社管理」にしない (§24-4)
      → 既定は管理区分=「未判定」。Phase 0b 確定で【RL】未運用のため
        現状すべての新規が「未判定」となる (RL_DETECT_COLUMN=None)。
@@ -517,6 +523,92 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
     return result
 
 
+def find_published_listings_for_login(login_id: str) -> list[dict]:
+    """その口座 (airwork_account_login_id 一致) で「公開中」の AirWork 求人を全件取得.
+
+    エクスポートから消えた求人を公開終了にするための候補。口座単位でだけ検索し、
+    口座IDが空なら何も返さない (別口座・口座IDなしの求人は絶対に触らない)。
+
+    Returns:
+        [{id, properties}] (id_airwork を持つものだけ)
+    """
+    if not login_id:
+        return []
+    headers = _headers()
+    out: list[dict] = []
+    after = None
+    while True:
+        body = {
+            "limit": 100,
+            "properties": ["id_airwork", PROP_AW_LOGIN_ID, PROP_HS_KYUUJIN_STATUS,
+                           "hs_pipeline_stage"],
+            "filterGroups": [{"filters": [
+                {"propertyName": PROP_AW_LOGIN_ID, "operator": "EQ", "value": login_id},
+                {"propertyName": PROP_HS_KYUUJIN_STATUS, "operator": "EQ", "value": "公開中"},
+                {"propertyName": "id_airwork", "operator": "HAS_PROPERTY"},
+            ]}],
+        }
+        if after:
+            body["after"] = after
+        r = requests.post(f"{BASE}/crm/v3/objects/0-420/search",
+                          headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        for o in j.get("results", []):
+            p = o.get("properties") or {}
+            if p.get("id_airwork") and p.get(PROP_AW_LOGIN_ID) == login_id:
+                out.append({"id": o["id"], "properties": p})
+        after = ((j.get("paging") or {}).get("next") or {}).get("after")
+        if not after:
+            break
+        time.sleep(0.1)
+    return out
+
+
+def export_is_complete(total_rows: int, valid_rows: int, skipped_no_id: int,
+                       limit: Optional[int], login_id: str) -> bool:
+    """エクスポートが「完全に取れた」と言えるか (公開終了判定の前提).
+
+    ダウンロードとパースが最後まで終わっている (ここへ来た時点で load_aw_input は
+    例外なく完了) ことに加えて、次をすべて満たすときだけ True:
+      - 口座IDがある
+      - --limit で先頭だけに切っていない
+      - 行数が 0 でない (0件は取得失敗と区別できない)
+      - 媒体求人IDの欠けた行が無い (その行が消えた求人かもしれないため)
+    AW の画面には総件数と照合できる表示が無いので、件数照合は行わない。
+    """
+    if env_end_missing_disabled():
+        return False
+    return bool(login_id) and not limit and total_rows > 0 \
+        and valid_rows > 0 and skipped_no_id == 0
+
+
+def env_end_missing_disabled() -> bool:
+    return os.environ.get("JAS_AW_END_MISSING", "1") == "0"
+
+
+def build_end_missing_props(existing_props: dict, now_iso: str,
+                            source_filename: str) -> dict:
+    """エクスポートから消えた求人を公開終了にするプロパティ.
+
+    既存の「01」処理 (build_update_props) に倣い、公開終了・ステージ追従
+    (選考進行中/採用決定は保護)・最終同期日・同期元ファイル名を書く。
+    媒体原ステータスは媒体で実際に見えた値の項目で、消えた求人では「01」を
+    観測していないので書かない (最後に見えた値を残す)。検出していないので「今回CSV検出フラグ」は false、
+    「最終CSV検出日」は触らない (検出した最後の日を残す)。
+    タイトル・URL・詳細・管理区分は書かない。AW に公開終了日時の項目は無い。
+    """
+    p: dict = {
+        PROP_HS_KYUUJIN_STATUS: "公開終了",
+        PROP_KONKAI_CSV_FLAG: "false",
+        PROP_LAST_SYNCED: now_iso,
+        PROP_DOUKI_FILENAME: source_filename,
+    }
+    p.update(_stage.stage_props(
+        "公開終了", (existing_props or {}).get("hs_pipeline_stage")))
+    return p
+
+
 # ============================================================================
 # プロパティビルダ
 # ============================================================================
@@ -816,9 +908,32 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
             creates.append({"properties": props})
             create_preview.append({"id_airwork": jid, "properties": props})
 
+    # ★ エクスポートから消えた求人 → 公開終了 (2026-10-13)。
+    #   完全に取れたエクスポートのときだけ。同じ口座の「公開中」で、エクスポートに
+    #   載っていない求人のみ。取得に失敗したら何もしない (従来どおり)。
+    ends: list[dict] = []
+    end_preview: list[dict] = []
+    end_checked = export_is_complete(len(rows), len(valid_rows), skipped_no_id,
+                                     limit, login_id)
+    if end_checked and (not dry_run or os.environ.get("HUBSPOT_ACCESS_TOKEN")):
+        try:
+            in_export = {str(j).strip() for j in media_job_ids}
+            for lst in find_published_listings_for_login(login_id):
+                if str(lst["properties"].get("id_airwork")).strip() in in_export:
+                    continue
+                props = build_end_missing_props(lst["properties"], now_iso,
+                                                source_filename)
+                ends.append({"id": lst["id"], "properties": props})
+                end_preview.append({"id_airwork": lst["properties"].get("id_airwork"),
+                                    "hubspot_id": lst["id"], "properties": props})
+        except Exception as e:
+            ends, end_preview = [], []
+            print(f"WARN: 公開中求人の検索に失敗したため公開終了は見送り: {type(e).__name__}")
+
     summary = {
         "input_path": input_path,
         "login_id": login_id,
+        "ends_planned": len(ends),
         "csv_total_rows": len(rows),   # キー名は後方互換のため csv_ を維持
         "skipped_no_id": skipped_no_id,
         "valid_rows": len(valid_rows),
@@ -832,6 +947,7 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
     print("\n--- 集計 ---")
     print(f"  更新予定: {len(updates)} 件")
     print(f"  新規作成予定 (01/02とも): {len(creates)} 件")
+    print(f"  エクスポートから消えた公開中→公開終了予定: {len(ends)} 件")
     if skipped_01_new:
         print(f"  01新規スキップ: {len(skipped_01_new)} 件 "
               f"(JAS_AW_CREATE_01=0 の旧挙動)")
@@ -841,18 +957,25 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
             "summary": summary,
             "updates_preview": update_preview[:10],
             "creates_preview": create_preview[:10],
+            "ends_preview": end_preview[:10],
             "skipped_01_new_preview": skipped_01_new[:10],
         }
     else:
         print("\n--- 本番実行 ---")
         u_ok, u_ng, u_err = batch_update(updates)
         c_ok, c_ng, c_err, idmap = batch_create(creates)
+        e_ok, e_ng, e_err = batch_update(ends)
         summary.update({
+            "ends_ok": e_ok, "ends_ng": e_ng,
             "updates_ok": u_ok, "updates_ng": u_ng,
             "creates_ok": c_ok, "creates_ng": c_ng,
         })
         print(f"  更新: OK={u_ok} NG={u_ng}")
         print(f"  作成: OK={c_ok} NG={c_ng}")
+        print(f"  公開終了(エクスポートから消えた分): OK={e_ok} NG={e_ng}")
+        if e_err:
+            print(f"  公開終了エラー: {len(e_err)}件 (内容は非公開ログ)")
+            plog.detail("airwork_import_end_errors", errors=e_err[:20])
         # HubSpot のエラー文は値 (会社名など) を含みうるので件数だけ。本文は非公開ログ
         if u_err:
             print(f"  更新エラー: {len(u_err)}件 (内容は非公開ログ)")
