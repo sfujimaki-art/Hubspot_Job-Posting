@@ -54,6 +54,7 @@ from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af  # 
 from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E402
 from scripts.job_application_sync import aw_prefetch  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_pace  # noqa: E402
 from scripts.job_application_sync.http_session import http as _http  # noqa: E402
 
 MAX_ATTEMPTS = 3
@@ -62,8 +63,15 @@ LOCK_STALE_SEC = 15 * 60
 # ★2026-10-13: 目標は「1社1分以内・10並列・50社5分」(ユーザー指定)。
 #   以前は BAN 対策で 12社を1社ずつ順に処理し、1社に数分〜30分かかっていた。
 MAX_AW_ACCOUNTS_PER_RUN = int(os.environ.get("JAS_MAX_AW_PER_RUN", "50"))
-# 同時に処理する AW アカウント数 (ログイン・CSV取得・HubSpot取り込みを社ごとに並列)
+# 同時に処理する AW アカウント数 (HubSpot 取り込みを社ごとに並列)
 AW_PARALLEL = max(1, int(os.environ.get("JAS_AW_PARALLEL", "10")))
+# AirWork へ同時にアクセスする (ブラウザを開く) 社の数。既定 1 = 1社ずつ。
+# ★2026-10-13: 10社同時にブラウザでアクセスした回で、AirWork の CloudFront が
+#   「403 Request blocked」を返し、この PC からのアクセスが約45分ブロックされた
+#   (18:41〜19:27 に解除を確認)。1社ずつの回では一度も起きていない。
+#   ログイン・CSV取得・求人取得 (自己修復) は 1 社ずつ、HubSpot 側だけ並列にする。
+AW_BROWSER_PARALLEL = max(1, int(os.environ.get("JAS_AW_BROWSER_PARALLEL", "1")))
+_AW_BROWSER = threading.Semaphore(AW_BROWSER_PARALLEL)
 # 応募日時の記録ファイルへの追記は 1 スレッドずつ (読み→追記の間に割り込ませない)
 _APPLY_LOG_LOCK = threading.Lock()
 # 5分ごとの sync 末尾で拾い直す件数の上限。対象は「対象外」の応募のみで
@@ -419,6 +427,16 @@ def process_aw_account(
     return res
 
 
+def _raise_if_aw_blocked() -> None:
+    """AirWork の CloudFront が 403 を返した後なら、アクセスせずにこの社を失敗にする。
+
+    失敗の社は台帳で DONE にならず、止めている期限が過ぎた後の回でやり直す。
+    """
+    if aw_pace.is_blocked():
+        until = datetime.fromtimestamp(aw_pace.blocked_until()).strftime("%H:%M")
+        raise RuntimeError(f"AirWork が403を返したため {until} までアクセスを止めています")
+
+
 def _new_aw_client(token: str):
     """AW 1社分の HubSpot クライアント (社ごとにまとめて読む版。テストで差し替える)。"""
     return aw_prefetch.PrefetchingHubSpotClient(token)
@@ -449,7 +467,9 @@ def _process_aw_account_raw(
         if is_blank_cred(bid):
             continue
         try:
-            csv_path = asyncio.run(_fetch_aw_csv(bid, b_pw, out_dir))
+            with _AW_BROWSER:   # AirWork へのアクセスは 1 社ずつ
+                _raise_if_aw_blocked()
+                csv_path = asyncio.run(_fetch_aw_csv(bid, b_pw, out_dir))
         except Exception as e:  # noqa: BLE001
             last_err = f"{bid}: {type(e).__name__}: {str(e)[:100]}"
             continue
@@ -495,9 +515,11 @@ def _process_aw_account_raw(
                                 missing_job_ids=missing)
                     absent: list = []
                     lids: dict = {}
-                    jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
-                                                   absent_out=absent,
-                                                   listing_ids_out=lids)
+                    with _AW_BROWSER:   # AirWork へのアクセスは 1 社ずつ
+                        _raise_if_aw_blocked()
+                        jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
+                                                       absent_out=absent,
+                                                       listing_ids_out=lids)
                     known.update(absent)
                     result["absent_new"].extend(absent)
                     result["acquired_job_ids"] = missing  # 過去分救出(ピンポイントrelink)用
@@ -1063,8 +1085,18 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                             attempts=atts)
         pool.shutdown(wait=True)
         if keys:
+            try:
+                from scripts.job_application_sync.fetchers import aw_pace as _pace
+                pace = dict(_pace.stats)
+                print("[applicant_sync] AirWork 側のリクエスト内訳: "
+                      + json.dumps(dict(sorted(_pace.by_kind.items(),
+                                               key=lambda x: -x[1])), ensure_ascii=False),
+                      flush=True)
+            except Exception:  # noqa: BLE001
+                pace = {}
             print(f"[applicant_sync] AW {len(keys)}社を{min(AW_PARALLEL, len(keys))}並列で"
-                  f" {time.monotonic() - t_all:.0f}秒", flush=True)
+                  f" {time.monotonic() - t_all:.0f}秒 (AirWorkへの同時アクセス"
+                  f"{AW_BROWSER_PARALLEL}社まで / リクエスト={pace})", flush=True)
         # 自己修復の仕上げ: 今回求人を習得した場合、過去に取りこぼした(対象外)応募を
         # 習得した求人IDに絞ったピンポイントrelinkで即救出する。全走査+sortは
         # HubSpot検索のページング途切れで取りこぼすため、IDで直接引く(確実・軽量)。

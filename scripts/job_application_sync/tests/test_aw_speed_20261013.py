@@ -210,6 +210,43 @@ def test_並列のスレッドからでもページの移動は1秒以上あく(
     assert len(stamps) == 3 and all(g >= 0.99 for g in gaps), gaps
 
 
+# ---- AirWork の 403 で止める ----------------------------------------------------
+
+def test_CloudFrontの403だけをブロックと判定する():
+    f = aw_pace.is_cloudfront_block
+    assert f(403, "https://ats.rct.airwork.net/entries", {"server": "CloudFront"})
+    assert f(403, "https://connect.airregi.jp/login", {"server": "CloudFront"})
+    assert not f(403, "https://www.google.com/x", {"server": "CloudFront"})   # 他のサイト
+    assert not f(200, "https://ats.rct.airwork.net/entries", {"server": "CloudFront"})
+    assert not f(403, "https://ats.rct.airwork.net/entries", {"server": "nginx"})
+
+
+def test_403の後は期限まで止まり_期限が過ぎれば戻る(tmp_path):
+    p = tmp_path / "blocked.txt"
+    assert aw_pace.is_blocked(p) is False
+    aw_pace.mark_blocked(minutes=1, path=p)
+    assert aw_pace.is_blocked(p) is True
+    aw_pace.mark_blocked(minutes=-1, path=p)      # 短い期限で上書きしない
+    assert aw_pace.is_blocked(p) is True
+    p.write_text(str(time.time() - 1), encoding="ascii")
+    assert aw_pace.is_blocked(p) is False
+
+
+def test_止めている間はAirWorkにアクセスせず_社を失敗にする(monkeypatch, tmp_path):
+    p = tmp_path / "blocked.txt"
+    monkeypatch.setattr(aw_pace, "BLOCK_FILE", p)
+    aw_pace.mark_blocked(minutes=5, path=p)
+    fetched = []
+
+    async def fake_fetch(bid, pw, out_dir):
+        fetched.append(bid)
+        return Path("x.csv")
+    monkeypatch.setattr(S, "_fetch_aw_csv", fake_fetch)
+    r = S._process_aw_account_raw("A社", ["id"], "pw", Path("."), dry_run=False,
+                                  allow_acquire=False, known_absent=set())
+    assert fetched == [] and r["ok"] is False and "403" in r["error"]
+
+
 # ---- 部分的なエラーは DONE にしない ------------------------------------------------
 
 def test_1行でもエラーがあれば_okにしない(monkeypatch):

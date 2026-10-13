@@ -23,8 +23,56 @@ from pathlib import Path
 MIN_INTERVAL_SEC = float(os.environ.get("JAS_AW_MIN_INTERVAL_SEC", "1.0"))
 PACE_FILE = Path(os.environ.get(
     "JAS_AW_PACE_FILE", str(Path(tempfile.gettempdir()) / "jas_aw_pace.txt")))
+# ★AirWork の CloudFront が 403 を返したら、この PC からのアクセスを止める (2026-10-13)。
+#   18:41 の回では 403 の後も残りの社がアクセスを続けていた。止めた時刻は
+#   ファイルに残し、次の回 (5分ごと) や求人の巡回 (別プロセス) も見る。
+BLOCK_FILE = Path(os.environ.get(
+    "JAS_AW_BLOCK_FILE", str(Path(tempfile.gettempdir()) / "jas_aw_blocked_until.txt")))
+BLOCK_COOLDOWN_MIN = float(os.environ.get("JAS_AW_BLOCK_COOLDOWN_MIN", "30"))
+_AW_HOST_SUFFIXES = ("airwork.net", "airregi.jp")
+
+
+def blocked_until(path: Path = None) -> float:
+    """アクセスを止めている期限 (epoch 秒)。止めていなければ 0。"""
+    try:
+        return float((path or BLOCK_FILE).read_text(encoding="ascii").strip() or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def is_blocked(path: Path = None) -> bool:
+    return time.time() < blocked_until(path)
+
+
+def mark_blocked(minutes: float = None, path: Path = None) -> float:
+    """今から minutes 分、AirWork へのアクセスを止める。期限を返す。"""
+    until = time.time() + 60 * (BLOCK_COOLDOWN_MIN if minutes is None else minutes)
+    p = path or BLOCK_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if until > blocked_until(p):
+        p.write_text(f"{until:.0f}", encoding="ascii")
+    return until
+
+
+def is_cloudfront_block(status: int, url: str, headers: dict) -> bool:
+    """AirWork / AirRegi の CloudFront が返した 403 か。"""
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").lower()
+    server = str((headers or {}).get("server", "")).lower()
+    return (status == 403 and host.endswith(_AW_HOST_SUFFIXES)
+            and "cloudfront" in server)
 
 _thread_lock = threading.Lock()
+# 観測用: このプロセスで AirWork 側へ送った / 止めたリクエストの数
+stats = {"sent": 0, "blocked": 0, "navigations": 0, "waited_sec": 0.0,
+         "cloudfront_403": 0}
+by_kind: dict = {}     # "ホスト|種類" → 件数
+_stats_lock = threading.Lock()
+
+
+def _count(key: str, n=1) -> None:
+    with _stats_lock:
+        stats[key] += n
 
 
 @contextmanager
@@ -77,15 +125,57 @@ def wait_turn(min_interval: float = None, path: Path = None) -> float:
         return waited
 
 
+# 読み込まない種類 (2026-10-13)。10社同時にアクセスした回で、AirWork の CloudFront が
+# 「403 Request blocked」を返した (18:41〜18:44、約45分で解除)。1社ずつにしたうえで、
+# 画面の判定に使わない画像・フォント・動画は読み込まず、1社あたりの通信量を減らす。
+# スタイルシートは読む (応募者一覧のボタンは画面の幅で出たり消えたりする)。
+BLOCK_RESOURCE_TYPES = {"image", "font", "media"}
+
+
+def _is_main_frame_navigation(request) -> bool:
+    try:
+        return (request.is_navigation_request()
+                and request.resource_type == "document"
+                and request.frame.parent_frame is None)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def install(ctx) -> None:
-    """Playwright のコンテキストに、ページの移動ごとの順番待ちを付ける。"""
+    """Playwright のコンテキストに、ページの移動ごとの順番待ちと、不要な読み込みの停止を付ける。"""
     if not hasattr(ctx, "route"):   # テストの偽コンテキスト
         return
 
-    async def _handler(route, request):
+    def _on_response(response):
         try:
-            if request.is_navigation_request() and request.resource_type == "document":
-                await asyncio.to_thread(wait_turn)
+            if is_cloudfront_block(response.status, response.url, response.headers):
+                mark_blocked()
+                _count("cloudfront_403")
+        except Exception:  # noqa: BLE001
+            pass
+    ctx.on("response", _on_response)
+
+    async def _handler(route, request):
+        if is_blocked():          # 403 を受けた後は何も送らない
+            _count("blocked")
+            await route.abort()
+            return
+        if request.resource_type in BLOCK_RESOURCE_TYPES:
+            _count("blocked")
+            await route.abort()
+            return
+        try:
+            if _is_main_frame_navigation(request):
+                _count("navigations")
+                _count("waited_sec", await asyncio.to_thread(wait_turn))
         finally:
+            _count("sent")
+            try:
+                from urllib.parse import urlsplit
+                k = f"{urlsplit(request.url).hostname}|{request.resource_type}"
+            except Exception:  # noqa: BLE001
+                k = "?"
+            with _stats_lock:
+                by_kind[k] = by_kind.get(k, 0) + 1
             await route.continue_()
     await ctx.route("**/*", _handler)
