@@ -467,9 +467,15 @@ def _process_aw_account_raw(
         if is_blank_cred(bid):
             continue
         try:
+            _t = time.monotonic()
             with _AW_BROWSER:   # AirWork へのアクセスは 1 社ずつ
-                _raise_if_aw_blocked()
-                csv_path = asyncio.run(_fetch_aw_csv(bid, b_pw, out_dir))
+                result["aw_wait_sec"] = result.get("aw_wait_sec", 0) + time.monotonic() - _t
+                _t = time.monotonic()
+                try:
+                    _raise_if_aw_blocked()
+                    csv_path = asyncio.run(_fetch_aw_csv(bid, b_pw, out_dir))
+                finally:
+                    result["aw_sec"] = result.get("aw_sec", 0) + time.monotonic() - _t
         except Exception as e:  # noqa: BLE001
             last_err = f"{bid}: {type(e).__name__}: {str(e)[:100]}"
             continue
@@ -515,11 +521,18 @@ def _process_aw_account_raw(
                                 missing_job_ids=missing)
                     absent: list = []
                     lids: dict = {}
+                    _t = time.monotonic()
                     with _AW_BROWSER:   # AirWork へのアクセスは 1 社ずつ
-                        _raise_if_aw_blocked()
-                        jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
-                                                       absent_out=absent,
-                                                       listing_ids_out=lids)
+                        result["aw_wait_sec"] = (result.get("aw_wait_sec", 0)
+                                                 + time.monotonic() - _t)
+                        _t = time.monotonic()
+                        try:
+                            _raise_if_aw_blocked()
+                            jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
+                                                           absent_out=absent,
+                                                           listing_ids_out=lids)
+                        finally:
+                            result["selfheal_sec"] = time.monotonic() - _t
                     known.update(absent)
                     result["absent_new"].extend(absent)
                     result["acquired_job_ids"] = missing  # 過去分救出(ピンポイントrelink)用
@@ -997,7 +1010,14 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                   f"前回失敗した{n_failed_before}社は後ろへ)", flush=True)
         # 自己修復の1run習得budget: 求人習得(mode=full)は生成待ちを内包し重いため
         # 少数に cap。溢れた社は次サイクル(5分毎)で自動的に習得される。
-        acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "2"))
+        # ★2026-10-13 既定を 0 (応募の回では求人を取りに行かない) に変更 (ユーザー決定):
+        #   「応募が来た案件を速攻で HubSpot に連携するのがスピードが必要。求人は
+        #    1日1〜3回ゆっくり更新して差異を分析すればよい」。
+        #   実測: 応募の回の中の求人取得は 1社で約10分 (栗山***、求人37件)。その間
+        #   AirWork へのアクセスの順番を握るため、他社の応募の取り込みが止まる。
+        #   求人の無い応募は従来どおり「対象外」で先に登録し、求人の巡回 (1日3回) で
+        #   求人が入った後、HR の回 (5分ごと) の relink で紐付く。
+        acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "0"))
         acquired_job_ids: list = []
         # 媒体の求人一覧に無かった求人ID (台帳に覚えている分 + この回に見つけた分)
         known_absent = ledger.meta_names("aw_absent_job")
@@ -1059,7 +1079,10 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                       f"linked={res.get('linked')} unlinked={res.get('unlinked')} "
                       f"一覧に無い求人への古い応募={res.get('no_listing_old', 0)} "
                       f"dup={res.get('dup')} 求人fetch={res.get('jobs_fetched')} (login={res.get('login_id')}) "
-                      f"所要{res.get('elapsed', 0):.0f}秒 HubSpot={res.get('hubspot', {})}", flush=True)
+                      f"所要{res.get('elapsed', 0):.0f}秒 (AirWork {res.get('aw_sec', 0):.0f}秒"
+                      f" / 求人取得 {res.get('selfheal_sec', 0):.0f}秒"
+                      f" / 順番待ち {res.get('aw_wait_sec', 0):.0f}秒)"
+                      f" HubSpot={res.get('hubspot', {})}", flush=True)
                 plog.detail("aw_account_ok", company=company, applicants=len(group),
                             linked=res.get("linked"), unlinked=res.get("unlinked"),
                             no_listing_old=res.get("no_listing_old", 0),
