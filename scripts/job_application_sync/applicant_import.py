@@ -55,6 +55,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
@@ -62,6 +63,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol
 
 from scripts.job_application_sync import hr_applicant_fields as hrf
+from scripts.job_application_sync.http_session import http as _http
 
 
 # ---- Association type IDs (Phase 0 実測確定) ------------------------------
@@ -147,11 +149,23 @@ def anmokuchi_transfer_props(deal_ids: list, deals: dict,
 
 # AW login_id → 管理用メールアドレス の遅延キャッシュ (Deal解決用)
 _AW_LOGIN_MAIL_CACHE: dict = {}
+_AW_LOGIN_MAIL_LOCK = threading.Lock()
 
 
 def _aw_login_to_mail(login_id: str) -> str:
-    """AW login_id → 管理用メールアドレス。account_loaderを1回だけ読んでキャッシュ。"""
-    if not _AW_LOGIN_MAIL_CACHE:
+    """AW login_id → 管理用メールアドレス。account_loaderを1回だけ読んでキャッシュ。
+
+    ★社を並列で処理する (2026-10-13)。読み込み途中の辞書を別スレッドが
+      「読み込み済み」と見て空文字を返さないよう、鍵の中で読む。
+    """
+    with _AW_LOGIN_MAIL_LOCK:
+        if "__loaded__" not in _AW_LOGIN_MAIL_CACHE:
+            _load_aw_login_mail()
+    return _AW_LOGIN_MAIL_CACHE.get(login_id, "")
+
+
+def _load_aw_login_mail() -> None:
+    if True:
         try:
             from scripts.job_application_sync.fetchers import account_loader as _al
             for a in _al.iter_aw_accounts(active_only=False):
@@ -162,7 +176,6 @@ def _aw_login_to_mail(login_id: str) -> str:
             _AW_LOGIN_MAIL_CACHE.setdefault("__loaded__", "1")
         except Exception:  # noqa: BLE001
             _AW_LOGIN_MAIL_CACHE.setdefault("__loaded__", "1")
-    return _AW_LOGIN_MAIL_CACHE.get(login_id, "")
 
 # ---- oubobaitaimei enum 値 (Phase 0 実測 12択) -----------------------------
 OUBO_BAITAI_VALUES = {
@@ -465,8 +478,10 @@ class RealHubSpotClient:
 
     def __init__(self, token: str):
         # 遅延 import (テスト時に requests/dotenv 不要)
-        import requests  # noqa
-        self._requests = requests
+        # ★接続を使い回す (2026-10-13)。モジュールの requests.post 等は毎回
+        #   新しい TCP+TLS 接続を張り、CA 束を読み直す (専用PCの実測で 1 回 約1.1秒、
+        #   使い回すと 0.46 秒)。http_session はスレッドごとの Session を使う。
+        self._requests = _http
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def _post(self, path: str, body: dict) -> Any:
@@ -591,7 +606,9 @@ class RealHubSpotClient:
         }
         r = self._post("/crm/v3/objects/0-421/search", body)
         if r.status_code >= 300:
-            return None
+            # ★検索に失敗したのに「重複なし」と見て作ると二重登録になる
+            #   (429 を 3 回受けた場合など)。行のエラーにして次の回でやり直す。
+            raise RuntimeError(f"重複の検索に失敗 (HTTP {r.status_code})")
         results = r.json().get("results", [])
         return results[0]["id"] if results else None
 
@@ -647,7 +664,11 @@ class RealHubSpotClient:
 
     def get_appointment_props(self, appointment_id: str,
                               properties: list) -> dict:
-        """既存APPOINTMENTの現在値取得 (dup補完の既存値保護判定用)。失敗は{}。"""
+        """既存APPOINTMENTの現在値取得 (dup補完の既存値保護判定用)。失敗は None。
+
+        ★以前は失敗時に {} を返し、呼び出し側が全項目を「空」と見て補完の
+          PATCH で既存の値を上書きしていた (既存値の保護が 429 で破れる)。
+        """
         try:
             url = (f"{self.BASE}/crm/v3/objects/0-421/{appointment_id}"
                    f"?properties={','.join(properties)}")
@@ -655,7 +676,7 @@ class RealHubSpotClient:
             r.raise_for_status()
             return r.json().get("properties") or {}
         except Exception:  # noqa: BLE001
-            return {}
+            return None
 
     def get_appointment_props_strict(self, appointment_id: str,
                                      properties: list) -> dict:
@@ -1305,8 +1326,10 @@ def _process_applicant(
                 fill = {}
         elif cand:
             cur = client.get_appointment_props(existing, list(cand))
-            fill = {k: v for k, v in cand.items()
-                    if not str(cur.get(k) or "").strip()}
+            # 現在値が読めなければ何も書かない (空と見て上書きしない)
+            fill = ({} if cur is None else
+                    {k: v for k, v in cand.items()
+                     if not str(cur.get(k) or "").strip()})
         if fill:
             try:
                 client.update_appointment(existing, fill)

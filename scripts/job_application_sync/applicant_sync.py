@@ -29,7 +29,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -51,12 +53,19 @@ from scripts.job_application_sync.fetchers import account_loader as al  # noqa: 
 from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af  # noqa: E402
 from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E402
+from scripts.job_application_sync import aw_prefetch  # noqa: E402
+from scripts.job_application_sync.http_session import http as _http  # noqa: E402
 
 MAX_ATTEMPTS = 3
 LOCK_STALE_SEC = 15 * 60
-# BAN対策: 1run あたり新規ログインするAWアカウント数の上限。
-# 5分バッチで少しずつ捌く(全106社なら ~9run/~45分に分散)。session再利用で2回目以降は再ログインなし。
-MAX_AW_ACCOUNTS_PER_RUN = int(os.environ.get("JAS_MAX_AW_PER_RUN", "12"))
+# 1run あたりに処理する AW アカウント数の上限。
+# ★2026-10-13: 目標は「1社1分以内・10並列・50社5分」(ユーザー指定)。
+#   以前は BAN 対策で 12社を1社ずつ順に処理し、1社に数分〜30分かかっていた。
+MAX_AW_ACCOUNTS_PER_RUN = int(os.environ.get("JAS_MAX_AW_PER_RUN", "50"))
+# 同時に処理する AW アカウント数 (ログイン・CSV取得・HubSpot取り込みを社ごとに並列)
+AW_PARALLEL = max(1, int(os.environ.get("JAS_AW_PARALLEL", "10")))
+# 応募日時の記録ファイルへの追記は 1 スレッドずつ (読み→追記の間に割り込ませない)
+_APPLY_LOG_LOCK = threading.Lock()
 # 5分ごとの sync 末尾で拾い直す件数の上限。対象は「対象外」の応募のみで
 # 実測180件のため 500 で十分足りる。増えたら envで調整する。
 RELINK_LIMIT_PER_SYNC = int(os.environ.get("JAS_RELINK_PER_SYNC", "500"))
@@ -240,19 +249,22 @@ def _missing_aw_listings(job_ids: list[str], token: str) -> list[str]:
         body = {"filterGroups": [{"filters": [
             {"propertyName": "id_airwork", "operator": "IN", "values": chunk}]}],
             "properties": ["id_airwork"], "limit": 200}
-        r = requests.post(
+        r = _http.post(
             "https://api.hubapi.com/crm/v3/objects/0-420/search",
             headers=H, json=body, timeout=30)
+        # ★失敗の応答 (429 等) を「結果0件」と読むと、全部を欠落と見て
+        #   不要な求人取得 (約40秒〜) が走る。失敗は例外にする (呼び出し側が握る)。
+        r.raise_for_status()
         for o in r.json().get("results", []):
             v = (o.get("properties") or {}).get("id_airwork")
             if v:
                 exist.add(v)
-        time.sleep(0.1)
     return [j for j in ids if j not in exist]
 
 
 def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
-                    absent_out: Optional[list] = None) -> int:
+                    absent_out: Optional[list] = None,
+                    listing_ids_out: Optional[dict] = None) -> int:
     """自己修復: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
 
     生成待ちあり(timeout_min分)。欠落時のみ発火。
@@ -268,6 +280,13 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
       取れなかったIDを必ず報告する。
 
     absent_out: 渡されたら、取れなかった求人IDをここへ足す (呼び出し側が台帳に覚える)。
+    listing_ids_out: 渡されたら、求人ID → LISTING id (既存+今回作成) を入れる。
+
+    ★2026-10-13: 取れたかどうかを、取り込みの結果 (作った LISTING の id) で判定する。
+      以前は作成の直後に Search で数え直していたが、Search への反映には数秒かかる。
+      その間に数えると、作れた求人まで「取れなかった」と判定され、台帳に
+      「一覧に無い求人」として永続化される (以後は取り直さない)。続く固定の
+      15秒待ちもこの反映待ちのためだったので、不要になった。
     """
     from scripts.job_application_sync.fetchers import aw_csv_fetcher as awf
     from scripts.job_application_sync.fetchers.aw_orchestrator import (
@@ -283,13 +302,20 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
     xlsx_path = _extract_xlsx_from_zip(Path(zip_path))
     # login_id=bid で LISTING を作成 (応募linkと同じキーに揃える)。
     # client_code はXLSX側と異なるため strict_client_code=False。
-    air.run_xlsx(xlsx_path, login_id=bid, dry_run=False,
-                 strict_client_code=False)
-    # 要求したIDのうち、まだLISTINGが無いもの = 取れなかったもの。
-    # 既存の _missing_aw_listings を再利用する(同じ判定を2度書かない)。
-    still = _missing_aw_listings(missing, os.environ.get("HUBSPOT_ACCESS_TOKEN", ""))
+    summ = air.run_xlsx(xlsx_path, login_id=bid, dry_run=False,
+                        strict_client_code=False) or {}
+    lids = summ.get("listing_ids")
+    if lids is not None:
+        # 要求したIDのうち、取り込み後も LISTING の id が無いもの = 取れなかったもの
+        still = [j for j in missing if j not in lids]
+        if listing_ids_out is not None:
+            listing_ids_out.update(lids)
+    else:  # 取り込みの結果に id が無いとき (旧版) は従来どおり Search で数える
+        still = _missing_aw_listings(missing, os.environ.get("HUBSPOT_ACCESS_TOKEN", ""))
     got = [x for x in missing if x not in still]
-    if absent_out is not None:
+    # 作成に失敗した求人があった回は「一覧に無い」と覚えない (次の回で取り直す)。
+    # 覚えると以後は取りに行かず、その求人への応募が紐付かないままになる。
+    if absent_out is not None and not summ.get("creates_ng"):
         absent_out.extend(still)
     if still:
         msg = (f"⚠️ AirWorkの求人を取得できませんでした (login={mask_secret(bid)})\n"
@@ -393,6 +419,11 @@ def process_aw_account(
     return res
 
 
+def _new_aw_client(token: str):
+    """AW 1社分の HubSpot クライアント (社ごとにまとめて読む版。テストで差し替える)。"""
+    return aw_prefetch.PrefetchingHubSpotClient(token)
+
+
 def _process_aw_account_raw(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
@@ -403,12 +434,16 @@ def _process_aw_account_raw(
     Returns: {ok, linked, unlinked, no_listing_old, dup, jobs_fetched, error, login_id}
     known_absent: 媒体の求人一覧に無かった求人ID (台帳に覚えたもの)。
       自己修復で取りに行かず、その求人への応募は unlinked でなく no_listing_old で数える。
-      渡された set には今回新たに一覧に無かったIDを足して返す。
+      渡された set は書き換えない (社を並列で処理するため)。今回新たに一覧に無かった
+      IDは戻り値の absent_new で返す (呼び出し側が台帳に覚える)。
     ★戻り値の error / login_id は伏せていない。外へ出すのは process_aw_account 経由のみ。"""
     token = os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
     result = {"ok": False, "linked": 0, "unlinked": 0, "no_listing_old": 0, "dup": 0,
               "jobs_fetched": 0, "error": "", "login_id": ""}
-    known = known_absent if known_absent is not None else set()
+    # 社を並列で処理するので、渡された set は書き換えない (手元の写しを使う)。
+    # 今回新たに「一覧に無い」と分かった求人IDは result["absent_new"] で返す。
+    known = set(known_absent or ())
+    result["absent_new"] = []
     last_err = ""
     for bid in b_ids or []:
         if is_blank_cred(bid):
@@ -420,7 +455,8 @@ def _process_aw_account_raw(
             continue
         rows = ai.load_applicants_csv(str(csv_path))
         # 応募日時(時刻付き)を分析用に記録 (2026-08-05)。本流に影響しない副産物
-        ai.append_apply_time_log(str(csv_path))
+        with _APPLY_LOG_LOCK:
+            ai.append_apply_time_log(str(csv_path))
         if dry_run:
             result.update(ok=True, login_id=bid, linked=0, unlinked=len(rows),
                           csv=csv_path.name, total=len(rows))
@@ -430,10 +466,18 @@ def _process_aw_account_raw(
         # → 今回の応募は即紐付き、過去の取りこぼしは呼出側(run)が直後の relink で救出。
         # 生成待ちが重いので1runの習得社数は呼出側が cap する(allow_acquire)。
         jobs_fetched = 0
+        # ★この社の求人と既存の応募を先にまとめて読む (2026-10-13、aw_prefetch の説明)。
+        #   行ごとの問い合わせを手元で答える。読めなかった分は従来どおり1行ずつ問い合わせる。
+        cli = _new_aw_client(token)
+        job_ids = list({r.media_job_id for r in rows if r.media_job_id})
+        cli.prefetch_listings(job_ids)
+        # allow_acquire は bool か、枠を1つ取れたら True を返す関数 (並列のとき)。
+        # 関数のときは、欠けている求人が実際にあるときだけ枠を取る。
         if allow_acquire:
             try:
-                job_ids = list({r.media_job_id for r in rows if r.media_job_id})
-                missing = _missing_aw_listings(job_ids, token)
+                missing = cli.missing_listings(job_ids)
+                if missing is None:   # まとめて読めなかったときは従来の数え方
+                    missing = _missing_aw_listings(job_ids, token)
                 # ★前回までに「媒体の求人一覧に無い」と確かめた求人IDは取りに行かない
                 #   (2026-10-08)。応募CSVには終わった求人への過去の応募も残るので、
                 #   放っておくと取り込みのたびに同じIDで全件の求人取得 (約8分・
@@ -443,23 +487,31 @@ def _process_aw_account_raw(
                 if known_missing:
                     print(f"  自己修復: {plog.mask_name(company)} 求人の一覧に無いと確認済みの"
                           f"求人ID {len(known_missing)}件は取り直さない", flush=True)
-                if missing:
+                if missing and (allow_acquire() if callable(allow_acquire)
+                                else True):
                     print(f"  自己修復: {plog.mask_name(company)} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
                     plog.detail("aw_selfheal_acquire", company=company,
                                 missing_job_ids=missing)
                     absent: list = []
+                    lids: dict = {}
                     jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
-                                                   absent_out=absent)
+                                                   absent_out=absent,
+                                                   listing_ids_out=lids)
                     known.update(absent)
+                    result["absent_new"].extend(absent)
                     result["acquired_job_ids"] = missing  # 過去分救出(ピンポイントrelink)用
-                    time.sleep(15)  # HubSpot search index 反映待ち
+                    # ★作った求人を手元に足す。以前はここで15秒待って Search の
+                    #   反映を待っていた (2026-10-13 廃止)。
+                    cli.add_listings(lids, bid)
             except Exception as e:  # noqa: BLE001
                 print(f"  自己修復失敗(応募は続行・対象外->後続relinkで救出): "
                       f"{type(e).__name__}: {scrub_secrets(str(e), [bid], passwords=[b_pw])[:80]}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
-        cli = ai.RealHubSpotClient(token)
+        cli.prefetch_appointments(
+            (getattr(rows[0], "media", "") or "AirWork") if rows else "AirWork", job_ids)
         results = ai.run_import(rows, cli, default_login_id=bid)
+        result["hubspot"] = dict(cli.stats)
         from collections import Counter
         st = Counter(r.status for r in results)
         n_err = st.get("error", 0)
@@ -471,7 +523,12 @@ def _process_aw_account_raw(
         #   でも「処理済み」になり、二度と取りに行かなくなる。しかも
         #   error件数はログにもSlackにも出ず、**全滅しても無音**だった。
         #   1件でも成功していれば ok、全部エラーなら ok=False で再試行に回す。
-        ok = (len(results) == 0) or (n_err < len(results))
+        # ★2026-10-13: 1行でもエラーがあれば ok=False にする。
+        #   実例: 専用PCの Wi-Fi が 4分切れた間に 214行中190行がエラーになったが、
+        #   24行成功していたので ok になり、その社の通知は台帳で DONE にされた
+        #   (190行は二度と取りに行かない)。成功した行は次の回で重複として飛ぶので、
+        #   やり直しても二重には作られない。
+        ok = n_err == 0
         # ★紐付け先の無い古い応募を、未紐付けと分けて数える (2026-10-08)。
         #   媒体の求人一覧に無い求人 (= 終わって消えた求人) への応募は、紐付く先が
         #   どこにも無い。実測: 8/1以降に作ったAWの応募で求人に紐付いていない
@@ -906,7 +963,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         n_failed_before = sum(
             1 for k, _a in runnable
             if ledger.meta("aw_fail", company_key(k[len("AW::"):])).get("failed"))
-        # BAN対策: 1runのAWアカウント数を上限でcap(一斉ログイン回避)。
+        # 1runのAWアカウント数の上限 (MAX_AW_ACCOUNTS_PER_RUN、AW_PARALLEL 並列で処理)
         cap = limit_accounts if limit_accounts else MAX_AW_ACCOUNTS_PER_RUN
         keys = runnable[:cap]
         if n_noauth_co:
@@ -914,27 +971,58 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                   f"ログインせず枠も使わない", flush=True)
         if len(runnable) > len(keys) or n_failed_before:
             print(f"[applicant_sync] AW {len(runnable)}社中 今回{len(keys)}社処理 "
-                  f"(残{len(runnable)-len(keys)}社は次サイクル / BAN対策の分散。"
+                  f"(残{len(runnable)-len(keys)}社は次サイクル。"
                   f"前回失敗した{n_failed_before}社は後ろへ)", flush=True)
         # 自己修復の1run習得budget: 求人習得(mode=full)は生成待ちを内包し重いため
         # 少数に cap。溢れた社は次サイクル(5分毎)で自動的に習得される。
         acquire_budget = int(os.environ.get("JAS_SELFHEAL_MAX_ACQUIRE", "2"))
-        acquired_total = 0
         acquired_job_ids: list = []
         # 媒体の求人一覧に無かった求人ID (台帳に覚えている分 + この回に見つけた分)
         known_absent = ledger.meta_names("aw_absent_job")
         absent_before = set(known_absent)
-        for key, acc in keys:
+        # ★社を並列で処理する (2026-10-13、AW_PARALLEL)。台帳・集計・表示は
+        #   このスレッド (結果を受け取る側) だけが触る。各社の処理は自分の結果を返すだけ。
+        #   自己修復の枠は、欠けている求人を実際に取りに行く社が取る (取った時点で数える)。
+        _acq_lock = threading.Lock()
+        _acq = {"n": 0}
+
+        def _claim_acquire() -> bool:
+            with _acq_lock:
+                if _acq["n"] >= acquire_budget:
+                    return False
+                _acq["n"] += 1
+                return True
+
+        absent_snapshot = frozenset(known_absent)
+
+        def _work(company, acc):
+            t0 = time.monotonic()
+            r = process_aw_account(
+                company, acc.b_ids, acc.b_pw, out_dir, dry_run,
+                allow_acquire=(_claim_acquire if not dry_run else False),
+                known_absent=absent_snapshot)
+            r["elapsed"] = time.monotonic() - t0
+            return r
+
+        t_all = time.monotonic()
+        pool = ThreadPoolExecutor(max_workers=min(AW_PARALLEL, max(1, len(keys))),
+                                  thread_name_prefix="aw")
+        futs = {pool.submit(_work, key[len("AW::"):], acc): (key, acc)
+                for key, acc in keys}
+        for fut in as_completed(futs):
+            key, acc = futs[fut]
             group = aw_groups[key]
             company = key[len("AW::"):]
             ck = company_key(company)
             summary["accounts"] += 1
-            res = process_aw_account(
-                company, acc.b_ids, acc.b_pw, out_dir, dry_run,
-                allow_acquire=(not dry_run and acquired_total < acquire_budget),
-                known_absent=known_absent)
+            try:
+                res = fut.result()
+            except Exception as e:  # noqa: BLE001 — 1社の予期しない例外で他社を止めない
+                res = {"ok": False, "error": scrub_secrets(
+                    f"{type(e).__name__}: {str(e)[:100]}", list(acc.b_ids or []),
+                    passwords=[acc.b_pw]), "login_id": "", "elapsed": 0.0}
+            known_absent.update(res.get("absent_new") or [])
             if res.get("jobs_fetched"):
-                acquired_total += 1
                 acquired_job_ids.extend(res.get("acquired_job_ids") or [])
             if res["ok"]:
                 if ledger.meta("aw_fail", ck).get("failed"):
@@ -948,7 +1036,8 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 print(f"  ✅ {plog.mask_name(company)}: 応募{len(group)}件 "
                       f"linked={res.get('linked')} unlinked={res.get('unlinked')} "
                       f"一覧に無い求人への古い応募={res.get('no_listing_old', 0)} "
-                      f"dup={res.get('dup')} 求人fetch={res.get('jobs_fetched')} (login={res.get('login_id')})", flush=True)
+                      f"dup={res.get('dup')} 求人fetch={res.get('jobs_fetched')} (login={res.get('login_id')}) "
+                      f"所要{res.get('elapsed', 0):.0f}秒 HubSpot={res.get('hubspot', {})}", flush=True)
                 plog.detail("aw_account_ok", company=company, applicants=len(group),
                             linked=res.get("linked"), unlinked=res.get("unlinked"),
                             no_listing_old=res.get("no_listing_old", 0),
@@ -972,6 +1061,10 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                           f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
                 plog.detail("aw_account_failed", company=company, error=res["error"],
                             attempts=atts)
+        pool.shutdown(wait=True)
+        if keys:
+            print(f"[applicant_sync] AW {len(keys)}社を{min(AW_PARALLEL, len(keys))}並列で"
+                  f" {time.monotonic() - t_all:.0f}秒", flush=True)
         # 自己修復の仕上げ: 今回求人を習得した場合、過去に取りこぼした(対象外)応募を
         # 習得した求人IDに絞ったピンポイントrelinkで即救出する。全走査+sortは
         # HubSpot検索のページング途切れで取りこぼすため、IDで直接引く(確実・軽量)。
@@ -1100,7 +1193,7 @@ def relink(dry_run: bool = False, limit: int = 1000,
         # (a) oubokyuujinmemo に求人IDを持つ対象外 (IN でバッチ検索)
         for i in range(0, len(ids), 50):
             chunk = ids[i:i + 50]
-            r = requests.post(
+            r = _http.post(
                 "https://api.hubapi.com/crm/v3/objects/0-421/search",
                 headers=H, json={"filterGroups": [{"filters": [
                     {"propertyName": "kokyakushiitotenkijoukyou",
@@ -1110,10 +1203,9 @@ def relink(dry_run: bool = False, limit: int = 1000,
                     "properties": _PROPS, "limit": 200}, timeout=30).json()
             for o in r.get("results", []):
                 _collect(o)
-            time.sleep(0.2)
         # (b) 旧backlog(oubokyuujinmemo空, bikou_hiaringuにID記載)はトークン検索で補完
         for jid in ids:
-            r = requests.post(
+            r = _http.post(
                 "https://api.hubapi.com/crm/v3/objects/0-421/search",
                 headers=H, json={"filterGroups": [{"filters": [
                     {"propertyName": "kokyakushiitotenkijoukyou",
@@ -1125,7 +1217,6 @@ def relink(dry_run: bool = False, limit: int = 1000,
                     "properties": _PROPS, "limit": 100}, timeout=30).json()
             for o in r.get("results", []):
                 _collect(o)
-            time.sleep(0.2)
     else:
         after = None
         while checked < limit:
@@ -1140,7 +1231,7 @@ def relink(dry_run: bool = False, limit: int = 1000,
                 "properties": _PROPS, "limit": 100}
             if after:
                 body["after"] = after
-            r = requests.post(
+            r = _http.post(
                 "https://api.hubapi.com/crm/v3/objects/0-421/search",
                 headers=H, json=body, timeout=30).json()
             for o in r.get("results", []):
@@ -1156,7 +1247,7 @@ def relink(dry_run: bool = False, limit: int = 1000,
         ids = sorted(set(job_ids))
         for i in range(0, len(ids), 100):
             chunk = ids[i:i + 100]
-            r = requests.post(
+            r = _http.post(
                 "https://api.hubapi.com/crm/v3/objects/0-420/search",
                 headers=H, json={"filterGroups": [{"filters": [
                     {"propertyName": prop, "operator": "IN", "values": chunk}]}],
@@ -1171,7 +1262,6 @@ def relink(dry_run: bool = False, limit: int = 1000,
                 m[v] = None if v in m else (
                     o["id"], p.get("ichijitaiounoumu_deforuto"),
                     p.get("hubspot_owner_id"))  # 2件目=曖昧
-            time.sleep(0.1)
         return m
     hr_map = _listing_map([j for _, j, ish, _d in targets if ish], "id_hrhakkaa")
     aw_map = _listing_map([j for _, j, ish, _d in targets if not ish], "id_airwork")
@@ -1207,7 +1297,7 @@ def relink(dry_run: bool = False, limit: int = 1000,
                 props.update(cli.get_oubosaki_props(lid, media, "", jid))
             except Exception:  # noqa: BLE001
                 pass
-            requests.patch(
+            _http.patch(
                 f"https://api.hubapi.com/crm/v3/objects/0-421/{appt_id}",
                 headers=H, json={"properties": props}, timeout=20)
             # ②求人のピン留め暗黙知Noteを応募へ複製 (一次対応コーラー用, best-effort)

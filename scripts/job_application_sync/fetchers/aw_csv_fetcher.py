@@ -35,6 +35,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+try:  # パッケージ/直接実行の両対応 (この file は 2 通りの名前で import される)
+    from scripts.job_application_sync.fetchers import aw_pace as _aw_pace
+except ImportError:  # pragma: no cover
+    try:
+        from job_application_sync.fetchers import aw_pace as _aw_pace  # type: ignore
+    except ImportError:
+        import aw_pace as _aw_pace  # type: ignore
+
 
 # Phase 0b 実測 URL
 # ★ビューポートを明示的に大きく固定する (2026-08-07)。
@@ -293,6 +301,7 @@ async def establish_aw_session(
         ctx = await browser.new_context(accept_downloads=True,
                                         viewport=VIEWPORT,
                                         storage_state=str(sp))
+        await _aw_pace.install(ctx)   # ページの移動は PC 全体で 1 秒以上あける
         page = await ctx.new_page()
         try:
             await page.goto(URL_DASHBOARD, wait_until="domcontentloaded",
@@ -316,6 +325,7 @@ async def establish_aw_session(
 
     # 2) full login (初回 or セッション切れ)
     ctx = await browser.new_context(accept_downloads=True, viewport=VIEWPORT)
+    await _aw_pace.install(ctx)       # ページの移動は PC 全体で 1 秒以上あける
     page = await ctx.new_page()
     await page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
     # airwork → connect.airregi.jp のリダイレクト完了と描画を待つ (best effort)

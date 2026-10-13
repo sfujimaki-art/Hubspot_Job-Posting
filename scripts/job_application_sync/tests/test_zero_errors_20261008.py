@@ -238,6 +238,23 @@ def _pr(status, jid):
                             media_job_id=jid)
 
 
+class _NoPrefetch:
+    """まとめて読めなかったときと同じ振る舞いの偽クライアント (HubSpot に行かない)。"""
+    stats: dict = {}
+
+    def prefetch_listings(self, job_ids):
+        return False
+
+    def missing_listings(self, job_ids):
+        return None          # → 従来の _missing_aw_listings で数える
+
+    def add_listings(self, jid_to_listing, login_id):
+        pass
+
+    def prefetch_appointments(self, media, job_ids):
+        return False
+
+
 @pytest.fixture
 def aw_stub(monkeypatch):
     st = SimpleNamespace(ensure_calls=[], rows=[], results=[], hubspot_missing=[])
@@ -248,11 +265,12 @@ def aw_stub(monkeypatch):
     monkeypatch.setattr(ai, "load_applicants_csv", lambda p: list(st.rows))
     monkeypatch.setattr(ai, "append_apply_time_log", lambda p: 0)
     monkeypatch.setattr(ai, "RealHubSpotClient", lambda token: object())
+    monkeypatch.setattr(S, "_new_aw_client", lambda token: _NoPrefetch())
     monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="": list(st.results))
     monkeypatch.setattr(S, "_missing_aw_listings",
                         lambda ids, token: [j for j in ids if j in st.hubspot_missing])
 
-    def fake_ensure(bid, pw, missing, out_dir, absent_out=None):
+    def fake_ensure(bid, pw, missing, out_dir, absent_out=None, listing_ids_out=None):
         st.ensure_calls.append(sorted(missing))
         if absent_out is not None:
             absent_out.extend(missing)          # 媒体の一覧にも無かった
@@ -274,7 +292,8 @@ def test_一覧に無い求人への応募は別の欄で数える(aw_stub):
     assert aw_stub.ensure_calls == [["NEW1"]]
     # NEW1 も一覧に無かったので、今回から古い応募として数える
     assert r["no_listing_old"] == 3 and r["unlinked"] == 0 and r["linked"] == 1
-    assert known == {"OLD1", "NEW1"}
+    # 渡した set は書き換えず (社を並列で処理するため)、新たに分かった ID を返す
+    assert known == {"OLD1"} and r["absent_new"] == ["NEW1"]
     assert r["ok"] is True
 
 
@@ -283,8 +302,9 @@ def test_同じ求人IDで自己修復を繰り返さない(aw_stub):
     aw_stub.hubspot_missing = ["OLD1", "OLD2"]
     aw_stub.results = [_pr("unlinked", "OLD1"), _pr("unlinked", "OLD2")]
     known: set = set()
-    S._process_aw_account_raw("A社", ["id"], "pw", Path("."), dry_run=False,
-                              allow_acquire=True, known_absent=known)
+    r = S._process_aw_account_raw("A社", ["id"], "pw", Path("."), dry_run=False,
+                                  allow_acquire=True, known_absent=known)
+    known.update(r["absent_new"])            # 呼び出し側 (run) が台帳に覚える
     S._process_aw_account_raw("A社", ["id"], "pw", Path("."), dry_run=False,
                               allow_acquire=True, known_absent=known)
     assert aw_stub.ensure_calls == [["OLD1", "OLD2"]]     # 2回目は取りに行かない
@@ -304,9 +324,8 @@ def test_一覧に無い求人IDを台帳に覚える(harness, monkeypatch):
 
     def proc(company, b_ids, b_pw, out_dir, dry_run=True, allow_acquire=False,
              known_absent=None):
-        known_absent.add("J9")
         return {"ok": True, "linked": 0, "unlinked": 0, "no_listing_old": 1, "dup": 0,
-                "jobs_fetched": 0, "error": "", "login_id": ""}
+                "jobs_fetched": 0, "error": "", "login_id": "", "absent_new": ["J9"]}
     monkeypatch.setattr(S, "process_aw_account", proc)
     s = _run()
     assert "J9" in harness.ledger.meta_names("aw_absent_job")

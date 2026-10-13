@@ -21,8 +21,13 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import requests
+import requests  # noqa: F401  (他のモジュール・テストが notes.requests を参照する)
 from requests.exceptions import RequestException
+
+try:  # script実行/パッケージ両対応の二重import (applicant_import の notes 読み込みと同じ)
+    from scripts.job_application_sync.http_session import http as _http
+except ImportError:  # pragma: no cover
+    from http_session import http as _http
 
 BASE = "https://api.hubapi.com"
 LISTING = "0-420"
@@ -198,7 +203,8 @@ def _send(method: str, url: str, *, token: Optional[str] = None,
     書込(POST/PUT/PATCH/DELETE)も読取(GET)もこれを通す。冪等判定の読取を
     リトライしないと一過性エラーでフェイルオープンし二重作成を招く(F2-01)。
     """
-    fn = getattr(requests, method.lower())
+    # 接続を使い回す (2026-10-13、http_session の説明を参照)
+    fn = getattr(_http, method.lower())
     r = None
     for attempt in range(retries):
         try:
