@@ -94,12 +94,12 @@ SSO_SUBMIT_SELECTOR_CANDIDATES = (
 
 
 def _mask(s: str) -> str:
-    """ログ用に PW などをマスク."""
-    if not s:
-        return ""
-    if len(s) <= 4:
-        return "*" * len(s)
-    return s[:2] + "*" * (len(s) - 4) + s[-2:]
+    """ログ用に PW などをマスク. 文字も文字数も出さない.
+
+    ★2026-10-13: 旧実装は先頭2文字・末尾2文字・文字数を出しており、公開の
+      Actions ログに `pw=SK********0!` の形でパスワードの断片が出ていた。
+    """
+    return "***" if s else ""
 
 
 # ログイン画面の描画待ち上限 (ms)。2026-10-10 以降 Actions 上で欄が描画前に判定され
@@ -331,8 +331,7 @@ async def establish_aw_session(
         if output_dir:
             await _dump_debug(page, output_dir, "login_form_not_found")
         raise RuntimeError(
-            f"AirRegi SSO のID/PWフィールド未検出 (login_id={login_id}, "
-            f"pw={_mask(password)})"
+            f"AirRegi SSO のID/PWフィールド未検出 (login_id={login_id})"
         )
     await _wait_any_visible(page, SSO_SUBMIT_SELECTOR_CANDIDATES, 5000)
     if not await _click_first_match(page, SSO_SUBMIT_SELECTOR_CANDIDATES):

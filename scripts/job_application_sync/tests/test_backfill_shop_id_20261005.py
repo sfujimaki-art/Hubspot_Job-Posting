@@ -77,9 +77,9 @@ def test_ログインIDとパスワードを伏字にする():
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(HERE))))
     from scripts.job_application_sync import applicant_sync as S
     msg = "secretid@example.com: RuntimeError: ログイン失敗 (login_id=secretid@example.com, pw=Pass1234)"
-    out = S.scrub_secrets(msg, ["secretid@example.com", "Pass1234"])
+    out = S.scrub_secrets(msg, ["secretid@example.com"], passwords=["Pass1234"])
     assert "secretid@example.com" not in out and "Pass1234" not in out
-    assert "se…" in out and "Pa…" in out
+    assert "se…" in out and "Pa…" not in out and "***" in out   # PWは先頭2文字も出さない
     assert S.scrub_secrets("ok", ["", None, "ab"]) == "ok"      # 短すぎる値・空は触らない
 
 

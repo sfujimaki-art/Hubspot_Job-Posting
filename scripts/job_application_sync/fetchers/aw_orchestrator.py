@@ -74,6 +74,13 @@ def _mask(v) -> str:
     return (v[:2] + "…") if len(v) > 2 else "…"
 
 
+def _drop_pw(text, password) -> str:
+    """例外文からパスワードを消す。先頭2文字も残さない (2026-10-13)。"""
+    t = str(text or "")
+    pw = str(password or "")
+    return t.replace(pw, "***") if len(pw) >= 3 else t
+
+
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
 
@@ -313,7 +320,8 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
         except AWNotReadyError as e:
             # Phase2で生成物未完 → 再キュー
             return {"login_id": login_id, "company": company,
-                    "status": "not_ready", "error": str(e)}
+                    "status": "not_ready",
+                    "error": _drop_pw(str(e), acc.get("password"))}
         except AWNoDataError as e:
             return {
                 "login_id": login_id, "company": company, "status": "ok",
@@ -325,8 +333,9 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
         except Exception as e:
             return {
                 "login_id": login_id, "company": company, "status": "error",
-                "error": str(e),
-                "trace": traceback.format_exc().splitlines()[-5:],
+                "error": _drop_pw(str(e), acc.get("password")),
+                "trace": [_drop_pw(x, acc.get("password"))
+                          for x in traceback.format_exc().splitlines()[-5:]],
             }
 
 
