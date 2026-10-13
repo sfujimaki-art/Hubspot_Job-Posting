@@ -861,13 +861,11 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 print(f"  {'❌' if atts >= MAX_ATTEMPTS else '⏳'} HR: "
                       f"{res['error']} ({atts}/{MAX_ATTEMPTS}回)", flush=True)
 
-        if media_filter not in ("AW", "BOTH"):
-            if not dry_run:
-                ledger.save()  # dry-runは台帳を汚さない(実登録してないのにDONEにしない)
-            print(f"[applicant_sync-done] {summary}", flush=True)
-            return summary   # lock は finally で解放
-
-        aw_groups = {k: v for k, v in grouped.items() if k.startswith("AW::")}
+        # HR だけの回は AW を触らない。以前はここで return していたため、後ろの
+        # 顧客シート転記と relink まで飛ばしていた (2026-10-13)。AW を空にして
+        # 素通りさせ、台帳の保存と後段は通常どおり走らせる。
+        aw_groups = ({k: v for k, v in grouped.items() if k.startswith("AW::")}
+                     if media_filter in ("AW", "BOTH") else {})
         # ── 枠を数える前に、ログインしなくても結果が決まる社を外す (2026-10-08) ──
         #   以前は枠 (先頭12社) を取ってから認証を見ていたため、解約済・認証なしの
         #   社もログインする社と同じく1枠を使っていた。
@@ -992,7 +990,13 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     # ---- 顧客シート転記 (2026-08-04 MVP12社) ----
     # 本線(HubSpot登録)完了後に実行。転記の失敗は本線を道連れにしない。
     # 許可リスト(CUSTOMER_SHEET_ALLOW)が空なら何もしない。
-    if not dry_run:
+    # ★後段 (顧客シート転記と relink) は HR を含む回 (HR/BOTH) だけで走らせる (2026-10-13)。
+    #   AW は専用PC (--media AW)、Actions は --media HR に分ける。両方で走らせると
+    #   転記と relink が二重になる。顧客シート用のSAと許可リストは Actions の
+    #   secrets にあるので Actions 側 (HR) に寄せ、AW だけの回では走らせない。
+    #   AW で入った応募は、次の HR の回 (5分ごと) の転記・relink で拾われる。
+    run_post = not dry_run and media_filter in ("HR", "BOTH")
+    if run_post:
         try:
             try:
                 from . import customer_sheet_sync as css
@@ -1027,7 +1031,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     #
     # 対象は「対象外」の応募のみ(実測180件)なので毎回走らせても軽い。
     # 本線(応募の取り込み)には影響させない = 失敗しても握って続行する。
-    if not dry_run:
+    if run_post:
         try:
             rl = relink(dry_run=False, limit=RELINK_LIMIT_PER_SYNC)
             summary["relinked"] = rl.get("relinked", 0)

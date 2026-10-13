@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import re
 import sys
@@ -411,6 +412,17 @@ def load_recruit_url_cache(state_dir: Path) -> dict:
     return {}
 
 
+def login_file_tag(login_id: str) -> str:
+    """ファイル名用: ログインIDのハッシュ先頭8桁 (2026-10-13)。
+
+    以前は @ や . を _ にした ID をそのまま入れており、例外文や saved: の
+    出力で公開ログに ID が出ていた。private_log.file_tag と同じ値
+    (private_log は atexit を登録するので、ここでは import しない)。
+    """
+    t = (login_id or "").strip()
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()[:8] if t else "unknown"
+
+
 async def _cache_recruit_url_if_missing(page, login_id: str, state_dir: Path) -> None:
     """未キャッシュなら採用サイトURLを抽出して保存 (遅延・BAN対策)。
 
@@ -548,8 +560,7 @@ async def fetch_aw_xlsx(
                             )
                     dl = await dl_info.value
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    safe_id = re.sub(r"[^0-9A-Za-z_.-]", "_", login_id)
-                    out_path = output_dir / f"aw_{safe_id}_{ts}.zip"
+                    out_path = output_dir / f"aw_{login_file_tag(login_id)}_{ts}.zip"
                     await dl.save_as(str(out_path))
                     return out_path
 

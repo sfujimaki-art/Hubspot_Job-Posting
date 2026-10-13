@@ -61,7 +61,7 @@ CLI:
 出力:
   dry-run: 更新/作成予定 + skipリスト → JSON + サマリ
   actual:  HubSpot API実行 + 同一形式ログ
-  ログ:    scripts/job_application_sync/logs/airwork_import_{login_id}_{timestamp}.json
+  ログ:    scripts/job_application_sync/logs/airwork_import_{ログインIDのハッシュ8桁}_{timestamp}.json
 """
 from __future__ import annotations
 
@@ -69,7 +69,6 @@ import argparse
 import csv
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -999,10 +998,14 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
             "created_idmap": idmap,
         }
 
-    # ログ出力 (login_id をファイル名に含める)
+    # ログ出力。★ファイル名はログインIDから作らない (2026-10-13)。
+    #   以前は @ や . を _ にしただけの ID を入れており、下の print で
+    #   公開の Actions ログに ID がほぼそのまま出ていた。ハッシュの先頭8桁にして、
+    #   どの ID のログかは非公開ログで引けるようにする。
     ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-    safe_login = re.sub(r"[^0-9A-Za-z_.\-]+", "_", login_id) or "unknown"
-    log_path = LOG_DIR / f"airwork_import_{safe_login}_{'dry' if dry_run else 'actual'}_{ts}.json"
+    log_path = (LOG_DIR / f"airwork_import_{plog.file_tag(login_id)}_"
+                          f"{'dry' if dry_run else 'actual'}_{ts}.json")
+    plog.detail("airwork_import_log", path=str(log_path), login_id=login_id)
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2),
                         encoding="utf-8")
     print(f"\nログ: {log_path}")

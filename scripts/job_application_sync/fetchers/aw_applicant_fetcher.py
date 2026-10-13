@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -49,11 +48,6 @@ CSV_HEADER_TOKEN = "応募ID"
 # 既定保存先 (repo_root/scratchpad/csv_fetched/aw_applicants)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_DIR = _REPO_ROOT / "scratchpad" / "csv_fetched" / "aw_applicants"
-
-
-def sanitize_login_id(login_id: str) -> str:
-    """login_id をファイル名に安全な形へ (@ や . 等を _ に)."""
-    return re.sub(r"[^0-9A-Za-z_-]", "_", login_id)
 
 
 def validate_applicant_csv(path: Path) -> None:
@@ -203,7 +197,7 @@ async def fetch_aw_applicants(
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = (
                 output_dir
-                / f"aw_applicants_{sanitize_login_id(login_id)}_{ts}.csv"
+                / f"aw_applicants_{awf.login_file_tag(login_id)}_{ts}.csv"
             )
             await dl.save_as(str(out_path))
             validate_applicant_csv(out_path)

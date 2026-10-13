@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -77,6 +78,13 @@ def mask_id(s: Any) -> str:
     if len(t) <= 4:
         return t[:1] + "***"
     return t[:2] + "***" + t[-2:]
+
+
+def file_tag(s: Any) -> str:
+    """ファイル名に入れる識別子: ハッシュの先頭8桁。ログインID・メールから
+    ファイル名を作るとき、元の値の断片が公開ログに出ないようにする (2026-10-13)。"""
+    t = "" if s is None else str(s).strip()
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()[:8] if t else "unknown"
 
 
 def redact(text: Any, values: Iterable[Any] = ()) -> str:
