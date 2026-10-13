@@ -102,6 +102,85 @@ def _mask(s: str) -> str:
     return s[:2] + "*" * (len(s) - 4) + s[-2:]
 
 
+# ログイン画面の描画待ち上限 (ms)。2026-10-10 以降 Actions 上で欄が描画前に判定され
+# 失敗していたため、候補のどれかが見えるまで待つ。
+LOGIN_FORM_WAIT_MS = 15000
+
+# 診断ログで「あるか無いか」だけ出す既知の語 (本文は出さない)
+DIAG_WORDS = (
+    "ログイン", "AirID", "認証", "ロボット", "captcha", "reCAPTCHA",
+    "アクセス", "制限", "エラー", "メンテナンス", "混雑", "403", "429",
+)
+
+
+async def _wait_any_visible(page, selectors: tuple[str, ...],
+                            timeout_ms: int = LOGIN_FORM_WAIT_MS,
+                            interval_ms: int = 250) -> bool:
+    """候補セレクタのどれかが表示されるまで最大 timeout_ms 待つ (ポーリング)."""
+    waited = 0
+    while True:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        if waited >= timeout_ms:
+            return False
+        await asyncio.sleep(interval_ms / 1000)
+        waited += interval_ms
+
+
+def _safe_url(url: str) -> str:
+    """ホストとパスだけ (クエリ・フラグメントは落とす)."""
+    m = re.match(r"^(https?)://([^/?#]+)([^?#]*)", url or "")
+    if not m:
+        return "(non-http)"
+    return f"{m.group(2)}{m.group(3)}"
+
+
+def format_login_diag(url: str, title: str, input_counts: dict,
+                      words: dict) -> str:
+    """公開ログ向けの診断行. 本文・クエリ・ID は含めない."""
+    inputs = ",".join(f"{k}={v}" for k, v in sorted(input_counts.items())) or "none"
+    present = ",".join(w for w in DIAG_WORDS if words.get(w)) or "none"
+    t = (title or "").replace("\n", " ")[:80]
+    return (f"[aw-login-diag] url={_safe_url(url)} title={t!r} "
+            f"inputs={inputs} words={present}")
+
+
+async def _log_login_diag(page, stage: str) -> None:
+    """欄未検出時に安全な情報だけを stderr へ出す (失敗しても握りつぶす)."""
+    try:
+        url = page.url
+        try:
+            title = await page.title()
+        except Exception:  # noqa: BLE001
+            title = ""
+        info = await page.evaluate(
+            """(words) => {
+                const counts = {};
+                document.querySelectorAll('input').forEach(i => {
+                    const t = (i.getAttribute('type') || 'text').toLowerCase();
+                    counts[t] = (counts[t] || 0) + 1;
+                });
+                const body = (document.body && document.body.innerText) || '';
+                const low = body.toLowerCase();
+                const found = {};
+                words.forEach(w => { found[w] = low.includes(w.toLowerCase()); });
+                return {counts, found};
+            }""",
+            list(DIAG_WORDS),
+        )
+        line = format_login_diag(url, title, info.get("counts", {}),
+                                 info.get("found", {}))
+        print(f"{line} stage={stage}", file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[aw-login-diag] 取得失敗 stage={stage} err={type(e).__name__}",
+              file=sys.stderr, flush=True)
+
+
 async def _fill_first_match(page, selectors: tuple[str, ...], value: str) -> bool:
     """セレクタ候補を順に試して最初にヒットしたものへ value を入力."""
     for sel in selectors:
@@ -238,16 +317,26 @@ async def establish_aw_session(
     ctx = await browser.new_context(accept_downloads=True, viewport=VIEWPORT)
     page = await ctx.new_page()
     await page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
+    # airwork → connect.airregi.jp のリダイレクト完了と描画を待つ (best effort)
+    try:
+        await page.wait_for_load_state("load", timeout=LOGIN_FORM_WAIT_MS)
+    except Exception:  # noqa: BLE001
+        pass
+    await _wait_any_visible(page, SSO_ID_SELECTOR_CANDIDATES)
     ok_id = await _fill_first_match(page, SSO_ID_SELECTOR_CANDIDATES, login_id)
+    await _wait_any_visible(page, SSO_PW_SELECTOR_CANDIDATES, 3000)
     ok_pw = await _fill_first_match(page, SSO_PW_SELECTOR_CANDIDATES, password)
     if not (ok_id and ok_pw):
+        await _log_login_diag(page, "form_not_found")
         if output_dir:
             await _dump_debug(page, output_dir, "login_form_not_found")
         raise RuntimeError(
             f"AirRegi SSO のID/PWフィールド未検出 (login_id={login_id}, "
             f"pw={_mask(password)})"
         )
+    await _wait_any_visible(page, SSO_SUBMIT_SELECTOR_CANDIDATES, 5000)
     if not await _click_first_match(page, SSO_SUBMIT_SELECTOR_CANDIDATES):
+        await _log_login_diag(page, "submit_not_found")
         if output_dir:
             await _dump_debug(page, output_dir, "login_submit_not_found")
         raise RuntimeError("AirRegi SSO の submit ボタン未検出")
