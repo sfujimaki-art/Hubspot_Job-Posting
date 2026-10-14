@@ -65,6 +65,7 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
 
 # A-2 を関数呼出で再利用
 from scripts.job_application_sync import airwork_import as awi  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_pace as _aw_pace  # noqa: E402
 
 
 
@@ -273,6 +274,13 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
     async with sem:
         login_id = acc.get("login_id", "")
         company = acc.get("company_name", "")
+        # ★AirWork の CloudFront が 403 を返した後は触らない。触る前は、応募の取り込みと
+        #   共通の「社と社の間の最低間隔」を守る (2026-10-13、fetchers/aw_pace.py)。
+        if _aw_pace.is_blocked():
+            return {"login_id": login_id, "company": company,
+                    "status": "not_ready" if phase == "collect" else "error",
+                    "error": "AirWork が403を返したため、アクセスを止めています"}
+        await asyncio.to_thread(_aw_pace.wait_company_turn)
         try:
             t0 = datetime.now()
 
