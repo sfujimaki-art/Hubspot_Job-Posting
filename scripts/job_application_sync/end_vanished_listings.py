@@ -9,7 +9,7 @@
 
 ルール (定数はこのファイルの先頭):
   - HRハッカー: CSV が完全に取れた取込のあと、店舗ごとに「公開中」で、最終CSV検出日が
-    HRH_VANISH_DAYS 日以上前の求人を公開終了にする (kyuujin_status=公開終了 /
+    HRH_VANISH_DAYS(=1)日以上前、つまり今回の取込日より前の求人を公開終了にする (kyuujin_status=公開終了 /
     baitai_genjoukyou_hrhakkaa=非公開)。再び CSV に載れば通常の更新で 公開中/公開 に戻る。
   - AirWork: 取得に成功した口座 (airwork_import が完全なエクスポートを処理した口座) の
     「公開中」で、そのエクスポートに無い求人だけを公開終了にする (airwork_import.run)。
@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover
 BASE = "https://api.hubapi.com"
 
 # ---- 定数 -------------------------------------------------------------------
-HRH_VANISH_DAYS = 3          # 最終CSV検出日がこの日数以上前なら「消えた」とみなす
+HRH_VANISH_DAYS = 1          # 最終CSV検出日がこの日数以上前(=今回の取込日より前)なら、CSVに載らなかったとみなす
 MAX_END_RATIO = 0.20         # 1 店舗/口座の「公開中」のうち、1 回に終了にしてよい上限の割合
 MAX_END_FLOOR = 2            # 終了予定がこの件数以下なら割合の上限を適用しない (小さな店舗が永久に止まらないように)
 AW_RECENT_FETCH_DAYS = 7     # 是正 CLI: 口座を「最近取得した」とみなす日数
@@ -320,6 +320,11 @@ def main(argv=None) -> int:
 
     if args.only in (None, "hrh"):
         hl = fetch_hrh_published()
+        # 今日の取込が済んでいないと全件が「1日以上前」になるため、今日検出された求人が
+        # 1件も無ければ HRH は見送る (取込のあとに実行する)
+        if not any(parse_date(l["properties"].get(PROP_SEEN)) == today for l in hl):
+            print("[HRH] 今日検出された求人が無い(今日の取込が未実行)ため見送り")
+            hl = []
         ends, skipped, no_date = plan_hrh_ends(hl, today)
         print(f"[HRH] 公開中 {len(hl)} 件 / 終了予定 {len(ends)} 件 / "
               f"上限超えで見送る店舗 {len(skipped)} (予定 {sum(s[0] for s in skipped.values())} 件) / "

@@ -25,10 +25,11 @@ def L(i, shop="S1", ago=0, **kw):
 
 
 # ---- HRH 計画 ---------------------------------------------------------------
-def test_境界_2日前は残し3日前から終了():
-    ls = [L(i, ago=0) for i in range(1, 8)] + [L(8, ago=2), L(9, ago=3), L(10, ago=30)]
+def test_境界_0日前は残し1日前から終了():
+    ls = [L(i, ago=0) for i in range(1, 9)] + [L(9, ago=1), L(10, ago=30)]
     ends, skipped, _ = ev.plan_hrh_ends(ls, TODAY)
     assert sorted(l["id"] for l in ends) == ["10", "9"] and not skipped
+    assert ev.HRH_VANISH_DAYS == 1
 
 
 def test_今回のCSVに載っている求人は古い日付でも終了にしない():

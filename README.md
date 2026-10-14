@@ -56,7 +56,7 @@ LISTING(0-420) を (`airwork_account_login_id`, `id_airwork`=参照番号) の�
 
 | 項目 | 値 / ルール |
 |---|---|
-| `HRH_VANISH_DAYS` | 3。HRハッカーの公開中求人のうち、最終CSV検出日が3日以上前のものを `kyuujin_status=公開終了` / `baitai_genjoukyou_hrhakkaa=非公開` にする |
+| `HRH_VANISH_DAYS` | 1。HRハッカーの公開中求人のうち、今回の取込のCSVに載らなかった(最終CSV検出日が今回の取込日より前=1日以上前の)ものを `kyuujin_status=公開終了` / `baitai_genjoukyou_hrhakkaa=非公開` にする |
 | 実行条件 (HRH) | `hrhacker_import` の actual で CSV が完全 (`--limit` なし・1行以上・媒体求人ID欠けなし) かつ更新/作成が全部成功した回だけ。店舗 (`id_shop_hrhakkaa`) ごとに判定 |
 | AirWork | 完全なエクスポートを処理した口座の公開中のうち、そのエクスポートに無い求人だけ公開終了 (従来の動作)。取得していない口座は触らない。取得に成功した口座は `data/job_application_sync/aw_fetch_ledger.json` にハッシュで記録 |
 | `MAX_END_RATIO` | 0.20。1 店舗/口座の公開中のうち 20% を超える終了予定になったら、その店舗/口座は見送り (壊れた取得の疑い)。予定が `MAX_END_FLOOR`=2 件以下なら適用しない |
@@ -71,4 +71,4 @@ python scripts/job_application_sync/end_vanished_listings.py --apply    # 書き
 python scripts/job_application_sync/end_vanished_listings.py --only hrh # hrh / aw の片方だけ
 ```
 
-AW は「口座を7日以内に取得済み」かつ「その取得に載らなかった」求人だけが対象。取得日は台帳、無ければ口座内の最終CSV検出日の最大値で推定する。取得が古い口座や日付の無い求人は「要確認」として変更しない。書き込んだ求人は `douki_moto_filename` に `end_vanished_listings` と入る。
+HRH は今日の取込が済んでいる(今日検出された求人がある)ときだけ対象。AW は「口座を7日以内に取得済み」かつ「その取得に載らなかった」求人だけが対象。取得日は台帳、無ければ口座内の最終CSV検出日の最大値で推定する。取得が古い口座や日付の無い求人は「要確認」として変更しない。書き込んだ求人は `douki_moto_filename` に `end_vanished_listings` と入る。
