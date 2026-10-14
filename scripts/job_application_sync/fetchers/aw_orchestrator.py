@@ -33,7 +33,7 @@ import os
 import re
 import sys
 import traceback
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -694,6 +694,230 @@ async def orchestrate(parallel: int = 5,
 
 
 # ============================================================================
+# 有料広告実績 (billing) フェーズ
+#   billing-create : 各社の先頭の未取得の週を作成するだけ (待たない)。キューに保存
+#   billing-collect: キューから待機短めで ZIP を保存 (ローテーションスライス)
+#   billing-full   : 1 週ずつ create → 完成待ち → 保存を週の数だけ直列 (バックフィル向け)
+# HubSpot への書込はここでは行わない (airwork_billing_import.py が別途実行)。
+# ============================================================================
+BILLING_PHASES = ("billing-create", "billing-collect", "billing-full")
+BILLING_QUEUE_PATH = _REPO / "data" / "job_application_sync" / "aw_billing_queue.json"
+BILLING_EMPTY_PATH = _REPO / "data" / "job_application_sync" / "aw_billing_empty.json"
+
+
+def _load_json(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def _save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _billing_status(week_results: list, mode: str) -> str:
+    """週ごとの結果から 1 アカウントの status を決める。"""
+    st = {s for _, s, _ in week_results}
+    if "error" in st:
+        return "error"
+    if "not_ready" in st:
+        return "not_ready"
+    if mode == "create" and "queued" in st:
+        return "queued"
+    return "ok"
+
+
+async def process_billing_one(sem: asyncio.Semaphore, acc: dict, weeks: list,
+                              out_dir: Path, headless: bool, mode: str) -> dict:
+    """1 顧客の有料広告実績を処理。常に dict 返却 (例外も捕捉)。"""
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    async with sem:
+        login_id = acc.get("login_id", "")
+        company = acc.get("company_name", "")
+        pw = acc.get("password", "")
+        t0 = datetime.now()
+        try:
+            res = await bf.fetch_aw_billing_weeks(
+                login_id, pw, weeks, out_dir, headless=headless, mode=mode)
+            counts: dict = {}
+            for _, s, _ in res:
+                counts[s] = counts.get(s, 0) + 1
+            first_err = next((d for _, s, d in res if s in ("error", "not_ready") and d), "")
+            return {"login_id": login_id, "company": company,
+                    "status": _billing_status(res, mode),
+                    "weeks": counts,
+                    "week_status": {w.isoformat(): s for w, s, _ in res},
+                    "error": _scrub(_drop_pw(first_err, pw), [login_id]),
+                    "duration_sec": (datetime.now() - t0).total_seconds()}
+        except Exception as e:  # noqa: BLE001
+            return {"login_id": login_id, "company": company, "status": "error",
+                    "error": _scrub(_drop_pw(str(e), pw), [login_id]),
+                    "trace": [_scrub(_drop_pw(x, pw), [login_id])
+                              for x in traceback.format_exc().splitlines()[-5:]]}
+
+
+def _select_billing_accounts(from_active_deals: bool, target_login_ids) -> list:
+    if from_active_deals:
+        mails = _fetch_active_deal_mails()
+        accounts, unresolved = resolve_accounts_for_mails(
+            mails, active_only=True, prefer="A")
+        print(f"[orchestrate] --from-active-deals: AW解決 {len(accounts)} / "
+              f"未解決 {len(unresolved)}", flush=True)
+    else:
+        accounts = list(iter_aw_accounts(active_only=True))[::-1]
+    if target_login_ids:
+        tset = {str(e).strip() for e in target_login_ids if str(e).strip()}
+        accounts = [a for a in accounts if a.get("login_id") in tset]
+        print(f"[orchestrate] --target-login-ids filter: {len(accounts)}/{len(tset)} matched",
+              flush=True)
+    return accounts
+
+
+async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
+                              limit: Optional[int] = None, headless: bool = True,
+                              out_dir: Optional[Path] = None,
+                              log_dir: Optional[Path] = None,
+                              target_login_ids: Optional[list] = None,
+                              from_active_deals: bool = False,
+                              dry_run: bool = False) -> dict:
+    """有料広告実績の取得。dry_run=True なら対象の列挙だけ (ログインしない)。"""
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    mode = phase.split("-", 1)[1]
+    out_dir = Path(out_dir) if out_dir else bf.DEFAULT_OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(log_dir) if log_dir else (_HERE.parent / "logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(parallel)
+    empty = _load_json(BILLING_EMPTY_PATH)   # {login_id: [週の月曜 ISO,...]} データ無し確定の週
+
+    def pending_weeks(lid: str) -> list:
+        skip = set(empty.get(lid, []))
+        return [w for w in weeks if w.isoformat() not in skip
+                and not bf.has_saved(out_dir, lid, w)]
+
+    if phase == "billing-collect":
+        queue = _load_json(BILLING_QUEUE_PATH)
+        q_items = sorted(queue.items())
+        slice_n = limit if limit else int(os.environ.get("AW_COLLECT_SLICE", "20"))
+        q_slice = _rotate_slice(q_items, slice_n, out_dir, key="billing-collect")
+        jobs = []
+        for lid, meta in q_slice:
+            try:
+                wk = date.fromisoformat(meta.get("week_start", ""))
+            except Exception:  # noqa: BLE001
+                continue
+            acc = find_account_by_login_id(lid) or {
+                "login_id": lid, "company_name": meta.get("company", ""), "password": ""}
+            jobs.append((acc, [wk]))
+        print(f"[orchestrate] phase={phase}: キュー {len(queue)}件 → 今回 {len(jobs)}社",
+              flush=True)
+    else:
+        accounts = _select_billing_accounts(from_active_deals, target_login_ids)
+        if limit and (from_active_deals) and not target_login_ids:
+            accounts = _rotate_slice(accounts, limit, out_dir, key=phase)
+        elif limit:
+            accounts = accounts[:limit]
+        jobs = [(a, pending_weeks(a.get("login_id", ""))) for a in accounts]
+        jobs = [(a, w) for a, w in jobs if w]
+        print(f"[orchestrate] phase={phase}: 対象 {len(jobs)}社 / 週 "
+              f"{weeks[0].isoformat() if weeks else '-'}〜{weeks[-1].isoformat() if weeks else '-'}"
+              f" ({len(weeks)}週), parallel={parallel}", flush=True)
+
+    total = len(jobs)
+    if total == 0:
+        print("[orchestrate] 対象なし。", flush=True)
+        return {"ok": 0, "ng": 0, "total": 0, "log": None}
+    if dry_run:
+        print(f"[orchestrate] dry-run: {total}社を処理予定 (ログインしない)", flush=True)
+        return {"ok": 0, "ng": 0, "total": total, "log": None, "dry_run": True}
+
+    done = {"n": 0}
+
+    async def _wrapped(acc, wk):
+        r = await process_billing_one(sem, acc, wk, out_dir, headless, mode)
+        done["n"] += 1
+        print(f"[done {done['n']}/{total}] {r['status']} "
+              f"login_id={_mask(r.get('login_id'))} "
+              f"({plog.mask_name(r.get('company', ''))}) weeks={r.get('weeks', {})}",
+              flush=True)
+        return r
+
+    results = await asyncio.gather(*[_wrapped(a, w) for a, w in jobs])
+
+    # --- 状態の更新 (キュー / データ無しの週) ---
+    queue = _load_json(BILLING_QUEUE_PATH)
+    for r in results:
+        lid = r["login_id"]
+        for wk, st in (r.get("week_status") or {}).items():
+            if st == "empty":
+                lst = empty.setdefault(lid, [])
+                if wk not in lst:
+                    lst.append(wk)
+        if phase == "billing-create" and r["status"] == "queued":
+            first = next((w for w, s in (r.get("week_status") or {}).items()
+                          if s == "queued"), "")
+            queue[lid] = {"company": r.get("company", ""), "week_start": first,
+                          "triggered_at": datetime.now().isoformat()}
+        elif phase == "billing-collect":
+            if r["status"] == "ok":
+                queue.pop(lid, None)
+        elif phase == "billing-full":
+            queue.pop(lid, None) if r["status"] == "ok" else None
+    _save_json(BILLING_EMPTY_PATH, empty)
+    _save_json(BILLING_QUEUE_PATH, queue)
+
+    summary = _write_account_results(results, out_dir, phase)
+    print(f"[orchestrate] 住み分け({phase}): {summary}", flush=True)
+    _slack_notify(f"🔄 AW有料広告実績({phase}) {total}社処理: "
+                  + " / ".join(f"{k}={v}" for k, v in summary.items()))
+    ok = sum(1 for r in results if r["status"] in ("ok", "queued"))
+    ng = sum(1 for r in results if r["status"] == "error")
+    nr = sum(1 for r in results if r["status"] == "not_ready")
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    log_path = log_dir / f"aw_{phase.replace('-', '_')}_{ts}.json"
+    log_path.write_text(json.dumps(
+        {"ok": ok, "ng": ng, "not_ready": nr,
+         "results": [_sanitize(r) for r in results]},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    for r in results:
+        if r.get("status") not in ("ok", "queued"):
+            plog.detail("aw_billing_result", phase=phase, login_id=r.get("login_id"),
+                        company=r.get("company"), status=r.get("status"),
+                        error=r.get("error", ""))
+    print(f"[{phase}-done] ok={ok} ng={ng} not_ready={nr} queue残={len(queue)} "
+          f"log={log_path}", flush=True)
+    return {"ok": ok, "ng": ng, "not_ready": nr, "total": total, "log": str(log_path)}
+
+
+def resolve_billing_weeks(week_start: str = "", frm: str = "", to: str = "",
+                          today: Optional[date] = None) -> list:
+    """CLI 引数 → 対象週 (月曜 date のリスト)。
+
+    --week-start : その 1 週 (月曜でなければエラー)
+    --from [--to]: その期間の完了週すべて (バックフィル)
+    どちらも無し : 直近の完了週 1 週
+    """
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    if week_start and (frm or to):
+        raise SystemExit("--week-start と --from/--to は同時に指定できません")
+    if week_start:
+        d = date.fromisoformat(week_start)
+        if d.weekday() != 0:
+            raise SystemExit("--week-start は月曜日を指定してください")
+        return [d]
+    if frm:
+        return bf.weeks_between(date.fromisoformat(frm),
+                                date.fromisoformat(to) if to else None, today)
+    if to:
+        raise SystemExit("--to は --from と一緒に指定してください")
+    return [bf.last_full_week(today)]
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 def parse_args(argv=None):
@@ -723,11 +947,25 @@ def parse_args(argv=None):
                         "シート1のAW応募→AWアカウント解決を対象にする")
     p.add_argument("--applications-cutoff", default="",
                    help="--from-applications の応募日カットオフ(ISO YYYY-MM-DD, 空=全件)")
-    p.add_argument("--phase", choices=["full", "create", "collect"],
+    p.add_argument("--phase",
+                   choices=["full", "create", "collect", *BILLING_PHASES],
                    default="full",
                    help="full=生成+DL+取込(従来) / create=生成トリガーのみ(Phase1,"
                         "対象をキュー保存) / collect=キューから待機なしDL+取込(Phase2)。"
-                        "クラウド課金の生成待ち時間を分離する")
+                        "クラウド課金の生成待ち時間を分離する。"
+                        "billing-create/billing-collect/billing-full=有料広告実績(求人単位/週)の"
+                        "取得 (HubSpot 書込なし。取込は airwork_billing_import.py)")
+    p.add_argument("--week-start", default="",
+                   help="[billing-*] 対象週の月曜 YYYY-MM-DD (既定: 直近の完了週)")
+    p.add_argument("--from", dest="billing_from", default="",
+                   help="[billing-*] バックフィル開始日 YYYY-MM-DD (その日を含む週から)")
+    p.add_argument("--to", dest="billing_to", default="",
+                   help="[billing-*] バックフィル終了日 (既定: 直近の完了週)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="[billing-*] 対象の列挙だけ行い、ログインしない "
+                        "(billing は HubSpot に書かないので --actual は不要)")
+    p.add_argument("--billing-dir", default=None,
+                   help="[billing-*] ZIP 保存先 (既定 ~/airwork-exports/billing)")
     return p.parse_args(argv)
 
 
@@ -737,6 +975,15 @@ def main(argv=None):
     if args.target_login_ids:
         target_ids = [s.strip() for s in args.target_login_ids.split(",")
                       if s.strip()]
+    if args.phase in BILLING_PHASES:
+        asyncio.run(orchestrate_billing(
+            args.phase,
+            resolve_billing_weeks(args.week_start, args.billing_from, args.billing_to),
+            parallel=args.parallel, limit=args.limit, headless=not args.headful,
+            out_dir=Path(args.billing_dir) if args.billing_dir else None,
+            target_login_ids=target_ids, from_active_deals=args.from_active_deals,
+            dry_run=args.dry_run))
+        return
     asyncio.run(orchestrate(
         parallel=args.parallel,
         limit=args.limit,
