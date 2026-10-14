@@ -81,9 +81,11 @@ import requests
 from dotenv import load_dotenv
 
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
+    from . import end_vanished_listings as _ev
     from . import listing_stage as _stage
     from . import private_log as plog
 except ImportError:  # pragma: no cover
+    import end_vanished_listings as _ev  # type: ignore
     import listing_stage as _stage  # type: ignore
     import private_log as plog  # type: ignore
 
@@ -912,12 +914,14 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
     #   載っていない求人のみ。取得に失敗したら何もしない (従来どおり)。
     ends: list[dict] = []
     end_preview: list[dict] = []
+    end_skipped_cap = 0
     end_checked = export_is_complete(len(rows), len(valid_rows), skipped_no_id,
                                      limit, login_id)
     if end_checked and (not dry_run or os.environ.get("HUBSPOT_ACCESS_TOKEN")):
         try:
             in_export = {str(j).strip() for j in media_job_ids}
-            for lst in find_published_listings_for_login(login_id):
+            published = find_published_listings_for_login(login_id)
+            for lst in published:
                 if str(lst["properties"].get("id_airwork")).strip() in in_export:
                     continue
                 props = build_end_missing_props(lst["properties"], now_iso,
@@ -925,6 +929,12 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
                 ends.append({"id": lst["id"], "properties": props})
                 end_preview.append({"id_airwork": lst["properties"].get("id_airwork"),
                                     "hubspot_id": lst["id"], "properties": props})
+            # 安全弁 (2026-10-15): 公開中の MAX_END_RATIO を超える終了は、壊れた取得の疑いなので見送る
+            if _ev.over_cap(len(ends), len(published)):
+                end_skipped_cap = len(ends)
+                print(f"WARN: 終了予定 {len(ends)} 件が公開中 {len(published)} 件の"
+                      f" {int(_ev.MAX_END_RATIO * 100)}% を超えるため、この口座の公開終了は見送り")
+                ends, end_preview = [], []
         except Exception as e:
             ends, end_preview = [], []
             print(f"WARN: 公開中求人の検索に失敗したため公開終了は見送り: {type(e).__name__}")
@@ -933,6 +943,8 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         "input_path": input_path,
         "login_id": login_id,
         "ends_planned": len(ends),
+        "ends_skipped_cap": end_skipped_cap,
+        "export_complete": bool(end_checked),
         "csv_total_rows": len(rows),   # キー名は後方互換のため csv_ を維持
         "skipped_no_id": skipped_no_id,
         "valid_rows": len(valid_rows),
@@ -972,6 +984,12 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         print(f"  更新: OK={u_ok} NG={u_ng}")
         print(f"  作成: OK={c_ok} NG={c_ng}")
         print(f"  公開終了(エクスポートから消えた分): OK={e_ok} NG={e_ng}")
+        # 完全なエクスポートを処理できた口座を記録 (是正 CLI が「取得済みの口座」を判定する材料)
+        if end_checked and u_ng == 0:
+            try:
+                _ev.record_aw_fetch(login_id)
+            except OSError:
+                pass
         if e_err:
             print(f"  公開終了エラー: {len(e_err)}件 (内容は非公開ログ)")
             plog.detail("airwork_import_end_errors", errors=e_err[:20])

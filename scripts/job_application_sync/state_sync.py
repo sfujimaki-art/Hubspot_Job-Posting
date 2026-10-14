@@ -43,6 +43,7 @@ SYNC_TARGETS = [
     # 応募連携 (2026-07-07): 処理台帳 + AWアカウント別セッション
     "applicant_ledger.json",
     "aw_sessions",    # ディレクトリ (アカウント別 storage_state)
+    "aw_fetch_ledger.json",   # 完全に取得できた AW 口座の記録 (2026-10-15、口座はハッシュのみ)
 ]
 
 
