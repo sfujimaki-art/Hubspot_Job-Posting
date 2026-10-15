@@ -56,7 +56,7 @@ LISTING(0-420) を (`airwork_account_login_id`, `id_airwork`=参照番号) の�
 
 | 項目 | 値 / ルール |
 |---|---|
-| `HRH_VANISH_DAYS` | 1。HRハッカーの公開中求人のうち、今回の取込のCSVに載らなかった(最終CSV検出日が今回の取込日より前=1日以上前の)ものを `kyuujin_status=公開終了` / `baitai_genjoukyou_hrhakkaa=非公開` にする |
+| `HRH_VANISH_DAYS` | 2。中1日あけて(2日以上見つからないとき)終了にする。理由: 取込が1日抜けたり最終CSV検出日が1日更新されなかったときに、間違って終了にしないための余裕。HRハッカーの公開中求人のうち、最終CSV検出日が取込日の2日以上前のものを `kyuujin_status=公開終了` / `baitai_genjoukyou_hrhakkaa=非公開` にする |
 | 実行条件 (HRH) | `hrhacker_import` の actual で CSV が完全 (`--limit` なし・1行以上・媒体求人ID欠けなし) かつ更新/作成が全部成功した回だけ。店舗 (`id_shop_hrhakkaa`) ごとに判定 |
 | AirWork | 完全なエクスポートを処理した口座の公開中のうち、そのエクスポートに無い求人だけ公開終了 (従来の動作)。取得していない口座は触らない。取得に成功した口座は `data/job_application_sync/aw_fetch_ledger.json` にハッシュで記録 |
 | `MAX_END_RATIO` | 0.20。1 店舗/口座の公開中のうち 20% を超える終了予定になったら、その店舗/口座は見送り (壊れた取得の疑い)。予定が `MAX_END_FLOOR`=2 件以下なら適用しない |
