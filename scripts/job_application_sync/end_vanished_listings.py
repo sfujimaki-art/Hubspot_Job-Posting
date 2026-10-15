@@ -320,12 +320,19 @@ def main(argv=None) -> int:
 
     if args.only in (None, "hrh"):
         hl = fetch_hrh_published()
-        # 今日の取込が済んでいないと検出日が1日ずれて誤判定しうるため、今日検出された求人が
-        # 1件も無ければ HRH は見送る (取込のあとに実行する)
-        if not any(parse_date(l["properties"].get(PROP_SEEN)) == today for l in hl):
-            print("[HRH] 今日検出された求人が無い(今日の取込が未実行)ため見送り")
+        # 基準日 = 直近の取込日 (公開中の求人の最終CSV検出日の最大)。毎日の取込は 05:00 JST に
+        # 走り、検出日は UTC の日付で入るため、暦の「今日」とは1日ずれる。暦の今日で比べると
+        # 取込済みでも「今日検出が無い」と見送り続けるので、直近の取込日を基準にする。
+        # 直近の取込日が2日より古ければ取込が止まっているとみなして見送る。
+        seen = [d for d in (parse_date(l["properties"].get(PROP_SEEN)) for l in hl) if d]
+        ref = max(seen) if seen else None
+        if ref is None or (today - ref).days > 2:
+            print(f"[HRH] 直近の取込日が古い({ref})ため見送り")
             hl = []
-        ends, skipped, no_date = plan_hrh_ends(hl, today)
+            ref = today
+        else:
+            print(f"[HRH] 基準日(直近の取込日) {ref}")
+        ends, skipped, no_date = plan_hrh_ends(hl, ref)
         print(f"[HRH] 公開中 {len(hl)} 件 / 終了予定 {len(ends)} 件 / "
               f"上限超えで見送る店舗 {len(skipped)} (予定 {sum(s[0] for s in skipped.values())} 件) / "
               f"日付なし {no_date} 件 (HRH_VANISH_DAYS={HRH_VANISH_DAYS})")
