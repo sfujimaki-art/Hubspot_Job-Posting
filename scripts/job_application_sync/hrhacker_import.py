@@ -695,6 +695,16 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None,
     print(f"  更新予定: {len(updates)} 件")
     print(f"  新規作成予定: {len(creates)} 件")
 
+    # ★ CSV から消えた公開中求人 → 公開終了 (2026-10-15)。CSV が完全に取れた回だけ。
+    #   書き込みの取込が全部成功した後にだけ実行する (dry-run は計画の件数だけ)。
+    end_ok_to_run = False
+    try:
+        from scripts.job_application_sync import end_vanished_listings as _ev
+    except ImportError:  # pragma: no cover
+        import end_vanished_listings as _ev  # type: ignore
+    end_complete = _ev.csv_is_complete(len(rows), len(valid_rows), skipped_no_id, limit)
+    summary["end_vanished_checked"] = bool(end_complete)
+
     if dry_run:
         log = {
             "summary": summary,
@@ -728,11 +738,27 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None,
         summary["template_notes_failed"] = note_failed
         print(f"  テンプレNote付与: ✅{note_ok}"
               + (f" ❌{len(note_failed)} {note_failed[:5]}" if note_failed else ""))
+        end_ok_to_run = end_complete and u_ng == 0 and c_ng == 0
         log = {
             "summary": summary,
             "errors": {"update": u_err, "create": c_err},
             "created_idmap": idmap,
         }
+
+    # CSV から消えた求人の公開終了 (取込が全部成功した actual、または dry-run の計画のみ)
+    if (dry_run and end_complete and os.environ.get("HUBSPOT_ACCESS_TOKEN")) or end_ok_to_run:
+        try:
+            ev = _ev.run_hrh_end_vanished(media_job_ids, dry_run=dry_run, now_iso=now_iso,
+                                          source=source_filename)
+            summary.update(ev)
+            print(f"  CSVから消えた公開中→公開終了: 予定 {ev['hrh_ends_planned']} 件"
+                  f" / 上限超えで見送る店舗 {ev['hrh_skipped_shops']}"
+                  + (f" / OK={ev['hrh_ends_ok']} NG={ev['hrh_ends_ng']}" if "hrh_ends_ok" in ev else ""))
+        except Exception as e:  # noqa: BLE001 — 取込本体は成功済み。公開終了だけ見送る
+            summary["end_vanished_error"] = type(e).__name__
+            print(f"WARN: 消えた求人の公開終了は見送り: {type(e).__name__}")
+    elif not end_complete:
+        print("  消えた求人の公開終了: CSVが完全と言えないため見送り")
 
     # ログ出力
     ts = datetime.now().strftime("%Y%m%dT%H%M%S")
