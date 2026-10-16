@@ -50,9 +50,20 @@ COMPANY_PACE_FILE = Path(os.environ.get(
     "JAS_AW_COMPANY_PACE_FILE", str(Path(tempfile.gettempdir()) / "jas_aw_company_pace.txt")))
 
 
-def company_interval() -> float:
-    """次の社の始まりまでの間隔 (秒)。最小〜最大の一様乱数。"""
-    return random.uniform(COMPANY_INTERVAL_MIN_SEC, COMPANY_INTERVAL_MAX_SEC)
+# ★2026-10-16 (ユーザー承認): 求人の巡回・課金の受け取りは 60〜90 秒あける (応募は 30〜50 秒のまま)。
+#   巡回を同時 5 社・30〜50 秒で回した日に、始めてから 25〜55 分で 403 が 2 回出た
+#   (16:15・17:10)。応募の取り込みだけの時間帯には 403 は出ていない。
+CRAWL_INTERVAL_MIN_SEC = float(os.environ.get("JAS_AW_CRAWL_INTERVAL_MIN_SEC", "60"))
+CRAWL_INTERVAL_MAX_SEC = max(CRAWL_INTERVAL_MIN_SEC, float(
+    os.environ.get("JAS_AW_CRAWL_INTERVAL_MAX_SEC", "90")))
+
+
+def company_interval(priority: bool = True) -> float:
+    """次の社の始まりまでの間隔 (秒)。応募は 30〜50 秒、巡回・課金は 60〜90 秒の一様乱数。"""
+    if priority:
+        return random.uniform(COMPANY_INTERVAL_MIN_SEC, COMPANY_INTERVAL_MAX_SEC)
+    return random.uniform(max(COMPANY_INTERVAL_MIN_SEC, CRAWL_INTERVAL_MIN_SEC),
+                          max(COMPANY_INTERVAL_MAX_SEC, CRAWL_INTERVAL_MAX_SEC))
 
 
 # ★2026-10-16: 応募の取り込みを先に通す (ユーザーの優先度「応募は速攻で HubSpot へ。求人はゆっくりでよい」)。
@@ -97,7 +108,7 @@ def wait_company_turn(priority: bool = False) -> float:
     if priority:
         with _priority_mark():
             return wait_turn(min_interval=company_interval(), path=COMPANY_PACE_FILE)
-    return wait_turn(min_interval=company_interval(), path=COMPANY_PACE_FILE,
+    return wait_turn(min_interval=company_interval(priority=False), path=COMPANY_PACE_FILE,
                      yield_to_priority=True)
 
 

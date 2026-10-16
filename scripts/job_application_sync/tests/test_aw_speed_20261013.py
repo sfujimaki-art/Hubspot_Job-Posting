@@ -342,3 +342,14 @@ def test_落ちたプロセスの古い印は無視する(tmp_path, monkeypatch)
     assert aw_pace.priority_waiting(d) is False
     f.write_text("y")
     assert aw_pace.priority_waiting(d) is True
+
+
+def test_巡回と課金は60から90秒_応募は30から50秒(monkeypatch):
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 30.0)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 50.0)
+    monkeypatch.setattr(aw_pace, "CRAWL_INTERVAL_MIN_SEC", 60.0)
+    monkeypatch.setattr(aw_pace, "CRAWL_INTERVAL_MAX_SEC", 90.0)
+    a = [aw_pace.company_interval(priority=True) for _ in range(500)]
+    c = [aw_pace.company_interval(priority=False) for _ in range(500)]
+    assert 30 <= min(a) and max(a) <= 50
+    assert 60 <= min(c) and max(c) <= 90
