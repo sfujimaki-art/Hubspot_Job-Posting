@@ -290,3 +290,18 @@ def test_1行でもエラーがあれば_okにしない(monkeypatch):
     r = S._process_aw_account_raw("A社", ["id"], "pw", Path("."), dry_run=False,
                                   allow_acquire=False, known_absent=set())
     assert r["ok"] is False and r["error_rows"] == 1
+
+
+def test_社の順番を待つ間も_別の社はページを開ける(monkeypatch, tmp_path):
+    # 2026-10-16 14:37: 社の間隔とページの間隔が同じ鍵を共有していたため、
+    # 社の順番待ち (最大50秒) の間に別の社のページが開けず、45秒で時間切れになった。
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 2.0)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 2.0)
+    aw_pace.wait_company_turn()                     # 直前に社が始まった
+    t = threading.Thread(target=aw_pace.wait_company_turn)
+    t.start()                                       # 次の社は 2 秒待つ
+    time.sleep(0.2)
+    t0 = time.time()
+    aw_pace.wait_turn(min_interval=0.0)             # 動いている社のページの移動
+    assert time.time() - t0 < 0.5
+    t.join()

@@ -90,7 +90,17 @@ def is_cloudfront_block(status: int, url: str, headers: dict) -> bool:
     return (status == 403 and host.endswith(_AW_HOST_SUFFIXES)
             and "cloudfront" in server)
 
-_thread_lock = threading.Lock()
+# ★2026-10-16: 鍵はファイルごとに分ける。以前は 1 つの鍵をページの間隔 (1 秒) と
+#   社の間隔 (30〜50 秒) で共有しており、社の順番を待つ間 (最大 50 秒) その鍵を持ったまま
+#   眠るため、同じプロセスで動いている別の社がページを開けず、45 秒で時間切れになった
+#   (14:37 の billing-collect、同時 5 社のうち 4 社が airplf/login の読み込みで時間切れ)。
+_thread_locks: dict = {}
+_thread_locks_guard = threading.Lock()
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    with _thread_locks_guard:
+        return _thread_locks.setdefault(str(path), threading.Lock())
 # 観測用: このプロセスで AirWork 側へ送った / 止めたリクエストの数
 stats = {"sent": 0, "blocked": 0, "navigations": 0, "waited_sec": 0.0,
          "cloudfront_403": 0}
@@ -137,7 +147,7 @@ def wait_turn(min_interval: float = None, path: Path = None) -> float:
     """前のページアクセスから min_interval 秒たつまで待ち、今を記録する。待った秒数を返す。"""
     gap = MIN_INTERVAL_SEC if min_interval is None else min_interval
     p = path or PACE_FILE
-    with _thread_lock, _file_lock(p) as fd:
+    with _thread_lock_for(p), _file_lock(p) as fd:
         os.lseek(fd, 0, os.SEEK_SET)
         raw = os.read(fd, 64).decode("ascii", "ignore").strip("\x00 \r\n")
         try:
