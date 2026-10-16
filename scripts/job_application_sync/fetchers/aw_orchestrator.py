@@ -379,6 +379,16 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
                 except Exception as e:  # noqa: BLE001
                     out["images"] = {"error": type(e).__name__}
                 print(f"  画像 ({plog.mask_name(company)}): {out['images']}", flush=True)
+            # ★2026-10-16 (ユーザー指示「課金も求人と一緒に」): 直近の完了週の有料広告実績が
+            #   まだなら、この社の作成ボタンを押して待ち行列に積む (できあがりは数分〜15分後。
+            #   取りに行くのは 5 分ごとの urgent の回の billing-collect)。週に 1 回だけ押す。
+            if not dry_run and os.environ.get("JAS_AW_BILLING", "1") != "0":
+                try:
+                    out["billing"] = await _billing_create_if_due(
+                        login_id, acc.get("password", ""), company, headless)
+                except Exception as e:  # noqa: BLE001
+                    out["billing"] = f"error:{type(e).__name__}"
+                print(f"  課金 ({plog.mask_name(company)}): {out['billing']}", flush=True)
             return out
         except AWNotReadyError as e:
             # Phase2で生成物未完 → 再キュー
@@ -816,6 +826,51 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+async def _billing_create_if_due(login_id: str, password: str, company: str,
+                                 headless: bool = True) -> str:
+    """直近の完了週の有料広告実績を、まだ取っていなければ作成だけする。結果の種類を返す。
+
+    skip   : 保存済み・データ無しと確定済み・作成済みで待ち行列にある
+    queued : 作成した (待ち行列に積んだ)
+    saved  : 作成済みのファイルが残っていて、その場で保存できた
+    empty  : その週のデータが無い (以後その週は押さない)
+    それ以外は fetch_aw_billing_weeks の status (error / not_ready)。
+    """
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    out_dir = bf.DEFAULT_OUT_DIR
+    week = bf.last_full_week()
+    wk = week.isoformat()
+    with _billing_state_lock():
+        empty = _load_json(BILLING_EMPTY_PATH)
+        queue = _load_json(BILLING_QUEUE_PATH)
+    if (bf.has_saved(out_dir, login_id, week) or wk in empty.get(login_id, [])
+            or (queue.get(login_id) or {}).get("week_start") == wk):
+        return "skip"
+    if _aw_pace.is_blocked():
+        return "not_ready"
+    res = await bf.fetch_aw_billing_weeks(login_id, password, [week], out_dir,
+                                          headless=headless, mode="create")
+    st = next((x for w, x, _ in res if w == week), "error")
+    with _billing_state_lock():
+        empty = _load_json(BILLING_EMPTY_PATH)
+        queue = _load_json(BILLING_QUEUE_PATH)
+        if st == "empty":
+            lst = empty.setdefault(login_id, [])
+            if wk not in lst:
+                lst.append(wk)
+            _save_json(BILLING_EMPTY_PATH, empty)
+        elif st == "queued":
+            queue[login_id] = {"company": company, "week_start": wk,
+                               "triggered_at": datetime.now().isoformat()}
+            _save_json(BILLING_QUEUE_PATH, queue)
+    return st
+
+
+def _billing_state_lock():
+    """課金の待ち行列・データ無しの記録を、巡回と urgent の回で同時に書き換えないための鍵。"""
+    return _aw_pace._file_lock(BILLING_QUEUE_PATH.with_suffix(".lock"))
+
+
 def _billing_status(week_results: list, mode: str) -> str:
     """週ごとの結果から 1 アカウントの status を決める。"""
     st = {s for _, s, _ in week_results}
@@ -908,6 +963,24 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
         slice_n = limit if limit else int(os.environ.get("AW_COLLECT_SLICE", "20"))
         q_slice = _rotate_slice(q_items, slice_n, out_dir, key="billing-collect")
         jobs = []
+        # ★2026-10-16: 作成から 24 時間でファイルは消える。20 時間を過ぎた分は待ち行列から外し、
+        #   次の巡回で作り直す (いつまでも not_ready で残り続けないように)。
+        stale_h = float(os.environ.get("AW_BILLING_QUEUE_MAX_HOURS", "20"))
+        now = datetime.now()
+        for lid, meta in list(queue.items()):
+            try:
+                age = (now - datetime.fromisoformat(meta.get("triggered_at", ""))).total_seconds()
+            except Exception:  # noqa: BLE001
+                age = 0
+            if age > stale_h * 3600:
+                queue.pop(lid, None)
+        if len(queue) != len(q_items):
+            with _billing_state_lock():
+                cur = _load_json(BILLING_QUEUE_PATH)
+                for lid in [k for k, _ in q_items if k not in queue]:
+                    cur.pop(lid, None)
+                _save_json(BILLING_QUEUE_PATH, cur)
+        q_slice = [kv for kv in q_slice if kv[0] in queue]
         for lid, meta in q_slice:
             try:
                 wk = date.fromisoformat(meta.get("week_start", ""))
@@ -952,26 +1025,28 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
     results = await asyncio.gather(*[_wrapped(a, w) for a, w in jobs])
 
     # --- 状態の更新 (キュー / データ無しの週) ---
-    queue = _load_json(BILLING_QUEUE_PATH)
-    for r in results:
-        lid = r["login_id"]
-        for wk, st in (r.get("week_status") or {}).items():
-            if st == "empty":
-                lst = empty.setdefault(lid, [])
-                if wk not in lst:
-                    lst.append(wk)
-        if phase == "billing-create" and r["status"] == "queued":
-            first = next((w for w, s in (r.get("week_status") or {}).items()
-                          if s == "queued"), "")
-            queue[lid] = {"company": r.get("company", ""), "week_start": first,
-                          "triggered_at": datetime.now().isoformat()}
-        elif phase == "billing-collect":
-            if r["status"] == "ok":
-                queue.pop(lid, None)
-        elif phase == "billing-full":
-            queue.pop(lid, None) if r["status"] == "ok" else None
-    _save_json(BILLING_EMPTY_PATH, empty)
-    _save_json(BILLING_QUEUE_PATH, queue)
+    with _billing_state_lock():
+        empty = _load_json(BILLING_EMPTY_PATH)   # 巡回が並行して書いた分を取り込む
+        queue = _load_json(BILLING_QUEUE_PATH)
+        for r in results:
+            lid = r["login_id"]
+            for wk, st in (r.get("week_status") or {}).items():
+                if st == "empty":
+                    lst = empty.setdefault(lid, [])
+                    if wk not in lst:
+                        lst.append(wk)
+            if phase == "billing-create" and r["status"] == "queued":
+                first = next((w for w, s in (r.get("week_status") or {}).items()
+                              if s == "queued"), "")
+                queue[lid] = {"company": r.get("company", ""), "week_start": first,
+                              "triggered_at": datetime.now().isoformat()}
+            elif phase == "billing-collect":
+                if r["status"] == "ok":
+                    queue.pop(lid, None)
+            elif phase == "billing-full":
+                queue.pop(lid, None) if r["status"] == "ok" else None
+        _save_json(BILLING_EMPTY_PATH, empty)
+        _save_json(BILLING_QUEUE_PATH, queue)
 
     summary = _write_account_results(results, out_dir, phase)
     print(f"[orchestrate] 住み分け({phase}): {summary}", flush=True)

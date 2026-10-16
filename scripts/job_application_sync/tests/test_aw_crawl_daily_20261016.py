@@ -136,3 +136,47 @@ def test_応募の回は求人を取りに行かず_無い求人IDを返す(monk
                              allow_acquire=False, known_absent={"J3"})
     assert r["missing_job_ids"] == ["J2"]           # 一覧に無いと確認済みの J3 は積まない
     assert r["_urgent_login_id"] == "bid1" and r["login_id"] != "bid1"   # 表示用は伏せる
+
+
+# ---- 課金: 求人と同じ回で、週に 1 回だけ作成する -----------------------------------------
+def test_課金は週に1回だけ作成し_データ無しは記録して押さない(monkeypatch, tmp_path):
+    import datetime as dt
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    monkeypatch.setattr(bf, "DEFAULT_OUT_DIR", tmp_path / "billing")
+    week = bf.last_full_week()
+    calls = []
+
+    async def fake_fetch(lid, pw, weeks, out_dir, headless=True, mode="full"):
+        calls.append((lid, mode))
+        return [(weeks[0], "queued" if lid == "A" else "empty", None)]
+    monkeypatch.setattr(bf, "fetch_aw_billing_weeks", fake_fetch)
+    assert asyncio.run(orch._billing_create_if_due("A", "p", "A社")) == "queued"
+    assert asyncio.run(orch._billing_create_if_due("A", "p", "A社")) == "skip"     # 待ち行列にある
+    assert asyncio.run(orch._billing_create_if_due("B", "p", "B社")) == "empty"
+    assert asyncio.run(orch._billing_create_if_due("B", "p", "B社")) == "skip"     # データ無し確定
+    assert calls == [("A", "create"), ("B", "create")]
+    q = orch._load_json(orch.BILLING_QUEUE_PATH)
+    assert q["A"]["week_start"] == week.isoformat()
+    assert orch._load_json(orch.BILLING_EMPTY_PATH) == {"B": [week.isoformat()]}
+
+
+def test_課金の待ち行列は20時間を過ぎたら外す(monkeypatch, tmp_path):
+    import datetime as dt
+    old = (dt.datetime.now() - dt.timedelta(hours=21)).isoformat()
+    new = dt.datetime.now().isoformat()
+    orch._save_json(orch.BILLING_QUEUE_PATH, {
+        "old": {"week_start": "2026-10-05", "triggered_at": old},
+        "new": {"week_start": "2026-10-05", "triggered_at": new}})
+    seen = []
+
+    async def fake_one(sem, acc, weeks, out_dir, headless, mode):
+        seen.append(acc["login_id"])
+        return {"login_id": acc["login_id"], "company": "", "status": "not_ready"}
+    monkeypatch.setattr(orch, "process_billing_one", fake_one)
+    monkeypatch.setattr(orch, "find_account_by_login_id",
+                        lambda lid: {"login_id": lid, "password": "p", "company_name": ""})
+    monkeypatch.setattr(orch, "_write_account_results", lambda *a, **k: {})
+    monkeypatch.setattr(orch, "_slack_notify", lambda m: None)
+    asyncio.run(orch.orchestrate_billing("billing-collect", [], out_dir=tmp_path, log_dir=tmp_path))
+    assert seen == ["new"]
+    assert set(orch._load_json(orch.BILLING_QUEUE_PATH)) == {"new"}

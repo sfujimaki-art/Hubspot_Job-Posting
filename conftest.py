@@ -53,3 +53,6 @@ def _no_real_aw_pace(monkeypatch, tmp_path):
     monkeypatch.setattr(aw_urgent_queue, "QUEUE_PATH", tmp_path / "aw_urgent_jobs.json")
     # 巡回の中の画像の取得 (公開ページと HubSpot への通信) はテストでは動かさない
     monkeypatch.setenv("JAS_AW_IMAGES", "0")
+    monkeypatch.setenv("JAS_AW_BILLING", "0")
+    monkeypatch.setattr(orch, "BILLING_QUEUE_PATH", tmp_path / "aw_billing_queue.json")
+    monkeypatch.setattr(orch, "BILLING_EMPTY_PATH", tmp_path / "aw_billing_empty.json")
