@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from datetime import date, datetime
 from pathlib import Path
@@ -202,6 +203,46 @@ def _rotate_slice(accounts: list, limit: int, out_dir: Path, key: str) -> list:
     print(f"[orchestrate] incremental: {n}社中 cursor {cursor}→{new_cursor} "
           f"の{len(sliced)}社を処理", flush=True)
     return sliced
+
+
+LAST_OK_PATH = STATE_DIR / "aw_crawl_last_ok.json"
+
+
+def _load_last_ok(path: Path = None) -> dict:
+    """login_id → 最後に求人を取れた時刻 (epoch 秒)。無ければ空。"""
+    p = path or LAST_OK_PATH
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _record_last_ok(login_id: str, when: float = None, path: Path = None) -> None:
+    """取れた社の時刻を記録する。社ごとに書くので、途中で止まっても続きから回れる。
+
+    巡回と「すぐ取りに行く」処理の両方が書くので、毎回読み直してから1社分だけ足す。
+    """
+    p = path or LAST_OK_PATH
+    try:
+        data = _load_last_ok(p)
+        data[login_id] = float(when if when is not None else time.time())
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _order_stale_first(accounts: list, last_ok: dict) -> list:
+    """最後に取れたのが古い社から並べる (一度も取れていない社が先頭)。同じなら元の順。
+
+    ★2026-10-16 (ユーザー承認 A): 以前は「何社目まで進んだか」の番号で回していた。
+      対象の社の一覧は回ごとに変わる (新しい応募・受注で増減し、順番も詰め直される) ので、
+      番号がずれて同じ社を何度も取っていた (10/14〜15 の6回・のべ60社で、別々の社は31社)。
+      最後に取れた時刻で並べれば、一覧が変わっても取れていない社から順に回る。
+    """
+    return sorted(accounts, key=lambda a: last_ok.get(a.get("login_id", ""), 0.0))
 
 
 def _classify_error(err: str) -> str:
@@ -528,6 +569,7 @@ async def orchestrate(parallel: int = 5,
         return {"ok": ok, "ng": ng, "not_ready": nr, "total": total,
                 "log": str(log_path)}
 
+    accounts = []
     if from_applications:
         # 応募起点(ブートストラップ, 2026-07-23): AW求人がHubSpotに未存在の導入期に、
         # 「応募が来た社」の求人を一括習得するための入口。日常の差分検知は別(温存)。
@@ -551,16 +593,24 @@ async def orchestrate(parallel: int = 5,
         print(f"[orchestrate] --from-applications: 応募{len(items)}件 → "
               f"AW解決アカウント {len(accounts)}社(cutoff={applications_cutoff})",
               flush=True)
-    elif from_active_deals:
+    if from_active_deals:
         # Deal起点: アクティブDeal(納品管理pipeline)のkanri_mail → AWアカウント解決。
         # シート順(古い会社混入)を排除し「現役顧客」のみを巡回対象にする。
+        # ★2026-10-16 (ユーザー承認 B): --from-applications と一緒に指定したら両方を足す
+        #   (受注中の全社 + 受注の一覧に無いが最近応募が来た社)。同じ login_id は1つにする。
         deal_mails = _fetch_active_deal_mails()
-        accounts, unresolved = resolve_accounts_for_mails(
+        deal_accounts, unresolved = resolve_accounts_for_mails(
             deal_mails, active_only=True, prefer="A")
+        have = {a.get("login_id") for a in accounts}
+        for a in deal_accounts:
+            if a.get("login_id") not in have:
+                have.add(a.get("login_id"))
+                accounts.append(a)
         print(
             f"[orchestrate] --from-active-deals: Deal管理メール "
             f"{len(set(m.lower() for m in deal_mails))}ユニーク → "
-            f"AW解決 {len(accounts)} / 未解決 {len(unresolved)}",
+            f"AW解決 {len(deal_accounts)} (応募起点と合わせて {len(accounts)}社) / "
+            f"未解決 {len(unresolved)}",
             flush=True,
         )
         # 未解決(シートID/PW整備で埋まる分)をログ出力
@@ -572,7 +622,7 @@ async def orchestrate(parallel: int = 5,
                 {"unresolved_count": len(unresolved), "mails": unresolved},
                 ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[orchestrate] 未解決メール一覧: {ur_path}", flush=True)
-    else:
+    if not (from_applications or from_active_deals):
         # 顧客管理シートは下=最新。最新顧客から検証するため逆順(下から)で処理する。
         accounts = list(iter_aw_accounts(active_only=True))[::-1]
     if target_login_ids:
@@ -585,9 +635,12 @@ async def orchestrate(parallel: int = 5,
         )
     # incremental: 全社一斉を避け「N社ずつローテーション」で巡回 (2026-07-09)。
     # from_active_deals/from_applications + limit のときカーソルを進めて続きから処理。
-    if limit and (from_active_deals or from_applications) and not target_login_ids:
-        accounts = _rotate_slice(accounts, limit, out_dir, key=phase)
-    elif limit:
+    if (from_active_deals or from_applications) and not target_login_ids:
+        accounts = _order_stale_first(accounts, _load_last_ok())
+        if limit:
+            print(f"[orchestrate] 最後に取れたのが古い順に {min(limit, len(accounts))}/"
+                  f"{len(accounts)}社を処理", flush=True)
+    if limit:
         accounts = accounts[:limit]
     total = len(accounts)
     print(
@@ -606,6 +659,8 @@ async def orchestrate(parallel: int = 5,
     async def _wrapped(acc: dict) -> dict:
         r = await process_one(sem, acc, out_dir, dry_run, headless, phase=phase)
         done_count["n"] += 1
+        if r["status"] == "ok" and phase == "full" and not dry_run:
+            _record_last_ok(r.get("login_id", ""))
         marker = {"ok": "OK ", "queued": "QUEUED ",
                   "error": "NG "}.get(r["status"], r["status"] + " ")
         print(

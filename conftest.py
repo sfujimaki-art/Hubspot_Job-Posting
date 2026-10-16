@@ -44,3 +44,8 @@ def _no_real_aw_pace(monkeypatch, tmp_path):
     monkeypatch.setattr(aw_pace, "COMPANY_PACE_FILE", tmp_path / "company_pace.txt")
     monkeypatch.setattr(aw_pace, "BLOCK_FILE", tmp_path / "blocked_until.txt")
     monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_SEC", 0.0)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 0.0)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 0.0)
+    # 求人を最後に取れた時刻の記録 (巡回の順番) も一時フォルダへ
+    from scripts.job_application_sync.fetchers import aw_orchestrator as orch
+    monkeypatch.setattr(orch, "LAST_OK_PATH", tmp_path / "aw_crawl_last_ok.json")
