@@ -366,6 +366,36 @@ class AccountResolver:
             return cands[0], True
         return None, False
 
+    def explain(self, item: QueueItem) -> str:
+        """resolve が None を返した通知について、突合できなかった理由を人向けに返す。
+
+        ★2026-10-16 ユーザー指示「エラーの報告内容で原因を特定できるようにしてほしい」。
+          以前の通知は「会社名の登録が無い可能性」としか書かず、何を直せばよいか
+          分からなかった。resolve と同じ索引を見て、どこで止まったかを書く。
+        """
+        mails = [m for m in dict.fromkeys([item.login_id] + list(item.login_ids or []))
+                 if _norm(m)]
+        mail_rows = {m: len(self.idx_mail_multi.get(_norm(m)) or []) for m in mails}
+        hit = {m: n for m, n in mail_rows.items() if n}
+        comp = _norm_company(item.company)
+        comp_rows = self.idx_comp_norm.get(comp) or [] if comp else []
+        if not comp and not hit:
+            return "通知の会社名が空か法人格だけで、メールも顧客管理シートにありません"
+        if hit:
+            m, n = next(iter(hit.items()))
+            return (f"メール {m[:24]} はシートの{n}行にありますが、通知の会社名"
+                    f"「{item.company[:20]}」と一致する行が無いため1社に絞れません"
+                    f"（同じメールを複数の社で使っている・社名の表記が違う）")
+        if len(comp_rows) > 1:
+            return (f"会社名が一致する行が{len(comp_rows)}行あり、行ごとにログイン情報が"
+                    f"違うため事業所を決められません。通知のメール "
+                    f"{(mails[0] if mails else '')[:24]} がシートにありません")
+        if len(comp_rows) == 1:
+            return "会社名は1行に一致しましたが、突合の条件を満たしませんでした（要調査）"
+        return (f"会社名「{item.company[:20]}」もメール "
+                f"{(mails[0] if mails else '(なし)')[:24]} も顧客管理シートにありません"
+                f"（新しい顧客か、社名の表記が違う）")
+
     def resolve(self, item: QueueItem) -> Optional[ResolvedAccount]:
         """queue項目 → ResolvedAccount。突合できなければ None (=要報告)."""
         lid = _norm(item.login_id)

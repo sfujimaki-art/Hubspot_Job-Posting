@@ -55,7 +55,25 @@ from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E402
 from scripts.job_application_sync import aw_prefetch  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_pace  # noqa: E402
+from scripts.job_application_sync import alert_text  # noqa: E402
 from scripts.job_application_sync.http_session import http as _http  # noqa: E402
+
+
+def _norm_mail(s: str) -> str:
+    return str(s or "").strip().lower()
+
+
+def _first_report_today(ledger, kind: str, key: str) -> bool:
+    """同じ失敗の Slack 報告を 1 日 1 回にする。今日まだ送っていなければ True。
+
+    ★2026-10-16: 上限 (3回) を超えた社は、5分ごとの回のたびに同じ失敗を送っていた
+      (Slack に「9回試行済」「11回試行済」が並ぶ)。再試行はこれまでどおり続ける。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if ledger.meta(kind, key).get("day") == today:
+        return False
+    ledger.set_meta(kind, key, day=today)
+    return True
 
 MAX_ATTEMPTS = 3
 LOCK_STALE_SEC = 15 * 60
@@ -219,8 +237,18 @@ def slack_notify(message: str, dry_run: bool = False) -> bool:
         plog.public(f"[slack未設定] {len(message)}字 (本文は非公開ログ)")
         plog.detail("slack_unsent", reason="webhook未設定", message=message)
         return False
+    # ★出どころを先頭に付ける (2026-10-16)。専用PCと Actions が同じ Webhook に同じ形式で
+    #   送るので、Slack 上でどちらからの通知か見分けられなかった。
+    tag = alert_text.source_tag()
+    if tag not in message[:30]:
+        message = (message.replace("⚠️ ", f"⚠️ {tag} ", 1) if message.startswith("⚠️ ")
+                   else f"{tag} {message}")
     try:
         r = requests.post(url, json={"text": message}, timeout=15)
+        if r.status_code != 200:
+            # ★以前は 200 以外を黙って False にしていた。届いていないことが誰にも見えない
+            plog.public(f"[slack送信失敗] HTTP {r.status_code} (本文は非公開ログ)")
+            plog.detail("slack_unsent", reason=f"HTTP {r.status_code}", message=message)
         return r.status_code == 200
     except requests.RequestException as e:
         # 例外文は Webhook の URL を含みうるので型名だけ
@@ -884,12 +912,33 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             plog.detail("out_of_scope_media", n=len(out_of_scope),
                         companies=media_names[:50])
         if need_action:
-            samp = ", ".join(f"{u.company[:14]}({u.login_id[:20]})"
-                             for u in need_action[:5])
-            slack_notify(dry_run=dry_run, message=
-                f"⚠️ 応募連携: アカウント特定不可 {len(need_action)}件\n"
-                f"顧客管理シートに会社名の登録が無い可能性があります。\n"
-                f"例: {samp}")
+            # ★社ごとにまとめ、理由を書き、同じ社は1日1回だけ送る (2026-10-16)。
+            #   以前は 5分ごとの回のたびに同じ内容を送り、同じ社を通知の数だけ並べ、
+            #   「会社名の登録が無い可能性」としか書かなかった (何を直せばよいか不明)。
+            by_co: dict = {}
+            for u in need_action:
+                k = (u.media, u.company, _norm_mail(u.login_id))
+                by_co.setdefault(k, []).append(u)
+            today = datetime.now().strftime("%Y-%m-%d")
+            lines = []
+            for (media, comp, _m), us in by_co.items():
+                nk = company_key(f"{media}|{comp}|{_m}")
+                if ledger.meta("unresolved_notified", nk).get("day") == today:
+                    continue
+                ledger.set_meta("unresolved_notified", nk, day=today)
+                try:
+                    why = resolver.explain(us[0])
+                except Exception as e:  # noqa: BLE001 — 理由が取れなくても通知は送る
+                    why = f"理由を判定できませんでした ({type(e).__name__})"
+                lines.append(f"・{comp[:24]} ({'エアワーク' if media == 'AW' else 'HRハッカー' if media == 'HR' else media}"
+                             f"・応募{len(us)}件): {why}")
+            if lines:
+                slack_notify(dry_run=dry_run, message=
+                    f"⚠️ 応募連携: 応募の会社を顧客管理シートで特定できません ({len(lines)}社)\n"
+                    + "\n".join(lines[:15])
+                    + (f"\n…ほか{len(lines) - 15}社" if len(lines) > 15 else "")
+                    + "\n→ 取り込みはされていません。シートを直すと次の回から取り込みます。"
+                      "同じ社のこの通知は1日1回です")
 
         # ---- HR: 1マスターで日付範囲一括 (リクロジアドレスで100%突合) ----
         hr_items = grouped.get("HR::master", [])
@@ -950,10 +999,10 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 for it in hr_items:
                     atts = ledger.bump(it.row_id, res["error"])
                 summary["failed"] += len(hr_items)
-                if atts >= MAX_ATTEMPTS:
+                if atts >= MAX_ATTEMPTS and _first_report_today(ledger, "hr_fail_notified", "master"):
                     summary["reported"] += 1
-                    slack_notify(dry_run=dry_run, message=
-                        f"⚠️ HR応募登録失敗: 理由={res['error']} / {atts}回 / 要確認")
+                    slack_notify(dry_run=dry_run, message=alert_text.hr_failure_message(
+                        res["error"], atts))
                 print(f"  {'❌' if atts >= MAX_ATTEMPTS else '⏳'} HR: "
                       f"{res['error']} ({atts}/{MAX_ATTEMPTS}回)", flush=True)
 
@@ -1099,12 +1148,13 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                     atts = ledger.bump(it.row_id, res["error"])
                 summary["failed"] += len(group)
                 if atts >= MAX_ATTEMPTS:
-                    summary["reported"] += 1
-                    slack_notify(dry_run=dry_run, message=
-                        f"⚠️ 応募登録失敗: {company} / 理由={res['error']} / "
-                        f"{atts}回試行済 / 要手動確認")
+                    sent = _first_report_today(ledger, "aw_fail_notified", ck)
+                    if sent:
+                        summary["reported"] += 1
+                        slack_notify(dry_run=dry_run, message=alert_text.aw_failure_message(
+                            company, res["error"], atts, blocked_403=aw_pace.is_blocked()))
                     print(f"  ❌ {plog.mask_name(company)}: {plog.redact(res['error'])} "
-                          f"({atts}回→Slack報告)", flush=True)
+                          f"({atts}回→{'Slack報告' if sent else 'Slack報告は本日済み'})", flush=True)
                 else:
                     print(f"  ⏳ {plog.mask_name(company)}: {plog.redact(res['error'])} "
                           f"({atts}/{MAX_ATTEMPTS}回, 次サイクル再試行)", flush=True)
