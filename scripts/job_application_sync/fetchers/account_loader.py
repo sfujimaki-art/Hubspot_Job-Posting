@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials as SACredentials

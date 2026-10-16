@@ -152,7 +152,12 @@ jobs:
           LIMC=$([ -n "$LIMIT" ] && echo "--limit $LIMIT" || echo "--limit 15")
           case "$PHASE" in
             hr)
-              python scripts/job_application_sync/hr_watcher.py $FLAG --skip-aw
+              python scripts/job_application_sync/hr_watcher.py $FLAG --skip-aw --slack \
+                --status-file scratchpad/hr_watch_status.json
+              if python -c 'import json,sys; sys.exit(0 if json.load(open("scratchpad/hr_watch_status.json")).get("skip_reason") == "incomplete_csv" else 1)'; then
+                echo "[hr] CSV欠け: 後続の店舗ID補完・持ち主判定も停止 (正常終了)"
+                exit 0
+              fi
               # ★取引側の店舗ID(hrhacker_shop_ids)をその日のCSVで補完する。
               #   ここに置く理由: hr_watcher が scratchpad/csv_fetched/hr へ
               #   落とした**最新CSVが同じジョブ内にある**ため受け渡しが要らない。
