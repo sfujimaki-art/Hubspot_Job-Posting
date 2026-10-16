@@ -497,7 +497,8 @@ async def orchestrate(parallel: int = 5,
                       from_applications: bool = False,
                       applications_cutoff: str = "",
                       phase: str = "full",
-                      from_urgent_queue: bool = False) -> dict:
+                      from_urgent_queue: bool = False,
+                      skip_ok_since: float = 0.0) -> dict:
     """AW アカウントを並列処理。
 
     Args:
@@ -678,7 +679,16 @@ async def orchestrate(parallel: int = 5,
     # incremental: 全社一斉を避け「N社ずつローテーション」で巡回 (2026-07-09)。
     # from_active_deals/from_applications + limit のときカーソルを進めて続きから処理。
     if (from_active_deals or from_applications) and not target_login_ids:
-        accounts = _order_stale_first(accounts, _load_last_ok())
+        last_ok = _load_last_ok()
+        accounts = _order_stale_first(accounts, last_ok)
+        if skip_ok_since:
+            # ★2026-10-16 (ユーザー指示「一回ゆっくりでもいいからやりきって」): 同じ夜の
+            #   2 回目以降は、この夜すでに取れた社を飛ばし、取れなかった社だけ回る。
+            before = len(accounts)
+            accounts = [a for a in accounts
+                        if last_ok.get(a.get("login_id", ""), 0.0) < skip_ok_since]
+            print(f"[orchestrate] この回で取れた社 {before - len(accounts)}社を除き、"
+                  f"残り {len(accounts)}社を処理", flush=True)
         if limit:
             print(f"[orchestrate] 最後に取れたのが古い順に {min(limit, len(accounts))}/"
                   f"{len(accounts)}社を処理", flush=True)
@@ -952,8 +962,13 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
     sem = asyncio.Semaphore(parallel)
     empty = _load_json(BILLING_EMPTY_PATH)   # {login_id: [週の月曜 ISO,...]} データ無し確定の週
 
+    queued_now = _load_json(BILLING_QUEUE_PATH)
+
     def pending_weeks(lid: str) -> list:
         skip = set(empty.get(lid, []))
+        # 作成済みで受け取り待ちの週は、もう一度作成しない (2026-10-16)
+        if (queued_now.get(lid) or {}).get("week_start"):
+            skip.add(queued_now[lid]["week_start"])
         return [w for w in weeks if w.isoformat() not in skip
                 and not bf.has_saved(out_dir, lid, w)]
 
@@ -1125,6 +1140,8 @@ def parse_args(argv=None):
                         "シート1のAW応募→AWアカウント解決を対象にする")
     p.add_argument("--from-urgent-queue", action="store_true",
                    help="応募の求人が HubSpot に無かった社だけを取る (aw_urgent_queue)")
+    p.add_argument("--skip-ok-since", type=float, default=0.0,
+                   help="この時刻 (epoch 秒) 以降に求人を取れた社は飛ばす (同じ夜のやり直し用)")
     p.add_argument("--applications-cutoff", default="",
                    help="--from-applications の応募日カットオフ(ISO YYYY-MM-DD, 空=全件)")
     p.add_argument("--phase",
@@ -1176,6 +1193,7 @@ def main(argv=None):
         applications_cutoff=args.applications_cutoff,
         phase=args.phase,
         from_urgent_queue=args.from_urgent_queue,
+        skip_ok_since=args.skip_ok_since,
     ))
 
 

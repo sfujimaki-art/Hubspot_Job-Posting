@@ -180,3 +180,34 @@ def test_課金の待ち行列は20時間を過ぎたら外す(monkeypatch, tmp_
     asyncio.run(orch.orchestrate_billing("billing-collect", [], out_dir=tmp_path, log_dir=tmp_path))
     assert seen == ["new"]
     assert set(orch._load_json(orch.BILLING_QUEUE_PATH)) == {"new"}
+
+
+def test_同じ夜のやり直しは取れた社を飛ばす(monkeypatch, tmp_path):
+    seen = _stub_targets(monkeypatch, ["d1", "d2", "d3"], [])
+    orch._record_last_ok("d1", 500.0)   # この夜 (400 以降) に取れた
+    orch._record_last_ok("d2", 100.0)   # 前の夜
+    asyncio.run(orch.orchestrate(parallel=1, dry_run=False, out_dir=tmp_path, log_dir=tmp_path,
+                                 from_active_deals=True, skip_ok_since=400.0))
+    assert sorted(seen) == ["d2", "d3"]
+
+
+def test_課金の作成のやり直しは受け取り待ちの週を作り直さない(monkeypatch, tmp_path):
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    week = bf.last_full_week()
+    orch._save_json(orch.BILLING_QUEUE_PATH, {"q": {"week_start": week.isoformat(),
+                                                    "triggered_at": "2099-01-01T00:00:00"}})
+    monkeypatch.setattr(orch, "_select_billing_accounts", lambda fad, t: [
+        {"login_id": x, "password": "p", "company_name": x} for x in ("q", "n")])
+    monkeypatch.setattr(bf, "has_saved", lambda d, lid, w: False)
+    seen = []
+
+    async def fake_one(sem, acc, weeks, out_dir, headless, mode):
+        seen.append((acc["login_id"], [w.isoformat() for w in weeks]))
+        return {"login_id": acc["login_id"], "company": "", "status": "queued",
+                "week_status": {w.isoformat(): "queued" for w in weeks}}
+    monkeypatch.setattr(orch, "process_billing_one", fake_one)
+    monkeypatch.setattr(orch, "_write_account_results", lambda *a, **k: {})
+    monkeypatch.setattr(orch, "_slack_notify", lambda m: None)
+    asyncio.run(orch.orchestrate_billing("billing-create", [week], out_dir=tmp_path, log_dir=tmp_path,
+                                         from_active_deals=True))
+    assert seen == [("n", [week.isoformat()])]
