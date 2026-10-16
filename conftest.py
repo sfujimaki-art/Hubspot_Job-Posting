@@ -43,6 +43,7 @@ def _no_real_aw_pace(monkeypatch, tmp_path):
     monkeypatch.setattr(aw_pace, "PACE_FILE", tmp_path / "pace.txt")
     monkeypatch.setattr(aw_pace, "COMPANY_PACE_FILE", tmp_path / "company_pace.txt")
     monkeypatch.setattr(aw_pace, "BLOCK_FILE", tmp_path / "blocked_until.txt")
+    monkeypatch.setattr(aw_pace, "PRIORITY_DIR", tmp_path / "priority")
     monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_SEC", 0.0)
     monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 0.0)
     monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 0.0)

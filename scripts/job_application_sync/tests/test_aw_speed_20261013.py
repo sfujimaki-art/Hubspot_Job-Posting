@@ -305,3 +305,40 @@ def test_社の順番を待つ間も_別の社はページを開ける(monkeypat
     aw_pace.wait_turn(min_interval=0.0)             # 動いている社のページの移動
     assert time.time() - t0 < 0.5
     t.join()
+
+
+def test_応募の社は巡回の社より先に順番を取る(monkeypatch):
+    # 2026-10-16 15:10: 巡回の社が順番待ちに並んでいて、応募の社が 141 秒待った。
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 1.5)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 1.5)
+    aw_pace.wait_company_turn()                          # 直前に社が始まった
+    order = []
+
+    def crawl(name):
+        aw_pace.wait_company_turn()
+        order.append(name)
+    ts = [threading.Thread(target=crawl, args=(f"巡回{i}",)) for i in range(3)]
+    for t in ts:
+        t.start()
+    time.sleep(0.3)                                      # 巡回の 3 社が先に並ぶ
+    t0 = time.time()
+    aw_pace.wait_company_turn(priority=True)
+    order.append("応募")
+    waited = time.time() - t0
+    for t in ts:
+        t.join()
+    assert order[0] == "応募" and waited < 2.0          # 1 間隔以内で先に通る
+    assert len(order) == 4
+
+
+def test_落ちたプロセスの古い印は無視する(tmp_path, monkeypatch):
+    d = tmp_path / "prio"
+    d.mkdir()
+    f = d / "123_1"
+    f.write_text("x")
+    old = time.time() - 600
+    import os
+    os.utime(f, (old, old))
+    assert aw_pace.priority_waiting(d) is False
+    f.write_text("y")
+    assert aw_pace.priority_waiting(d) is True

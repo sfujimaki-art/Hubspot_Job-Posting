@@ -55,9 +55,50 @@ def company_interval() -> float:
     return random.uniform(COMPANY_INTERVAL_MIN_SEC, COMPANY_INTERVAL_MAX_SEC)
 
 
-def wait_company_turn() -> float:
-    """前の社が AirWork へのアクセスを始めてから 30〜50 秒 (乱数) たつまで待つ。PC 全体で共通。"""
-    return wait_turn(min_interval=company_interval(), path=COMPANY_PACE_FILE)
+# ★2026-10-16: 応募の取り込みを先に通す (ユーザーの優先度「応募は速攻で HubSpot へ。求人はゆっくりでよい」)。
+#   求人の巡回が同時に 5 社まで順番待ちをするようにした結果、応募の社が巡回の社の後ろに並び、
+#   15:10 の回で 141 秒待った。応募の社が待っている間は、巡回・課金の社は順番を譲る
+#   (待っている印のファイルを見て、自分の順番の待ちをやめて並び直す)。
+PRIORITY_DIR = Path(os.environ.get(
+    "JAS_AW_PRIORITY_DIR", str(Path(tempfile.gettempdir()) / "jas_aw_priority")))
+PRIORITY_STALE_SEC = 300
+
+
+def priority_waiting(directory: Path = None) -> bool:
+    """応募の社が順番を待っているか (5 分より古い印は落ちたプロセスの残りとして無視)。"""
+    d = Path(directory or PRIORITY_DIR)
+    try:
+        now = time.time()
+        return any(now - f.stat().st_mtime < PRIORITY_STALE_SEC for f in d.iterdir())
+    except OSError:
+        return False
+
+
+@contextmanager
+def _priority_mark():
+    d = Path(PRIORITY_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{os.getpid()}_{threading.get_ident()}"
+    f.write_text(str(time.time()), encoding="ascii")
+    try:
+        yield
+    finally:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def wait_company_turn(priority: bool = False) -> float:
+    """前の社が AirWork へのアクセスを始めてから 30〜50 秒 (乱数) たつまで待つ。PC 全体で共通。
+
+    priority=True (応募の取り込み) は、待っている間 巡回・課金の社に順番を譲らせる。
+    """
+    if priority:
+        with _priority_mark():
+            return wait_turn(min_interval=company_interval(), path=COMPANY_PACE_FILE)
+    return wait_turn(min_interval=company_interval(), path=COMPANY_PACE_FILE,
+                     yield_to_priority=True)
 
 
 def blocked_until(path: Path = None) -> float:
@@ -143,24 +184,40 @@ def _file_lock(path: Path):
         os.close(fd)
 
 
-def wait_turn(min_interval: float = None, path: Path = None) -> float:
-    """前のページアクセスから min_interval 秒たつまで待ち、今を記録する。待った秒数を返す。"""
+def wait_turn(min_interval: float = None, path: Path = None,
+              yield_to_priority: bool = False) -> float:
+    """前のアクセスから min_interval 秒たつまで待ち、今を記録する。待った秒数を返す。
+
+    yield_to_priority=True のときは、応募の社が待ち始めたら自分の待ちをやめて
+    (時刻を記録せずに鍵を放し) 並び直す。
+    """
     gap = MIN_INTERVAL_SEC if min_interval is None else min_interval
     p = path or PACE_FILE
-    with _thread_lock_for(p), _file_lock(p) as fd:
-        os.lseek(fd, 0, os.SEEK_SET)
-        raw = os.read(fd, 64).decode("ascii", "ignore").strip("\x00 \r\n")
-        try:
-            last = float(raw)
-        except ValueError:
-            last = 0.0
-        waited = max(0.0, last + gap - time.time())
-        if waited:
-            time.sleep(waited)
-        stamp = f"{time.time():.6f}".encode("ascii").ljust(32)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, stamp)
-        return waited
+    t0 = time.time()
+    while True:
+        yielded = False
+        with _thread_lock_for(p), _file_lock(p) as fd:
+            if not (yield_to_priority and priority_waiting()):
+                os.lseek(fd, 0, os.SEEK_SET)
+                raw = os.read(fd, 64).decode("ascii", "ignore").strip("\x00 \r\n")
+                try:
+                    last = float(raw)
+                except ValueError:
+                    last = 0.0
+                deadline = last + gap
+                while time.time() < deadline:
+                    if yield_to_priority and priority_waiting():
+                        yielded = True
+                        break
+                    time.sleep(min(0.5, max(0.0, deadline - time.time())))
+                if not yielded:
+                    stamp = f"{time.time():.6f}".encode("ascii").ljust(32)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, stamp)
+                    return time.time() - t0
+            else:
+                yielded = True
+        time.sleep(1.0)   # 鍵を放して、応募の社に先に取らせる
 
 
 # 読み込まない種類 (2026-10-13)。10社同時にアクセスした回で、AirWork の CloudFront が
