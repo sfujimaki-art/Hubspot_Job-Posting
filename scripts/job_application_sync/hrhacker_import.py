@@ -52,9 +52,11 @@ from dotenv import load_dotenv
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
     from . import listing_stage as _stage
     from . import private_log as plog
+    from .hr_offers_csv import HR_CSV_ENCODING, copy_fingerprint
 except ImportError:  # pragma: no cover
     import listing_stage as _stage  # type: ignore
     import private_log as plog  # type: ignore
+    from hr_offers_csv import HR_CSV_ENCODING, copy_fingerprint
 
 # ============================================================================
 # 環境設定
@@ -225,9 +227,6 @@ def location_props(row: dict, existing_props: Optional[dict],
     return p
 
 
-# CSVエンコーディング: Shift-JIS (BOMなし) — Phase 0b 28382 実測で確定
-HR_CSV_ENCODING = "shift_jis"
-
 # 内部キー → HubSpotプロパティ内部名 (Phase 0 実測準拠)
 HUBSPOT_PROPERTY_MAP: dict[str, str] = {
     "media_job_id": "id_hrhakkaa",
@@ -279,23 +278,32 @@ def map_hr_status(original: str) -> Optional[str]:
 
 
 # ============================================================================
-# CSV読込 (Shift-JIS 既定、Phase 0b 実測準拠)
+# CSV読込 (Windows拡張 Shift-JIS / cp932)
 # ============================================================================
 def load_hr_csv(path: str | Path, encoding: str = HR_CSV_ENCODING) -> list[dict]:
     """HRハッカーCSVを読込み, 内部キー辞書のリストを返す.
 
-    encoding: 既定 "shift_jis"  (Phase 0b 実測, ID 28382, 84列)。
+    encoding: 既定 cp932。読めない bytes のみ置換して最後まで読む。
     """
     rows: list[dict] = []
-    with open(path, encoding=encoding, newline="") as f:
+    with (open(path, encoding=encoding, errors="replace", newline="") as f,
+          open(path, encoding="shift_jis", errors="replace", newline="") as legacy_file):
         reader = csv.DictReader(f)
+        legacy_reader = csv.DictReader(legacy_file)
         header = list(reader.fieldnames or [])
-        for raw in reader:
+        legacy_header = list(legacy_reader.fieldnames or [])
+        for raw, legacy in zip(reader, legacy_reader):
             row: dict = {}
             for csv_col, key in HR_CSV_COLUMNS.items():
                 row[key] = (raw.get(csv_col) or "").strip()
             row["copy_body"] = compose_copy_body(raw, header)
             row["copy_images"] = compose_copy_images(raw, header)
+            # 元bytesから旧指紋を作る。cp932には同じ文字の別bytes表現があり、
+            # 新しい文字列を再エンコードするだけでは旧結果を再現できない。
+            row["_legacy_copy_hash"] = copy_fingerprint(
+                compose_copy_body(legacy, legacy_header),
+                compose_copy_images(legacy, legacy_header))
+            row["_legacy_job_name"] = (legacy.get("案件名") or "").strip()
             rows.append(row)
     return rows
 
