@@ -66,6 +66,7 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
 
 # A-2 を関数呼出で再利用
 from scripts.job_application_sync import airwork_import as awi  # noqa: E402
+from scripts.job_application_sync import aw_listing_images as _images  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_pace as _aw_pace  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_urgent_queue as _urgent  # noqa: E402
 
@@ -362,11 +363,23 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
                                      strict_client_code=False, **xkw),
             )
             t1 = datetime.now()
-            return {
+            out = {
                 "login_id": login_id, "company": company, "status": "ok",
                 "xlsx_path": str(xlsx_path), "result": result,
                 "duration_sec": (t1 - t0).total_seconds(),
             }
+            # ★2026-10-16 (ユーザー指示「画像は求人と一緒に」): 取り込んだ直後に、この社の
+            #   公開中の求人の画像の URL を公開ページから読み、変わったものだけ書く。
+            #   AirWork の管理画面には入らない (ログイン不要の公開ページ)。失敗しても求人は成功のまま。
+            if not dry_run and os.environ.get("JAS_AW_IMAGES", "1") != "0":
+                try:
+                    out["images"] = await asyncio.to_thread(
+                        _images.update_company_images, login_id,
+                        os.environ.get("HUBSPOT_ACCESS_TOKEN", ""), recruit_url)
+                except Exception as e:  # noqa: BLE001
+                    out["images"] = {"error": type(e).__name__}
+                print(f"  画像 ({plog.mask_name(company)}): {out['images']}", flush=True)
+            return out
         except AWNotReadyError as e:
             # Phase2で生成物未完 → 再キュー
             return {"login_id": login_id, "company": company,
@@ -823,6 +836,12 @@ async def process_billing_one(sem: asyncio.Semaphore, acc: dict, weeks: list,
         login_id = acc.get("login_id", "")
         company = acc.get("company_name", "")
         pw = acc.get("password", "")
+        # ★2026-10-16: 求人・応募の取得と同じく、403 で止めている間は触らず、
+        #   社の始まりは PC 全体で 30〜50 秒ずらす (以前は課金だけ間隔を守っていなかった)。
+        if _aw_pace.is_blocked():
+            return {"login_id": login_id, "company": company, "status": "not_ready",
+                    "error": "AirWork が403を返したため、アクセスを止めています"}
+        await asyncio.to_thread(_aw_pace.wait_company_turn)
         t0 = datetime.now()
         try:
             res = await bf.fetch_aw_billing_weeks(

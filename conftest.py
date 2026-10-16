@@ -51,3 +51,5 @@ def _no_real_aw_pace(monkeypatch, tmp_path):
     monkeypatch.setattr(orch, "LAST_OK_PATH", tmp_path / "aw_crawl_last_ok.json")
     from scripts.job_application_sync.fetchers import aw_urgent_queue
     monkeypatch.setattr(aw_urgent_queue, "QUEUE_PATH", tmp_path / "aw_urgent_jobs.json")
+    # 巡回の中の画像の取得 (公開ページと HubSpot への通信) はテストでは動かさない
+    monkeypatch.setenv("JAS_AW_IMAGES", "0")
