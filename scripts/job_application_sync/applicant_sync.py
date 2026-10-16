@@ -550,8 +550,14 @@ def _process_aw_account_raw(
                 if known_missing:
                     print(f"  自己修復: {plog.mask_name(company)} 求人の一覧に無いと確認済みの"
                           f"求人ID {len(known_missing)}件は取り直さない", flush=True)
-                if missing and (allow_acquire() if callable(allow_acquire)
-                                else True):
+                acquire_now = bool(missing) and (allow_acquire() if callable(allow_acquire)
+                                                 else True)
+                if missing and not acquire_now:
+                    # ★2026-10-16: この回で取りに行かない (枠が 0) ときは、無い求人IDを
+                    #   呼び出し側へ返し「すぐ取りに行く」待ち行列に積ませる。以前はここで
+                    #   何も返さず、19:05 の回の求人の無い応募が積まれなかった。
+                    result["missing_job_ids"] = list(missing)
+                if acquire_now:
                     print(f"  自己修復: {plog.mask_name(company)} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
                     plog.detail("aw_selfheal_acquire", company=company,

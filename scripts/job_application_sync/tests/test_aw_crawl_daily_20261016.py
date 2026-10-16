@@ -211,3 +211,33 @@ def test_課金の作成のやり直しは受け取り待ちの週を作り直�
     asyncio.run(orch.orchestrate_billing("billing-create", [week], out_dir=tmp_path, log_dir=tmp_path,
                                          from_active_deals=True))
     assert seen == [("n", [week.isoformat()])]
+
+
+def test_枠が0の関数を渡されても_無い求人IDを返す(monkeypatch):
+    # 本番の呼び出しは allow_acquire に関数 (_claim_acquire) を渡す。枠 0 で False を返す。
+    from pathlib import Path
+    from types import SimpleNamespace
+    from scripts.job_application_sync import applicant_import as ai
+    from scripts.job_application_sync import applicant_sync as S
+
+    async def fake_fetch(bid, pw, out_dir):
+        return Path("x.csv")
+    monkeypatch.setattr(S, "_fetch_aw_csv", fake_fetch)
+    monkeypatch.setattr(ai, "load_applicants_csv", lambda p: [
+        SimpleNamespace(media_job_id=j, media="AirWork") for j in ("J1", "J2")])
+    monkeypatch.setattr(ai, "append_apply_time_log", lambda p: 0)
+
+    class _Cli:
+        stats: dict = {}
+        def prefetch_listings(self, j): return True
+        def prefetch_appointments(self, m, j): return True
+        def missing_listings(self, j): return ["J2"]
+        def add_listings(self, *a): pass
+    monkeypatch.setattr(S, "_new_aw_client", lambda token: _Cli())
+    monkeypatch.setattr(S, "_ensure_aw_jobs", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("枠 0 なのに求人を取りに行った")))
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="": [
+        ai.ProcessResult(status="unlinked", applicant_key="k", media="AirWork", media_job_id="J2")])
+    r = S.process_aw_account("A社", ["bid1"], "pw", Path("."), dry_run=False,
+                             allow_acquire=lambda: False, known_absent=set())
+    assert r["missing_job_ids"] == ["J2"] and r["_urgent_login_id"] == "bid1"
