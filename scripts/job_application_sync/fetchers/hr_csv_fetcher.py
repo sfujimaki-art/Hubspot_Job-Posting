@@ -157,11 +157,18 @@ async def fetch_hr_csv(
             # 2. onboarding 除去
             await _dismiss_onboarding(page)
 
+            # Capture existing exports, including unfinished ones, before requesting
+            # a new export. Otherwise the first old completed row can win the poll.
+            await page.goto(EXPORT_LIST_URL, wait_until="domcontentloaded")
+            previous_exports = await _read_export_rows(page)
+
             # 3. CSV出力指示
             kick_iso = await _kick_csv_export(page, is_valid=is_valid)
 
             # 4. 完了ポーリング → DL URL 特定
-            dl_url = await _poll_export_list(page, kick_iso=kick_iso, timeout_min=timeout_min)
+            dl_url = await _poll_export_list(
+                page, kick_iso=kick_iso, timeout_min=timeout_min,
+                previous_exports=previous_exports)
 
             # 5. DL 保存
             out_path = await _download_csv(page, dl_url, output_dir, is_valid)
@@ -471,10 +478,40 @@ async def _kick_csv_export(page, is_valid: str) -> str:
 # ----------------------------------------------------------------------------
 # Step 4: 完了ポーリング
 # ----------------------------------------------------------------------------
-async def _poll_export_list(page, kick_iso: str, timeout_min: int) -> str:
+async def _read_export_rows(page) -> list[dict]:
+    return await page.evaluate(
+        """() => {
+            return Array.from(document.querySelectorAll('table tbody tr')).map(tr => {
+                const cells = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+                const dlA = tr.querySelector('a[href*="download-csv"]');
+                return {
+                    kishin: cells[0] || '',
+                    shuryou: cells[2] || '',
+                    info: cells[3] || '',
+                    dl: dlA ? dlA.href : null,
+                };
+            });
+        }"""
+    )
+
+
+def is_new_completed_export(row: dict, previous_exports: list[dict]) -> bool:
+    """Only accept a newly appearing export, never an old or previously pending one.
+
+    The history's first cell is its creation timestamp. Ambiguous/missing identity
+    fails closed rather than downloading a potentially unrelated CSV.
+    """
+    return bool(row.get("kishin") and row.get("dl") and row.get("shuryou")
+                and row["kishin"] not in {r.get("kishin") for r in previous_exports}
+                and row["dl"] not in {r.get("dl") for r in previous_exports})
+
+
+async def _poll_export_list(page, kick_iso: str, timeout_min: int,
+                            previous_exports: list[dict]) -> str:
     """CSV履歴ページを 15秒ごとにリロードし、完了行の DL URL を取得.
 
     完了行の定義:
+        - 出力指示前の履歴に無い作成日時・DLリンクである
         - cells[2] (処理終了日時) が空でない
         - a[href*=download-csv] が存在
 
@@ -514,24 +551,11 @@ async def _poll_export_list(page, kick_iso: str, timeout_min: int) -> str:
         except Exception:
             pass
         await _dismiss_onboarding(page)
-        rows = await page.evaluate(
-            """() => {
-                return Array.from(document.querySelectorAll('table tbody tr')).map(tr => {
-                    const cells = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
-                    const dlA = tr.querySelector('a[href*="download-csv"]');
-                    return {
-                        kishin: cells[0] || '',
-                        shuryou: cells[2] || '',
-                        info: cells[3] || '',
-                        dl: dlA ? dlA.href : null,
-                    };
-                });
-            }"""
-        )
+        rows = await _read_export_rows(page)
         for r in rows:
-            if r.get("dl") and r.get("shuryou"):
+            if is_new_completed_export(r, previous_exports):
                 elapsed = int(time.time() - start) + kick_wait
-                print(f"[hr_csv] CSV生成完了を検出 (待ち{elapsed}s)", flush=True)
+                print(f"[hr_csv] 今回のCSV生成完了を検出 (待ち{elapsed}s)", flush=True)
                 return r["dl"]
         waited = int(time.time() - start) + kick_wait
         print(f"[hr_csv] 生成中... 経過{waited}s / 上限{timeout_min * 60}s",
@@ -560,7 +584,11 @@ async def _download_csv(page, dl_url: str, output_dir: Path, is_valid: str) -> P
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     label = is_valid or "all"
     out_path = output_dir / f"hr_offers_{label}_{ts}.csv"
-    await dl.save_as(str(out_path))
+    await dl.save_as(str(out_path))  # Playwright waits for the download to finish.
+    if await dl.failure():
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError("HRH CSV download failed")
+    print(f"[hr_csv] ダウンロード完了: bytes={out_path.stat().st_size}", flush=True)
     return out_path
 
 

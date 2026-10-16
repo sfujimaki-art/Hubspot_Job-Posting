@@ -213,6 +213,7 @@ def csv_rows_to_snapshot(rows: list[dict], source_csv: str) -> dict:
         "fetched_at": datetime.now().isoformat(),
         "source_csv": source_csv,
         "jobs": jobs,
+        "row_count": len(rows),
     }
 
 
@@ -346,6 +347,8 @@ def run(csv_path: Optional[str] = None,
         deal_finder=None,           # shop_ids → deals list (find_deals_by_shop_ids 互換)
         account_finder=None,        # login_id → account dict or None
         aw_orchestrate_fn=None,     # (target_login_ids, dry_run, ...) → result dict
+        slack: bool = False,
+        slack_notify_fn=None,
         branches_fetcher=None,      # 引数なし → 店舗一覧CSVパス (実取得時は既定で fetch_hr_branches)
         ) -> dict:
     """hr_watcher メイン.
@@ -405,6 +408,20 @@ def run(csv_path: Optional[str] = None,
     # ---- W-2: 前回スナップショット vs 今回 ----
     prev = load_latest_snapshot(snapshot_dir)
     curr = csv_rows_to_snapshot(rows, source_csv=os.path.basename(str(csv_path)))
+    from scripts.job_application_sync import hr_csv_guard
+    assessment = hr_csv_guard.assess(snapshot_dir, curr)
+    summary["completeness"] = assessment
+    if assessment["incomplete"]:
+        summary.update(skipped_aw=True, skip_reason="incomplete_csv",
+                       snapshot_kept_previous=True)
+        print("[hr_watcher] CSV欠け検知 → 差分判定・HubSpot更新・後続処理を停止 (正常終了)")
+        if slack and not dry_run:
+            if slack_notify_fn is None:
+                from scripts.job_application_sync.check_sheet_url_drift import slack_notify
+                slack_notify_fn = slack_notify
+            summary["slack_sent"] = hr_csv_guard.notify_once(snapshot_dir, assessment, slack_notify_fn)
+        summary["log_path"] = str(_write_log(summary, "incomplete_csv"))
+        return summary
     diff = detect_diff(prev.get("jobs", {}), curr.get("jobs", {}))
     summary["diff"] = {k: len(v) for k, v in diff.items()}
     summary["prev_snapshot_jobs"] = len(prev.get("jobs", {}))
@@ -641,6 +658,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help=f"AW顧客上限 (既定 {DEFAULT_MAX_CUSTOMERS})")
     p.add_argument("--snapshot-dir", default=None,
                    help=f"スナップショット保存先 (既定 {DEFAULT_SNAPSHOT_DIR})")
+    p.add_argument("--slack", action="store_true", help="CSV欠けをSlack通知 (actualのみ)")
+    p.add_argument("--status-file", type=Path, help="後続処理用の件数のみの結果JSON")
     return p.parse_args(argv)
 
 
@@ -655,7 +674,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_customers=args.max_customers,
         snapshot_dir=snapshot_dir,
         input_mapping_json=args.input_mapping_json,
+        slack=args.slack,
     )
+    if args.status_file:
+        args.status_file.parent.mkdir(parents=True, exist_ok=True)
+        args.status_file.write_text(json.dumps(public_summary(result)), encoding="utf-8")
     print(f"\n[hr_watcher-done] {json.dumps(public_summary(result), ensure_ascii=False, indent=2)[:600]}")
     plog.detail("hr_watcher_done", **{k: v for k, v in result.items()
                                       if k != "hrhacker_summary"})
