@@ -248,11 +248,22 @@ def test_止めている間はAirWorkにアクセスせず_社を失敗にする
 
 
 def test_社と社の間は設定した秒数あく(monkeypatch, tmp_path):
-    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_SEC", 0.5)
+    # 本番の PC の間隔ファイルを触らないよう、一時ファイルを使う
+    monkeypatch.setattr(aw_pace, "COMPANY_PACE_FILE", tmp_path / "company_pace.txt")
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 0.5)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 0.5)
     t0 = time.time()
     aw_pace.wait_company_turn()
     aw_pace.wait_company_turn()
     assert time.time() - t0 >= 0.49
+
+
+def test_社の始まりは30秒から50秒の乱数でずれる(monkeypatch):
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MIN_SEC", 30.0)
+    monkeypatch.setattr(aw_pace, "COMPANY_INTERVAL_MAX_SEC", 50.0)
+    xs = [aw_pace.company_interval() for _ in range(2000)]
+    assert min(xs) >= 30.0 and max(xs) <= 50.0
+    assert min(xs) < 32 and max(xs) > 48   # 固定値ではなく範囲全体に散る
 
 
 # ---- 部分的なエラーは DONE にしない ------------------------------------------------

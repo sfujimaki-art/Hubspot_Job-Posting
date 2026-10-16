@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import tempfile
 import threading
 import time
@@ -34,14 +35,29 @@ _AW_HOST_SUFFIXES = ("airwork.net", "airregi.jp")
 #   1社ずつでも間を空けずに続けた回 (約4分20秒・AirWork/AirRegi 宛て最大4,467件) で 403、
 #   5社を約2分 (同 1,405件) では 403 なし、1社に数分かけていた回では一度も 403 なし。
 #   既定 30 秒 = 5分で最大10社。
-COMPANY_INTERVAL_SEC = float(os.environ.get("JAS_AW_COMPANY_INTERVAL_SEC", "30"))
+# ★2026-10-16 ユーザー指示「同時に1社は拡大してよい。ただし、ほぼ同時が正しい。
+#   30秒〜50秒くらいランダムにずらして作業し続ける」。社の始まりを 30〜50 秒の乱数で
+#   ずらし、前の社が終わるのは待たない (同時に動く社の数は呼び出し側の上限で決める)。
+#   AirWork へのリクエストの量は始まりの間隔で決まる (1社あたり約265件 ÷ 平均40秒 ≒ 7件/秒。
+#   403 になった回は約17件/秒、403 にならなかった5社/2分の回は約12件/秒)。
+#   JAS_AW_COMPANY_INTERVAL_SEC を指定したときは従来どおり固定の間隔。
+_FIXED = os.environ.get("JAS_AW_COMPANY_INTERVAL_SEC", "")
+COMPANY_INTERVAL_MIN_SEC = float(_FIXED or os.environ.get("JAS_AW_COMPANY_INTERVAL_MIN_SEC", "30"))
+COMPANY_INTERVAL_MAX_SEC = max(COMPANY_INTERVAL_MIN_SEC, float(
+    _FIXED or os.environ.get("JAS_AW_COMPANY_INTERVAL_MAX_SEC", "50")))
+COMPANY_INTERVAL_SEC = COMPANY_INTERVAL_MIN_SEC   # 互換 (表示用)
 COMPANY_PACE_FILE = Path(os.environ.get(
     "JAS_AW_COMPANY_PACE_FILE", str(Path(tempfile.gettempdir()) / "jas_aw_company_pace.txt")))
 
 
+def company_interval() -> float:
+    """次の社の始まりまでの間隔 (秒)。最小〜最大の一様乱数。"""
+    return random.uniform(COMPANY_INTERVAL_MIN_SEC, COMPANY_INTERVAL_MAX_SEC)
+
+
 def wait_company_turn() -> float:
-    """前の社が AirWork へのアクセスを始めてから COMPANY_INTERVAL_SEC 秒たつまで待つ。"""
-    return wait_turn(min_interval=COMPANY_INTERVAL_SEC, path=COMPANY_PACE_FILE)
+    """前の社が AirWork へのアクセスを始めてから 30〜50 秒 (乱数) たつまで待つ。PC 全体で共通。"""
+    return wait_turn(min_interval=company_interval(), path=COMPANY_PACE_FILE)
 
 
 def blocked_until(path: Path = None) -> float:

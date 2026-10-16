@@ -88,7 +88,10 @@ AW_PARALLEL = max(1, int(os.environ.get("JAS_AW_PARALLEL", "10")))
 #   「403 Request blocked」を返し、この PC からのアクセスが約45分ブロックされた
 #   (18:41〜19:27 に解除を確認)。1社ずつの回では一度も起きていない。
 #   ログイン・CSV取得・求人取得 (自己修復) は 1 社ずつ、HubSpot 側だけ並列にする。
-AW_BROWSER_PARALLEL = max(1, int(os.environ.get("JAS_AW_BROWSER_PARALLEL", "1")))
+# ★2026-10-16 既定を 5 に (ユーザー指示「同時に1社は拡大してよい。30〜50秒ランダムにずらす」)。
+#   社の始まりは aw_pace.wait_company_turn で PC 全体 30〜50 秒ずつずれるので、
+#   10社同時に始めた 10/13 18:41 の回 (403) のような一斉アクセスにはならない。
+AW_BROWSER_PARALLEL = max(1, int(os.environ.get("JAS_AW_BROWSER_PARALLEL", "5")))
 _AW_BROWSER = threading.Semaphore(AW_BROWSER_PARALLEL)
 # 応募日時の記録ファイルへの追記は 1 スレッドずつ (読み→追記の間に割り込ませない)
 _APPLY_LOG_LOCK = threading.Lock()
