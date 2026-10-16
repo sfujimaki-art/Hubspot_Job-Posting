@@ -56,6 +56,7 @@ from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E40
 from scripts.job_application_sync import aw_prefetch  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_pace  # noqa: E402
 from scripts.job_application_sync import alert_text  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_urgent_queue  # noqa: E402
 from scripts.job_application_sync.http_session import http as _http  # noqa: E402
 
 
@@ -454,6 +455,9 @@ def process_aw_account(
                                   known_absent=known_absent)
     res["error"] = scrub_secrets(res.get("error", ""), list(b_ids or []),
                                  passwords=[b_pw])
+    if res.get("missing_job_ids"):
+        # 待ち行列に積むときだけ使う (画面・ログには出さない)。伏せる前の値を別に残す
+        res["_urgent_login_id"] = res.get("login_id", "")
     res["login_id"] = mask_secret(res.get("login_id", "")) if res.get("login_id") else ""
     return res
 
@@ -577,6 +581,17 @@ def _process_aw_account_raw(
             except Exception as e:  # noqa: BLE001
                 print(f"  自己修復失敗(応募は続行・対象外->後続relinkで救出): "
                       f"{type(e).__name__}: {scrub_secrets(str(e), [bid], passwords=[b_pw])[:80]}", flush=True)
+        else:
+            # ★2026-10-16: この回では求人を取りに行かず、HubSpot に無い求人IDを呼び出し側へ返す。
+            #   呼び出し側が「すぐ取りに行く」待ち行列 (fetchers/aw_urgent_queue.py) に積み、
+            #   別のタスクがその社の求人だけを取って紐付け直す (ユーザー指示「未連携なら速攻で」)。
+            try:
+                missing = cli.missing_listings(job_ids)
+                if missing is None:
+                    missing = _missing_aw_listings(job_ids, token)
+                result["missing_job_ids"] = [j for j in missing if j not in known]
+            except Exception as e:  # noqa: BLE001 — 数えられなくても応募の取り込みは続ける
+                print(f"  求人の有無を数えられませんでした: {type(e).__name__}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
         cli.prefetch_appointments(
             (getattr(rows[0], "media", "") or "AirWork") if rows else "AirWork", job_ids)
@@ -1139,6 +1154,16 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                       f" / 求人取得 {res.get('selfheal_sec', 0):.0f}秒"
                       f" / 順番待ち {res.get('aw_wait_sec', 0):.0f}秒)"
                       f" HubSpot={res.get('hubspot', {})}", flush=True)
+                miss = res.get("missing_job_ids") or []
+                if miss and not dry_run:
+                    try:
+                        queued = aw_urgent_queue.add(res.get("_urgent_login_id") or "", company, miss)
+                    except Exception as e:  # noqa: BLE001
+                        queued = []
+                        print(f"  ⚠️ すぐ取りに行く待ち行列に積めません: {type(e).__name__}", flush=True)
+                    if queued:
+                        print(f"  → {plog.mask_name(company)}: HubSpot に無い求人 {len(queued)}件。"
+                              f"求人をすぐ取りに行く待ち行列に積みました", flush=True)
                 plog.detail("aw_account_ok", company=company, applicants=len(group),
                             linked=res.get("linked"), unlinked=res.get("unlinked"),
                             no_listing_old=res.get("no_listing_old", 0),

@@ -63,3 +63,76 @@ def test_上限つきでも取れていない社が先(monkeypatch, tmp_path):
     asyncio.run(orch.orchestrate(parallel=1, limit=2, dry_run=False, out_dir=tmp_path,
                                  log_dir=tmp_path, from_active_deals=True))
     assert seen == ["d2", "d3"]
+
+
+# ---- すぐ取りに行く待ち行列 -------------------------------------------------------
+from scripts.job_application_sync.fetchers import aw_urgent_queue as U  # noqa: E402
+
+
+def test_待ち行列は社ごとにまとめ_取りに行った求人は24時間積み直さない():
+    assert U.add("L1", "A社", ["J1", "J2"]) == ["J1", "J2"]
+    assert U.add("L1", "A社", ["J2", "J3"]) == ["J2", "J3"]
+    assert U.pending()["L1"]["job_ids"] == ["J1", "J2", "J3"]
+    U.finish("L1", ok=True)
+    assert U.pending() == {}
+    assert U.add("L1", "A社", ["J1", "J4"]) == ["J4"]      # J1 は取りに行ったばかり
+
+
+def test_失敗は3回まで待ち行列に残す():
+    U.add("L2", "B社", ["J9"])
+    U.finish("L2", ok=False)
+    U.finish("L2", ok=False)
+    assert "L2" in U.pending()
+    U.finish("L2", ok=False)
+    assert "L2" not in U.pending()
+
+
+def test_待ち行列の社だけを取り_取れたら外す(monkeypatch, tmp_path):
+    U.add("q1", "Q社", ["J1"])
+    U.add("gone", "消えた社", ["J2"])
+    monkeypatch.setattr(orch, "iter_aw_accounts",
+                        lambda active_only=False, prefer="A": iter(
+                            [{"login_id": "q1", "password": "p", "company_name": "Q社"},
+                             {"login_id": "other", "password": "p", "company_name": "他社"}]))
+    seen = []
+
+    async def fake_one(sem, acc, out_dir, dry_run, headless, phase="full"):
+        seen.append(acc["login_id"])
+        return {"login_id": acc["login_id"], "company": "", "status": "ok"}
+    monkeypatch.setattr(orch, "process_one", fake_one)
+    monkeypatch.setattr(orch, "_write_account_results", lambda *a, **k: {})
+    monkeypatch.setattr(orch, "_slack_notify", lambda m: None)
+    asyncio.run(orch.orchestrate(parallel=1, dry_run=False, out_dir=tmp_path, log_dir=tmp_path,
+                                 from_urgent_queue=True))
+    assert seen == ["q1"]
+    assert U.pending()["gone"]["attempts"] == 1    # シートに無い社は失敗として数える
+    assert "q1" not in U.pending()
+
+
+def test_応募の回は求人を取りに行かず_無い求人IDを返す(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from scripts.job_application_sync import applicant_import as ai
+    from scripts.job_application_sync import applicant_sync as S
+
+    async def fake_fetch(bid, pw, out_dir):
+        return Path("x.csv")
+    monkeypatch.setattr(S, "_fetch_aw_csv", fake_fetch)
+    monkeypatch.setattr(ai, "load_applicants_csv", lambda p: [
+        SimpleNamespace(media_job_id=j, media="AirWork") for j in ("J1", "J2", "J3")])
+    monkeypatch.setattr(ai, "append_apply_time_log", lambda p: 0)
+
+    class _Cli:
+        stats: dict = {}
+        def prefetch_listings(self, j): return True
+        def prefetch_appointments(self, m, j): return True
+        def missing_listings(self, j): return ["J2", "J3"]
+    monkeypatch.setattr(S, "_new_aw_client", lambda token: _Cli())
+    monkeypatch.setattr(S, "_ensure_aw_jobs", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("応募の回で求人を取りに行ってはいけない")))
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="": [
+        ai.ProcessResult(status="unlinked", applicant_key="k", media="AirWork", media_job_id="J2")])
+    r = S.process_aw_account("A社", ["bid1"], "pw", Path("."), dry_run=False,
+                             allow_acquire=False, known_absent={"J3"})
+    assert r["missing_job_ids"] == ["J2"]           # 一覧に無いと確認済みの J3 は積まない
+    assert r["_urgent_login_id"] == "bid1" and r["login_id"] != "bid1"   # 表示用は伏せる

@@ -67,6 +67,7 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
 # A-2 を関数呼出で再利用
 from scripts.job_application_sync import airwork_import as awi  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_pace as _aw_pace  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_urgent_queue as _urgent  # noqa: E402
 
 
 
@@ -472,7 +473,8 @@ async def orchestrate(parallel: int = 5,
                       from_active_deals: bool = False,
                       from_applications: bool = False,
                       applications_cutoff: str = "",
-                      phase: str = "full") -> dict:
+                      phase: str = "full",
+                      from_urgent_queue: bool = False) -> dict:
     """AW アカウントを並列処理。
 
     Args:
@@ -570,6 +572,23 @@ async def orchestrate(parallel: int = 5,
                 "log": str(log_path)}
 
     accounts = []
+    if from_urgent_queue:
+        # ★2026-10-16: 応募の求人が HubSpot に無かった社だけを取る (fetchers/aw_urgent_queue.py)。
+        pend = _urgent.pending()
+        if not pend:
+            print("[orchestrate] すぐ取りに行く待ち行列は空です", flush=True)
+            return {"ok": 0, "ng": 0, "total": 0, "log": None}
+        index: dict = {}
+        for prefer in ("A", "B"):
+            for a in iter_aw_accounts(active_only=False, prefer=prefer):
+                index.setdefault(a.get("login_id"), a)
+        for lid in pend:
+            if lid in index:
+                accounts.append(index[lid])
+            else:   # シートから消えた社は取りに行けない
+                _urgent.finish(lid, ok=False)
+        print(f"[orchestrate] すぐ取りに行く待ち行列: {len(pend)}社 → "
+              f"今回 {min(len(accounts), limit or len(accounts))}社", flush=True)
     if from_applications:
         # 応募起点(ブートストラップ, 2026-07-23): AW求人がHubSpotに未存在の導入期に、
         # 「応募が来た社」の求人を一括習得するための入口。日常の差分検知は別(温存)。
@@ -622,7 +641,7 @@ async def orchestrate(parallel: int = 5,
                 {"unresolved_count": len(unresolved), "mails": unresolved},
                 ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[orchestrate] 未解決メール一覧: {ur_path}", flush=True)
-    if not (from_applications or from_active_deals):
+    if not (from_applications or from_active_deals or from_urgent_queue):
         # 顧客管理シートは下=最新。最新顧客から検証するため逆順(下から)で処理する。
         accounts = list(iter_aw_accounts(active_only=True))[::-1]
     if target_login_ids:
@@ -661,6 +680,8 @@ async def orchestrate(parallel: int = 5,
         done_count["n"] += 1
         if r["status"] == "ok" and phase == "full" and not dry_run:
             _record_last_ok(r.get("login_id", ""))
+        if from_urgent_queue and not dry_run:
+            _urgent.finish(r.get("login_id", ""), ok=r["status"] == "ok")
         marker = {"ok": "OK ", "queued": "QUEUED ",
                   "error": "NG "}.get(r["status"], r["status"] + " ")
         print(
@@ -1008,6 +1029,8 @@ def parse_args(argv=None):
     p.add_argument("--from-applications", action="store_true",
                    help="応募起点(導入期ブートストラップ): 応募が来た社の求人を一括習得。"
                         "シート1のAW応募→AWアカウント解決を対象にする")
+    p.add_argument("--from-urgent-queue", action="store_true",
+                   help="応募の求人が HubSpot に無かった社だけを取る (aw_urgent_queue)")
     p.add_argument("--applications-cutoff", default="",
                    help="--from-applications の応募日カットオフ(ISO YYYY-MM-DD, 空=全件)")
     p.add_argument("--phase",
@@ -1058,6 +1081,7 @@ def main(argv=None):
         from_applications=args.from_applications,
         applications_cutoff=args.applications_cutoff,
         phase=args.phase,
+        from_urgent_queue=args.from_urgent_queue,
     ))
 
 

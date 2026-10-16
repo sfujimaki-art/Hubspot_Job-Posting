@@ -49,3 +49,5 @@ def _no_real_aw_pace(monkeypatch, tmp_path):
     # 求人を最後に取れた時刻の記録 (巡回の順番) も一時フォルダへ
     from scripts.job_application_sync.fetchers import aw_orchestrator as orch
     monkeypatch.setattr(orch, "LAST_OK_PATH", tmp_path / "aw_crawl_last_ok.json")
+    from scripts.job_application_sync.fetchers import aw_urgent_queue
+    monkeypatch.setattr(aw_urgent_queue, "QUEUE_PATH", tmp_path / "aw_urgent_jobs.json")
