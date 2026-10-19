@@ -353,3 +353,38 @@ def test_巡回と課金は60から90秒_応募は30から50秒(monkeypatch):
     c = [aw_pace.company_interval(priority=False) for _ in range(500)]
     assert 30 <= min(a) and max(a) <= 50
     assert 60 <= min(c) and max(c) <= 90
+
+
+def test_閉じたページへの要求の後始末で例外を出さない():
+    """2026-10-19: ログイン失敗で早く閉じると「Future exception was never retrieved」が並んだ。"""
+    import asyncio
+    from scripts.job_application_sync.fetchers import aw_pace
+
+    class Closed(Exception):
+        pass
+
+    class Route:
+        async def continue_(self):
+            raise Closed("Target page, context or browser has been closed")
+
+        async def abort(self):
+            raise Closed("Target page, context or browser has been closed")
+
+    class Req:
+        url, resource_type = "https://ats.rct.airwork.net/x.png", "image"
+
+        def is_navigation_request(self):
+            return False
+
+    class Ctx:
+        def on(self, *a):
+            pass
+
+        async def route(self, pat, handler):
+            self.h = handler
+
+    ctx = Ctx()
+    asyncio.run(aw_pace.install(ctx))
+    asyncio.run(ctx.h(Route(), Req()))                 # abort (画像は止める)
+    Req.resource_type = "document"
+    asyncio.run(ctx.h(Route(), Req()))                 # continue_

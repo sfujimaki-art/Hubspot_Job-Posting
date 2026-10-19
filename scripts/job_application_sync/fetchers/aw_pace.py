@@ -261,14 +261,22 @@ async def install(ctx) -> None:
             pass
     ctx.on("response", _on_response)
 
+    async def _done(call):
+        # ★ページを閉じた後に届いた要求の abort/continue は TargetClosedError になる。
+        #   ログに「Future exception was never retrieved」が並ぶだけなので捨てる (2026-10-19)。
+        try:
+            await call()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _handler(route, request):
         if is_blocked():          # 403 を受けた後は何も送らない
             _count("blocked")
-            await route.abort()
+            await _done(route.abort)
             return
         if request.resource_type in BLOCK_RESOURCE_TYPES:
             _count("blocked")
-            await route.abort()
+            await _done(route.abort)
             return
         try:
             if _is_main_frame_navigation(request):
@@ -283,5 +291,5 @@ async def install(ctx) -> None:
                 k = "?"
             with _stats_lock:
                 by_kind[k] = by_kind.get(k, 0) + 1
-            await route.continue_()
+            await _done(route.continue_)
     await ctx.route("**/*", _handler)
