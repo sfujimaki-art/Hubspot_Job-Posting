@@ -236,6 +236,17 @@ def _record_last_ok(login_id: str, when: float = None, path: Path = None) -> Non
         pass
 
 
+# ★ID/PW 誤り・規約の再同意で止まった社の時刻 (2026-10-19)。同じ夜の 2・3 回目は
+#   回し直さない。人が直すまで結果は変わらず、誤った PW のログインを一晩に何度も
+#   繰り返すだけになるため (毎晩 36 社)。次の夜はまた 1 回試す。
+LOGIN_STOP_PATH = STATE_DIR / "aw_crawl_login_stop.json"
+
+
+def _is_login_stop(error: str) -> bool:
+    e = str(error or "")
+    return "login_failed=true" in e or "usage_re_agreement" in e
+
+
 def _order_stale_first(accounts: list, last_ok: dict) -> list:
     """最後に取れたのが古い社から並べる (一度も取れていない社が先頭)。同じなら元の順。
 
@@ -704,7 +715,13 @@ async def orchestrate(parallel: int = 5,
             before = len(accounts)
             accounts = [a for a in accounts
                         if last_ok.get(a.get("login_id", ""), 0.0) < skip_ok_since]
-            print(f"[orchestrate] この回で取れた社 {before - len(accounts)}社を除き、"
+            stopped = _load_last_ok(LOGIN_STOP_PATH)
+            n_ok = before - len(accounts)
+            before = len(accounts)
+            accounts = [a for a in accounts
+                        if stopped.get(a.get("login_id", ""), 0.0) < skip_ok_since]
+            print(f"[orchestrate] この回で取れた社 {n_ok}社と、ID/PW誤り・規約の再同意で"
+                  f"止まった社 {before - len(accounts)}社を除き、"
                   f"残り {len(accounts)}社を処理", flush=True)
         if limit:
             print(f"[orchestrate] 最後に取れたのが古い順に {min(limit, len(accounts))}/"
@@ -730,6 +747,9 @@ async def orchestrate(parallel: int = 5,
         done_count["n"] += 1
         if r["status"] == "ok" and phase == "full" and not dry_run:
             _record_last_ok(r.get("login_id", ""))
+        elif (r["status"] == "error" and phase == "full" and not dry_run
+              and _is_login_stop(r.get("error", ""))):
+            _record_last_ok(r.get("login_id", ""), path=LOGIN_STOP_PATH)
         if from_urgent_queue and not dry_run:
             _urgent.finish(r.get("login_id", ""), ok=r["status"] == "ok")
         marker = {"ok": "OK ", "queued": "QUEUED ",

@@ -241,3 +241,31 @@ def test_枠が0の関数を渡されても_無い求人IDを返す(monkeypatch)
     r = S.process_aw_account("A社", ["bid1"], "pw", Path("."), dry_run=False,
                              allow_acquire=lambda: False, known_absent=set())
     assert r["missing_job_ids"] == ["J2"] and r["_urgent_login_id"] == "bid1"
+
+
+def test_ID_PW誤りと規約の再同意の社は同じ夜にやり直さない(monkeypatch, tmp_path):
+    """2026-10-19: 人が直すまで結果は変わらないのに、誤った PW のログインを一晩に3回していた。"""
+    seen = _stub_targets(monkeypatch, ["pw", "tos", "net", "good"], [])
+    errs = {"pw": "ログイン後 dashboards に遷移せず: ID か PW が違います "
+                  "(login_id=pw, last_url=https://connect.airregi.jp/login?login_failed=true)",
+            "tos": "ログイン後 dashboards に遷移せず: 利用規約の再同意が必要です "
+                   "(login_id=tos, last_url=https://ats.rct.airwork.net/usage_re_agreement)",
+            "net": "Page.goto: Timeout 30000ms exceeded."}
+
+    async def fake_one(sem, acc, out_dir, dry_run, headless, phase="full"):
+        seen.append(acc["login_id"])
+        lid = acc["login_id"]
+        return ({"login_id": lid, "company": "", "status": "error", "error": errs[lid]}
+                if lid in errs else {"login_id": lid, "company": "", "status": "ok"})
+    monkeypatch.setattr(orch, "process_one", fake_one)
+    monkeypatch.setattr(orch.time, "time", lambda: 500.0)
+    kw = dict(parallel=1, dry_run=False, out_dir=tmp_path, log_dir=tmp_path,
+              from_active_deals=True, skip_ok_since=400.0)
+    asyncio.run(orch.orchestrate(**kw))
+    assert sorted(seen) == ["good", "net", "pw", "tos"]
+    seen.clear()
+    asyncio.run(orch.orchestrate(**kw))
+    assert seen == ["net"]          # 一時的な失敗だけ回し直す
+    seen.clear()
+    asyncio.run(orch.orchestrate(**dict(kw, skip_ok_since=600.0)))   # 次の夜
+    assert sorted(seen) == ["good", "net", "pw", "tos"]
