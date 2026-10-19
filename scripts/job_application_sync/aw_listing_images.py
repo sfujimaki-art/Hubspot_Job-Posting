@@ -286,8 +286,12 @@ def update_company_images(login_id, token, recruit_url="", hubspot=None, session
         try:
             url = job_url(site, media)
             value = field_value(clean_urls(parse_gallery(get_page(session, url), url)))
-        except CaptureError:
+        except CaptureError as e:
+            # ★理由ごとにも数える (2026-10-19)。10/18 の夜は 1,411 件中 187 件が読めず、
+            #   公開を終えた求人か、画面の作りが変わったのかを見分けられなかった。
             stats["page_failed"] += 1
+            why = stats.setdefault("page_failed_reasons", {})
+            why[str(e)] = why.get(str(e), 0) + 1
             continue
         if same_value(props.get(PROPERTY), value):
             stats["same"] += 1

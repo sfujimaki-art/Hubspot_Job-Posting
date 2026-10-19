@@ -73,6 +73,7 @@ def test_変わった求人だけ書き_同じ値と読めないページは書�
                                                "https://cdn.arwrk.net/images/rct/a2.jpg"}},
         {"id": "3", "properties": {I.PROPERTY: I.NO_IMAGES}}]
     assert st == {"targets": 4, "written": 2, "same": 1, "no_site": 0, "page_failed": 1,
+                  "page_failed_reasons": {"public_page_unavailable": 1},
                   "write_failed": 0}
 
 
@@ -102,3 +103,18 @@ def test_cdn以外の画像は拒否する():
         assert False
     except I.CaptureError as e:
         assert e.code == "image_url_denied"
+
+
+def test_巡回の最後に画像の件数と読めなかった理由を合計する():
+    from scripts.job_application_sync.fetchers import aw_orchestrator as orch
+    tot = orch._images_total([
+        {"images": {"targets": 3, "written": 1, "same": 1, "page_failed": 1,
+                    "page_failed_reasons": {"public_page_unavailable": 1}}},
+        {"images": {"targets": 2, "written": 0, "same": 0, "page_failed": 2,
+                    "page_failed_reasons": {"public_page_unavailable": 1,
+                                            "gallery_layout_unrecognized": 1}}},
+        {"images": {"error": "RuntimeError"}},
+        {"status": "error"}])
+    assert tot == {"targets": 5, "written": 1, "same": 1, "page_failed": 3,
+                   "page_failed_reasons": {"public_page_unavailable": 2,
+                                           "gallery_layout_unrecognized": 1}}

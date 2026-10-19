@@ -415,6 +415,23 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
 # ============================================================================
 # orchestrator 本体
 # ============================================================================
+def _images_total(results: list[dict]) -> dict:
+    """社ごとの画像の件数を合計する (読めなかった理由ごとの件数も)。画像の処理が無ければ空。"""
+    tot: dict = {}
+    for r in results:
+        st = r.get("images")
+        if not isinstance(st, dict) or "error" in st:
+            continue
+        for k, v in st.items():
+            if isinstance(v, dict):
+                sub = tot.setdefault(k, {})
+                for kk, vv in v.items():
+                    sub[kk] = sub.get(kk, 0) + int(vv)
+            elif isinstance(v, int):
+                tot[k] = tot.get(k, 0) + v
+    return tot
+
+
 def _sanitize(r: dict) -> dict:
     """ログ書出前のフィールド除去 (PW 等の機微情報を念のため落とす)。
 
@@ -801,6 +818,9 @@ async def orchestrate(parallel: int = 5,
                     status=r.get("status"), error=r.get("error", ""),
                     result=r.get("result"))
 
+    img = _images_total(sanitized)
+    if img:
+        print(f"[orchestrate] 画像の合計: {img}", flush=True)
     print(
         f"[orchestrate-done] ok={ok} ng={ng} total={total} log={log_path}",
         flush=True,
