@@ -271,3 +271,71 @@ def test_collection_json_shape_and_source():
     data = json.loads(wanted["airwork_weekly_perf"])
     assert data["schema_version"] == 1 and data["source"] == "airwork" and data["job_id"] == "100"
     assert data["rows"][0]["cost_yen"] == 10
+
+
+# ---- 有料広告が無かった週に 0 を書く (2026-10-19) ------------------------------------------
+class OpenHub(FakeHub):
+    def __init__(self, records, open_records):
+        super().__init__(records)
+        self.open_records, self.open_logins = open_records, []
+
+    def open_listings(self, logins):
+        self.open_logins.append(list(logins))
+        return [r for r in self.open_records
+                if r["properties"]["airwork_account_login_id"] in logins]
+
+
+def orec(rid, ref, login, created="2025-01-01T00:00:00Z", perf=None):
+    r = rec(rid, ref, login, perf)
+    r["properties"].update({"kyuujin_status": "公開中", "hs_createdate": created})
+    return r
+
+
+def test_zero_fill_marks_open_listings_without_paid_ads(tmp_path):
+    # 口座 A: 5/05 の週は ZIP あり (求人 100 だけ有料)。口座 B: 5/05 の週は「実績なし」
+    make_zip(tmp_path, "2025-05-05", LOGIN_A, ["2025/05/05 - 2025/05/11,c,t,100,1000,0,10,2,6000.0,0"])
+    paid = rec("1", "100", LOGIN_A)
+    open_ = [orec("1", "100", LOGIN_A), orec("2", "101", LOGIN_A), orec("3", "200", LOGIN_B),
+             orec("4", "201", LOGIN_B, created="2025-06-01T00:00:00Z")]   # 週のあとに作った求人
+    hub = OpenHub([paid], open_)
+    out = imp.run(hub, tmp_path, apply=True, zero_fill=True,
+                  empty_weeks={LOGIN_B: {"2025-05-05"}})
+    by_id = {w["id"]: w["properties"] for w in hub.written}
+    assert set(by_id) == {"1", "2", "3"}            # 4 は作る前の週なので書かない
+    assert by_id["1"]["airwork_cost_last_week"] == 6000   # 実績は 0 で上書きしない
+    for rid in ("2", "3"):
+        assert by_id[rid]["airwork_cost_last_week"] == 0
+        assert by_id[rid]["airwork_applications_last4w"] == 0
+        assert by_id[rid]["airwork_last_week_start"] == "2025-05-05"
+        perf = json.loads(by_id[rid]["airwork_weekly_perf"])
+        assert perf["rows"][0]["no_paid_ads"] is True and perf["rows"][0]["cost_yen"] == 0
+    assert out["zero_filled_to_write"] == 2
+    # 書いた値を読み戻して再実行 → 変化なし (毎回書かない)
+    for r in hub.open_records + hub.records:
+        if r["id"] in by_id:
+            r["properties"].update({k: str(v) for k, v in by_id[r["id"]].items()})
+    hub.written.clear()
+    again = imp.run(hub, tmp_path, apply=True, zero_fill=True,
+                    empty_weeks={LOGIN_B: {"2025-05-05"}})
+    assert hub.written == [] and again["to_write"] == 0
+
+
+def test_zero_fill_does_not_overwrite_an_existing_paid_week(tmp_path):
+    """ZIP が消えていても、前に書いた実績の週を 0 にしない。"""
+    existing = json.dumps({"schema_version": 1, "source": "airwork", "job_id": "300",
+                           "captured_at": "x", "rows": [row("2025-05-05", 900)]})
+    hub = OpenHub([], [orec("5", "300", LOGIN_B, perf=existing)])
+    imp.run(hub, tmp_path, apply=True, zero_fill=True, empty_weeks={LOGIN_B: {"2025-05-05"}})
+    # (要約が空だったので要約だけ書く。週の値は 900 のまま)
+    assert [w["properties"]["airwork_cost_last_week"] for w in hub.written] == [900]
+    assert json.loads(hub.written[0]["properties"]["airwork_weekly_perf"])["rows"][0]["cost_yen"] == 900
+
+
+def test_zero_fill_is_off_by_default_and_empty_file_loader(tmp_path):
+    hub = OpenHub([], [orec("3", "200", LOGIN_B)])
+    imp.run(hub, tmp_path, apply=True, empty_weeks={LOGIN_B: {"2025-05-05"}})
+    assert hub.written == [] and hub.open_logins == []
+    p = tmp_path / "empty.json"
+    p.write_text(json.dumps({LOGIN_B: ["2025-05-05", "bad"]}), encoding="utf-8")
+    assert imp.load_empty_weeks(p) == {LOGIN_B: {"2025-05-05"}}
+    assert imp.load_empty_weeks(tmp_path / "none.json") == {}
