@@ -76,6 +76,29 @@ def _first_report_today(ledger, kind: str, key: str) -> bool:
     ledger.set_meta(kind, key, day=today)
     return True
 
+def _report_sheet1_health(ledger, cutoff_iso: str, dry_run: bool) -> None:
+    """シート1の読み取りの異常 (見出しが無い・応募が0件・媒体を判別できない) を
+    ログに出し、Slack に 1 日 1 回知らせる (2026-10-19)。
+
+    ★10/17 19:10〜10/19 8:45、見出しの行が通知メールで上書きされ、エラーにならずに
+      「0件」で終わり続けた。約37時間だれも気づけなかった。
+    """
+    d = aq.LAST_S1_DIAG
+    if not d:
+        return
+    print(f"[applicant_sync] シート1: 列={d.get('column_source')} "
+          f"見出しで引けない列={d.get('missing_by_name') or 'なし'} "
+          f"1行目がメール={d.get('header_is_mail')} 期間内の応募行={d.get('recent_app_rows')} "
+          f"(AW={d.get('recent_aw')} HR={d.get('recent_hr')})", flush=True)
+    for kind, msg in alert_text.sheet1_health_messages(d, cutoff_iso):
+        print(f"  ⚠️ シート1の異常: {kind}", flush=True)
+        if _first_report_today(ledger, "s1_health", kind):
+            slack_notify(dry_run=dry_run, message=msg)
+            if not dry_run:
+                # 列を決められずに例外で終わる回は最後の保存まで行かないので、ここで残す
+                ledger.save()
+
+
 MAX_ATTEMPTS = 3
 LOCK_STALE_SEC = 15 * 60
 # 1run あたりに処理する AW アカウント数の上限。
@@ -843,8 +866,11 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                   f"(cutoff={hr_cutoff_iso}, dry_run={dry_run})", flush=True)
             # media_filter を素通し(BOTH=HR+AW を読む)。AWは後段 aw_groups で処理。
             # (旧: BOTHをHRへ潰してAW保留していたが、突合復活に伴い解除 2026-07-22)
-            items = aq.read_new_items_from_sheet1(
-                cutoff_iso=hr_cutoff_iso, media_filter=media_filter)
+            try:
+                items = aq.read_new_items_from_sheet1(
+                    cutoff_iso=hr_cutoff_iso, media_filter=media_filter)
+            finally:
+                _report_sheet1_health(ledger, hr_cutoff_iso, dry_run)
         else:
             print(f"[applicant_sync] queue検知... (dry_run={dry_run})", flush=True)
             items = aq.read_new_items()

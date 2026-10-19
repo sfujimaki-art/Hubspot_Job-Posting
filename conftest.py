@@ -59,3 +59,6 @@ def _no_real_aw_pace(monkeypatch, tmp_path):
     monkeypatch.setenv("JAS_AW_BILLING", "0")
     monkeypatch.setattr(orch, "BILLING_QUEUE_PATH", tmp_path / "aw_billing_queue.json")
     monkeypatch.setattr(orch, "BILLING_EMPTY_PATH", tmp_path / "aw_billing_empty.json")
+    # シート1の列の位置の記録 (見出しが壊れたときに使う) も一時フォルダへ
+    from scripts.job_application_sync import applicant_queue as aq
+    monkeypatch.setattr(aq, "S1_COLUMNS_STATE", tmp_path / "sheet1_columns.json")

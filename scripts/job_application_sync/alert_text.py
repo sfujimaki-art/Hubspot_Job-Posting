@@ -81,3 +81,42 @@ def aw_failure_message(company: str, error: str, attempts: int,
             f"・対処: {action}\n"
             f"・{attempts}回試行済 (以後は時間を置いて自動で再試行。この社の通知は1日1回)\n"
             f"・理由の全文: {error}")
+
+
+_S1_COL_LABEL = {"media": "媒体", "from": "顧客", "company": "応募管理シート"}
+
+
+def sheet1_health_messages(diag: dict, cutoff_iso: str = "") -> list[tuple[str, str]]:
+    """シート1の読み取りの異常 → [(種類, Slack の本文)]。異常が無ければ空 (2026-10-19)。
+
+    なぜ: 10/17 19:10〜10/19 8:45、シート1の1行目 (見出し) が通知メールで上書きされ、
+      媒体の列を取り違えて応募を1件も読めなかった。エラーにならず「0件」で終わったので、
+      約37時間だれも気づけなかった。
+    """
+    out: list[tuple[str, str]] = []
+    src = diag.get("column_source", "")
+    since = f"{cutoff_iso} 以降" if cutoff_iso else "直近"
+    if diag.get("missing_by_name"):
+        names = "・".join(_S1_COL_LABEL.get(k, k) for k in diag["missing_by_name"])
+        how = {"saved": "前回まで読めていた列の位置で読んでいます",
+               "content": "列の中身から位置を決めて読んでいます",
+               }.get(src, "列の位置を決められず、読めていません")
+        mail = ("1行目に通知メールが入っています (書き込み側が見出しの行に書いた可能性)。"
+                "この行も応募として読みます。\n" if diag.get("header_is_mail") else "")
+        out.append(("header",
+                    f"⚠️ シート1の見出し ({names}) が見つかりません\n"
+                    f"{mail}"
+                    f"原因: 1行目の見出しが消えたか、名前が変わっています。{how}\n"
+                    f"対処: シート1の1行目を確認し、見出しを戻してください"))
+    if src in ("unresolved", "empty") or diag.get("recent_app_rows", 0) == 0:
+        out.append(("zero",
+                    f"⚠️ シート1から {since}の応募の行を1件も読めません\n"
+                    f"原因: シート1の行が消えた・見出しや列の並びが変わった・書き込みが止まった、のどれかです\n"
+                    f"対処: シート1の1行目と末尾の行を確認してください。応募の取り込みは止まっています"))
+    elif diag.get("recent_aw", 0) + diag.get("recent_hr", 0) == 0:
+        out.append(("media",
+                    f"⚠️ シート1の応募 {diag.get('recent_app_rows')}行 ({since}) の媒体を判別できません\n"
+                    f"原因: 媒体の列 (差出人) を読み違えています。見出しや列の並びが変わった可能性があります\n"
+                    f"対処: シート1の1行目の見出し (媒体・顧客・応募管理シート) を確認してください。"
+                    f"エアワーク・HRハッカーの応募の取り込みは止まっています"))
+    return out
