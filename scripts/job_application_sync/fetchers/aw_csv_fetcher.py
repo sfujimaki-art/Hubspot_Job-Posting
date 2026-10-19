@@ -273,7 +273,25 @@ def _is_authenticated_url(url: str) -> bool:
       (「アカウント登録・ログイン選択」画面) で、どちらの語も含まない。
     """
     path = url.split("?")[0].split("#")[0].rstrip("/")
-    return any(path.endswith(p) for p in ("/dashboards", "/entries"))
+    # /job_offers (求人一覧) も認証済み。ログイン後にここへ着く社があり、dashboards で
+    # ないだけで毎晩「ログイン失敗」にしていた (2026-10-19、グリーンパックス)。
+    return any(path.endswith(p) for p in ("/dashboards", "/entries", "/job_offers"))
+
+
+def _login_stop_url(url: str) -> bool:
+    """ログインの結果として、待っても先に進まない画面か (ID/PW誤り・規約の再同意)。"""
+    return "login_failed=true" in url or "usage_re_agreement" in url
+
+
+def login_fail_reason(url: str) -> str:
+    """ログイン後に着いた画面 → 原因の短い言葉 (例外文と Slack の分類に使う)。"""
+    if "login_failed=true" in url:
+        return "ID か PW が違います"
+    if "usage_re_agreement" in url:
+        return "利用規約の再同意が必要です"
+    if url.split("?")[0].rstrip("/").endswith("/interaction"):
+        return "エアワークの利用登録・ログイン選択の画面です (このIDにエアワークが紐付いていない可能性)"
+    return "管理画面に入れません"
 
 
 async def establish_aw_session(
@@ -350,15 +368,21 @@ async def establish_aw_session(
         if output_dir:
             await _dump_debug(page, output_dir, "login_submit_not_found")
         raise RuntimeError("AirRegi SSO の submit ボタン未検出")
+    # 管理画面に着くまで待つ。ID/PW誤り・規約の再同意の画面に着いたら待たずに失敗にする
+    # (2026-10-19: 毎晩の 38 社が 1 社 45 秒ずつ待っていた)。
+    err: Optional[Exception] = None
     try:
-        await page.wait_for_url("**/dashboards*", timeout=45000)
+        await page.wait_for_url(
+            lambda u: _is_authenticated_url(u) or _login_stop_url(u), timeout=45000)
     except Exception as e:  # noqa: BLE001
+        err = e
+    if err is not None or not _is_authenticated_url(page.url):
         if output_dir:
             await _dump_debug(page, output_dir, "login_failed")
         raise RuntimeError(
-            f"ログイン後 dashboards に遷移せず (login_id={login_id}, "
-            f"last_url={page.url[:80]})"
-        ) from e
+            f"ログイン後 dashboards に遷移せず: {login_fail_reason(page.url)} "
+            f"(login_id={login_id}, last_url={page.url[:80]})"
+        ) from err
 
     # 3) 新セッション保存 (次回から再利用)
     if sp:

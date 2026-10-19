@@ -29,6 +29,13 @@ def classify_aw_error(error: str, blocked_403: bool = False) -> tuple[str, str]:
     if "login_failed=true" in e or "login_failed=tru" in e:
         return ("ID か PW が違います (AirRegi がログインを拒否しました)",
                 "顧客管理シートの企業AirWorkのID/PWを確認してください")
+    if "usage_re_agreement" in e or "利用規約の再同意" in e:
+        return ("エアワークの利用規約の再同意が必要です (ID と PW は正しい)",
+                "その社の AirWork にログインして利用規約に同意してください (顧客の代わりに同意してよいかは社内で判断)")
+    if "/interaction" in e and "遷移せず" in e:
+        return ("ログインはできたが、エアワークの利用登録・ログイン選択の画面に着きました "
+                "(この ID にエアワークが紐付いていない可能性)",
+                "顧客管理シートの企業AirWorkの ID が、エアワークを使っている ID か確認してください")
     if "GITHUB_ACTIONS" in os.environ and ("未検出" in e or "遷移せず" in e):
         return ("GitHub Actions からは AirWork にアクセスできません (海外のサーバーとして拒否)。"
                 "画面が出ないため部品が見つかりません",
