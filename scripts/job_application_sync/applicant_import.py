@@ -18,7 +18,8 @@ Phase 0 確定事項 (docs/wbs_outputs/1.11.9_媒体CSV同期実装/Phase0_*.md)
 - 媒体求人ID は APPOINTMENT 側に持たない (LISTING側 id_hrhakkaa/id_airwork 検索でルックアップ)
 - AW LISTING は id_airwork + airwork_account_login_id の複合ユニーク
 - oubobaitaimei: HRハッカー / AirWork / jobギア / ジモティー / Indeed / ぶるる /
-                 エンゲージ / ジョブオプLite / 求人ボックス / ガテン系求人 / その他 / 未設定
+                 エンゲージ / ジョブオプLite / 求人ボックス / ガテン系求人 / その他 / 未設定 /
+                 リクロジメディア (2026-10-20 追加。reclogi_applicants.py が取り込む)
 
 CLI:
   --csv <path>    必須。応募CSV (cp932/utf-8 両対応試行)
@@ -164,10 +165,13 @@ def _aw_login_to_mail(login_id: str) -> str:
             _AW_LOGIN_MAIL_CACHE.setdefault("__loaded__", "1")
     return _AW_LOGIN_MAIL_CACHE.get(login_id, "")
 
-# ---- oubobaitaimei enum 値 (Phase 0 実測 12択) -----------------------------
+# ---- oubobaitaimei enum 値 (Phase 0 実測 12択 + リクロジメディア) -------------
+# 自社求人サイト reclogi.jp。求人は HRハッカーの求人なので id_hrhakkaa で引く (2026-10-20)
+RECLOGI_MEDIA = "リクロジメディア"
 OUBO_BAITAI_VALUES = {
     "HRハッカー", "AirWork", "jobギア", "ジモティー", "Indeed", "ぶるる",
     "エンゲージ", "ジョブオプLite", "求人ボックス", "ガテン系求人", "その他", "未設定",
+    RECLOGI_MEDIA,
 }
 
 # ---- 入力CSVの媒体名表記ゆれを enum 正規値に正規化 -------------------------
@@ -178,6 +182,8 @@ MEDIA_NAME_ALIAS = {
     "airwork": "AirWork",
     "air work": "AirWork",
     "エアワーク": "AirWork",
+    "リクロジ": RECLOGI_MEDIA,
+    "reclogi": RECLOGI_MEDIA,
 }
 
 # ---- 必須ヘッダ (暫定。Phase 0b で実物確認後に確定) -----------------------
@@ -1243,7 +1249,8 @@ def _process_applicant(
     # 1. LISTING検索 (媒体別)
     listing_id: Optional[str] = None
     unlinked_message = "LISTING検索ヒットゼロ → §24ガードに従いAssociation張らず"
-    if row.media == "HRハッカー":
+    if row.media in ("HRハッカー", RECLOGI_MEDIA):
+        # リクロジの求人は HRハッカーの求人。応募の HRハッカー求人ID で引く (2026-10-20)
         if row.media_job_id:
             listing_id = client.search_listing_hr(row.media_job_id)
     elif row.media == "AirWork":

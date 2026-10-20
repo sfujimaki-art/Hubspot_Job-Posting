@@ -51,6 +51,7 @@ from scripts.job_application_sync.fetchers import account_loader as al  # noqa: 
 from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af  # noqa: E402
 from scripts.job_application_sync import private_log as plog  # noqa: E402
 from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E402
+from scripts.job_application_sync import reclogi_applicants as reclogi  # noqa: E402
 
 MAX_ATTEMPTS = 3
 LOCK_STALE_SEC = 15 * 60
@@ -861,6 +862,21 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 print(f"  {'❌' if atts >= MAX_ATTEMPTS else '⏳'} HR: "
                       f"{res['error']} ({atts}/{MAX_ATTEMPTS}回)", flush=True)
 
+        # ---- リクロジ (reclogi.jp): GAS が書いたタブ「リクロジ応募」を読む (2026-10-20) ----
+        # HR を含む回だけ (Actions の --media HR)。AW 専用PC (--media AW) では走らせない。
+        # 後段 (顧客シート転記・relink) より前に走らせ、この回で入った応募も後段に乗せる。
+        # 本線 (HR/AW) を道連れにしない = 失敗しても握って続行する。黙らせはしない。
+        if media_filter in ("HR", "BOTH"):
+            try:
+                summary["reclogi"] = reclogi.run(
+                    dry_run=dry_run, ledger=ledger, max_attempts=MAX_ATTEMPTS,
+                    notify=lambda m: slack_notify(m, dry_run=dry_run))
+            except Exception as e:  # noqa: BLE001
+                print(f"[applicant_sync] リクロジ応募の取り込み失敗(本線には影響なし): "
+                      f"{type(e).__name__}: {str(e)[:120]}", flush=True)
+                slack_notify(dry_run=dry_run, message=
+                    f"⚠️ リクロジ応募の取り込みが失敗: {type(e).__name__}")
+
         # HR だけの回は AW を触らない。以前はここで return していたため、後ろの
         # 顧客シート転記と relink まで飛ばしていた (2026-10-13)。AW を空にして
         # 素通りさせ、台帳の保存と後段は通常どおり走らせる。
@@ -1057,6 +1073,22 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     return summary
 
 
+def relink_media(media: str) -> tuple:
+    """応募の媒体名 → (HRハッカー求人IDで引くか, get_oubosaki_props に渡す媒体名)。
+
+    リクロジメディアの応募は oubokyuujinmemo に HRハッカー求人ID を持つので
+    id_hrhakkaa で引く (2026-10-20)。以前の判定 ("HR"/"ハッカー" を含むか) では
+    AirWork 扱いになり id_airwork で引いて永久に紐付かなかった。
+    媒体名はそのまま渡す (HRハッカーとして渡すと応募先求人URLが
+    HRハッカーの URL で上書きされる)。
+    """
+    media = media or ""
+    if media == ai.RECLOGI_MEDIA:
+        return True, ai.RECLOGI_MEDIA
+    is_hr = "HR" in media or "ハッカー" in media
+    return is_hr, ("HRハッカー" if is_hr else "AirWork")
+
+
 def relink(dry_run: bool = False, limit: int = 1000,
            target_job_ids: Optional[list] = None) -> dict:
     """再紐付けスイープ (順序問題の恒久解決).
@@ -1089,9 +1121,9 @@ def relink(dry_run: bool = False, limit: int = 1000,
             jid = m.group(1) if m else ""
         if not jid:
             return
-        media = p.get("oubobaitaimei") or ""
-        targets.append((o["id"], jid, ("HR" in media or "ハッカー" in media),
-                        str(p.get("yingmuri") or "")[:10]))
+        is_hr, media = relink_media(p.get("oubobaitaimei") or "")
+        targets.append((o["id"], jid, is_hr,
+                        str(p.get("yingmuri") or "")[:10], media))
 
     # yingmuri(応募日) は「古い応募に一次対応を付けない」ガードに使う (2026-08-07)
     _PROPS = ["oubokyuujinmemo", "oubobaitaimei", "bikou_hiaringu", "yingmuri"]
@@ -1173,13 +1205,13 @@ def relink(dry_run: bool = False, limit: int = 1000,
                     p.get("hubspot_owner_id"))  # 2件目=曖昧
             time.sleep(0.1)
         return m
-    hr_map = _listing_map([j for _, j, ish, _d in targets if ish], "id_hrhakkaa")
-    aw_map = _listing_map([j for _, j, ish, _d in targets if not ish], "id_airwork")
+    hr_map = _listing_map([j for _, j, ish, _d, _m in targets if ish], "id_hrhakkaa")
+    aw_map = _listing_map([j for _, j, ish, _d, _m in targets if not ish], "id_airwork")
 
     # 3) 突合できた対象外だけ Association + 対象外解除 + 一次対応引き継ぎ
     relinked = still = ambiguous = 0
     note_copied = 0
-    for appt_id, jid, is_hr, apply_date in targets:
+    for appt_id, jid, is_hr, apply_date, media in targets:
         hit = (hr_map if is_hr else aw_map).get(jid, "__miss__")
         if hit == "__miss__":
             still += 1
@@ -1202,7 +1234,6 @@ def relink(dry_run: bool = False, limit: int = 1000,
                 props["hubspot_owner_id"] = l_owner       # 担当者も求人から継承
             # 応募先求人情報11項目も引き継ぐ (AWのlogin_idは対象外appt側に無いため
             # LISTING直読み+HR関連付けのみ。best-effort)
-            media = "HRハッカー" if is_hr else "AirWork"
             try:
                 props.update(cli.get_oubosaki_props(lid, media, "", jid))
             except Exception:  # noqa: BLE001
