@@ -160,6 +160,20 @@ async def fetch_aw_applicants(
             # 1) ログインは establish_aw_session で完了済 (セッション再利用/再ログイン)
             # 2) 応募者一覧
             await page.goto(URL_ENTRIES, wait_until="networkidle")
+            # ★保存セッションで dashboards には入れたのに、応募者一覧で /interaction
+            #   (ログイン選択) に飛ばされることがある (2026-10-19 朝、2日ぶりの回で4社)。
+            #   次の回 (5分後) にはログインし直して取れていたので、その場で1回だけ
+            #   保存セッションを捨ててログインし直す。
+            if (not awf._is_authenticated_url(page.url) and storage_state_path
+                    and Path(storage_state_path).exists()):
+                await awf._dump_debug(page, output_dir, "not_authenticated")
+                await ctx.close()
+                Path(storage_state_path).unlink(missing_ok=True)
+                ctx, page = await awf.establish_aw_session(
+                    browser, login_id, password,
+                    storage_state_path=storage_state_path, output_dir=output_dir,
+                )
+                await page.goto(URL_ENTRIES, wait_until="networkidle")
             # ★ここで認証済みでない画面(例 /interaction)に居たら、そのまま
             #   進めても button が0個で「ボタン未検出」になるだけ。原因が
             #   ボタン探索に見えて実体は認証切れ、という誤診を防ぐため明示する

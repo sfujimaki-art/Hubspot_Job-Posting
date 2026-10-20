@@ -17,6 +17,12 @@ CSV は 求人 × 期間全体 の 1 行 (日次ではない)。週ごとに (�
   airwork_cost_last_week, airwork_last_week_start, airwork_cost_total
 「直近4週」= その LISTING の最新の取込週を含む 4 週。
 
+★有料広告が無かった週は 0 を書く (2026-10-19、ユーザー指示)。
+  受け取りが済んだ週 (ZIP がある週 + aw_billing_empty.json の「その週は実績なし」) について、
+  その口座の公開中の求人で有料分の行が無いものに、費用 0・応募 0 の行を足す。
+  空欄 = まだ取れていない、0 = 取れていて有料広告は無かった、と見分けられるようにする。
+  取れていた実績の行を 0 で上書きはしない。求人を作る前の週には足さない。
+
 既定は dry-run (書かない)。--apply で書く。出力は件数のみ (名前は出さない)。
 
   HUBSPOT_ACCESS_TOKEN=... python scripts/job_application_sync/airwork_billing_import.py --limit 3
@@ -44,6 +50,10 @@ SUMMARY = ["airwork_cost_last4w", "airwork_applications_last4w", "airwork_cpa_la
 PROP_REF = "id_airwork"
 PROP_LOGIN = "airwork_account_login_id"
 READ_PROPERTIES = [PROP_REF, PROP_LOGIN, PERF] + SUMMARY
+PROP_STATUS = "kyuujin_status"
+OPEN_STATUS = "公開中"
+DEFAULT_EMPTY_FILE = str(Path(__file__).resolve().parents[2] / "data" / "job_application_sync"
+                         / "aw_billing_empty.json")
 DEFAULT_DIR = str(Path.home() / "airwork-exports" / "billing")
 MANIFEST_NAME = "billing_manifest.json"
 HUBSPOT_INTERVAL = 0.5
@@ -170,6 +180,48 @@ def load_dir(directory):
     return out, stats
 
 
+def collected_weeks(directory):
+    """{login_id: {週の月曜 ISO}}: 受け取りが済んだ週 (ログインIDの分かる ZIP がある週)。"""
+    root = Path(directory)
+    try:
+        manifest = json.loads((root / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        manifest = {}
+    out = {}
+    if not root.exists():
+        return out
+    for week_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        week = week_from_dirname(week_dir.name)
+        if week is None:
+            continue
+        for zpath in week_dir.glob("billing_*.zip"):
+            m = re.match(r"^billing_([0-9a-f]{8})_", zpath.name)
+            login = manifest.get(m.group(1)) if m else None
+            if login:
+                out.setdefault(login, set()).add(week[0])
+    return out
+
+
+def load_empty_weeks(path):
+    """aw_billing_empty.json -> {login_id: {週の月曜 ISO}} (「その週は実績なし」と分かった週)。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for login, weeks in (data or {}).items():
+        for w in weeks or []:
+            if week_from_dirname(str(w)):
+                out.setdefault(login, set()).add(str(w))
+    return out
+
+
+def zero_row(week_start):
+    start, end = week_from_dirname(week_start)
+    return {"period_start": start, "period_end": end, "impressions": 0, "clicks": 0,
+            "cost_yen": 0, "applications": 0, "no_paid_ads": True}
+
+
 # ---- merge and summary -------------------------------------------------------------------------
 
 def parse_existing(raw):
@@ -239,10 +291,17 @@ def norm(value):
         return text
 
 
-def plan_listing(ref, props, new_rows, captured_at):
-    """-> 書くプロパティ (変化なしなら None)。"""
+def plan_listing(ref, props, new_rows, captured_at, zero_rows=()):
+    """-> 書くプロパティ (変化なしなら None)。
+
+    zero_rows: 有料広告が無かった週の 0 の行。すでに行がある週 (取れていた実績) は上書きしない。
+    """
     existing = parse_existing(props.get(PERF))
     rows = merge_rows(existing, new_rows)
+    have = {row["period_start"] for row in rows}
+    extra = [z for z in zero_rows if z["period_start"] not in have]
+    if extra:
+        rows = merge_rows({"rows": rows}, extra)
     collection = build_collection(ref, rows, captured_at, existing)
     wanted = {PERF: json.dumps(collection, ensure_ascii=False, separators=(",", ":")),
               **summarize(rows)}
@@ -320,6 +379,30 @@ class HubSpotClient:
                     break
         return found
 
+    def open_listings(self, logins):
+        """口座 (airwork_account_login_id) が logins にある公開中の AirWork の LISTING。"""
+        found = []
+        for index in range(0, len(logins), BATCH):
+            chunk = logins[index:index + BATCH]
+            after = None
+            while True:
+                body = {"filterGroups": [{"filters": [
+                    {"propertyName": PROP_LOGIN, "operator": "IN", "values": chunk},
+                    {"propertyName": PROP_STATUS, "operator": "EQ", "value": OPEN_STATUS},
+                    {"propertyName": PROP_REF, "operator": "HAS_PROPERTY"}]}],
+                    "properties": READ_PROPERTIES + ["hs_createdate"], "limit": 100}
+                if after:
+                    body["after"] = after
+                response = self.call("POST", f"/crm/v3/objects/{LISTINGS}/search", body)
+                if response.status_code != 200:
+                    raise RuntimeError("hubspot_search_failed_%d" % response.status_code)
+                data = response.json()
+                found.extend(data.get("results", []))
+                after = ((data.get("paging") or {}).get("next") or {}).get("after")
+                if not after:
+                    break
+        return found
+
     def batch_update(self, inputs):
         response = self.call("POST", f"/crm/v3/objects/{LISTINGS}/batch/update", {"inputs": inputs})
         if response.status_code == 207:
@@ -327,7 +410,38 @@ class HubSpotClient:
         return response.status_code in (200, 201, 204)
 
 
-def run(hubspot, directory, apply=False, limit=None, now=None):
+def _zero_rows_for(records, weeks_by_login):
+    """公開中の LISTING ごとの 0 の行 -> ({(login, ref): [zero_row,...]}, {(login, ref): record}, ambiguous)。
+
+    求人を作った週より前の週には足さない (まだ無かった求人に 0 を付けない)。
+    """
+    zeros, recs, seen, ambiguous = {}, {}, collections.Counter(), set()
+    for record in records:
+        props = record.get("properties") or {}
+        key = ((props.get(PROP_LOGIN) or "").strip(), (props.get(PROP_REF) or "").strip())
+        if not all(key) or key[0] not in weeks_by_login:
+            continue
+        seen[key] += 1
+        if seen[key] > 1:
+            ambiguous.add(key)
+            continue
+        created = norm(props.get("hs_createdate"))[:10]
+        rows = [zero_row(w) for w in sorted(weeks_by_login[key[0]])
+                if not created or week_from_dirname(w)[1] >= created]
+        if rows:
+            zeros[key], recs[key] = rows, record
+    for key in ambiguous:
+        zeros.pop(key, None)
+        recs.pop(key, None)
+    return zeros, recs, len(ambiguous)
+
+
+def run(hubspot, directory, apply=False, limit=None, now=None, zero_fill=False,
+        empty_weeks=None):
+    """zero_fill=True で、受け取りが済んだ週に有料広告が無かった公開中の求人へ 0 を書く。
+
+    empty_weeks: {login_id: {週}} (「その週は実績なし」と分かった週。ZIP が無い週)。
+    """
     data, load_stats = load_dir(directory)
     captured_at = (now or datetime.datetime.now(datetime.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
     stats = collections.Counter(files=load_stats.get("files", 0), pairs=len(data))
@@ -335,25 +449,40 @@ def run(hubspot, directory, apply=False, limit=None, now=None):
                                   if k in ("unknown_account", "bad_zip", "no_sponsor_csv")})
     refs = sorted({ref for _, ref in data})
     by_key = match_records(hubspot.find_by_refs(refs), data.keys()) if refs else {}
+    zeros, zero_recs = {}, {}
+    if zero_fill:
+        weeks = collected_weeks(directory)
+        for login, ws in (empty_weeks or {}).items():
+            weeks.setdefault(login, set()).update(ws)
+        if weeks:
+            zeros, zero_recs, amb = _zero_rows_for(hubspot.open_listings(sorted(weeks)), weeks)
+            if amb:
+                errors["ambiguous_key_open"] += amb
     pending = []
-    for key in sorted(data):
-        records = by_key.get(key, [])
-        if not records:
-            stats["unmatched"] += 1
-            continue
-        if len(records) > 1:
-            errors["ambiguous_key"] += 1
-            continue
-        stats["matched"] += 1
-        record = records[0]
-        wanted = plan_listing(key[1], record.get("properties") or {},
-                              list(data[key].values()), captured_at)
+    for key in sorted(set(data) | set(zeros)):
+        if key in data:
+            records = by_key.get(key, [])
+            if not records:
+                stats["unmatched"] += 1
+                continue
+            if len(records) > 1:
+                errors["ambiguous_key"] += 1
+                continue
+            stats["matched"] += 1
+            record, real = records[0], list(data[key].values())
+        else:
+            record, real = zero_recs[key], []
+        zrows = zeros.get(key, [])
+        wanted = plan_listing(key[1], record.get("properties") or {}, real, captured_at,
+                              zero_rows=zrows)
         if wanted is None:
             stats["skipped_same"] += 1
             continue
         if limit is not None and stats["to_write"] >= limit:
             continue
         stats["to_write"] += 1
+        if key not in data:
+            stats["zero_filled"] += 1
         pending.append({"id": record["id"], "properties": wanted})
     if apply:
         for index in range(0, len(pending), BATCH):
@@ -366,6 +495,7 @@ def run(hubspot, directory, apply=False, limit=None, now=None):
             "pairs": stats["pairs"], "matched": stats["matched"],
             "unmatched": stats["unmatched"], "to_write": stats["to_write"],
             "written": stats["written"], "skipped_same": stats["skipped_same"],
+            "zero_fill_listings": len(zeros), "zero_filled_to_write": stats["zero_filled"],
             "errors": dict(errors),
             "listing_ids": [item["id"] for item in pending] if limit is not None else None}
 
@@ -376,6 +506,10 @@ def main(argv=None):
     parser.add_argument("--dir", default=DEFAULT_DIR, help="fetcher の保存先 (週ごとの ZIP)")
     parser.add_argument("--apply", action="store_true", help="HubSpot に書く (既定は dry-run)")
     parser.add_argument("--limit", type=int, help="書き込む LISTING を最大 N 件に (試走)")
+    parser.add_argument("--no-zero-fill", action="store_true",
+                        help="有料広告が無かった週に 0 を書かない (既定は書く)")
+    parser.add_argument("--empty-file", default=DEFAULT_EMPTY_FILE,
+                        help="「その週は実績なし」の記録 (aw_billing_empty.json)")
     args = parser.parse_args(argv)
     try:
         from dotenv import load_dotenv
@@ -387,7 +521,9 @@ def main(argv=None):
         print(json.dumps({"error": "missing_hubspot_token"}))
         return 1
     try:
-        summary = run(HubSpotClient(token), args.dir, apply=args.apply, limit=args.limit)
+        summary = run(HubSpotClient(token), args.dir, apply=args.apply, limit=args.limit,
+                      zero_fill=not args.no_zero_fill,
+                      empty_weeks=load_empty_weeks(args.empty_file))
     except RuntimeError as error:
         print(json.dumps({"error": str(error)}))
         return 1

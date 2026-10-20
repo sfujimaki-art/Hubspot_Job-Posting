@@ -220,6 +220,28 @@ async def _click_text(page, text: str, *, exact: bool = True) -> bool:
     return False
 
 
+# 集計単位のラジオ (2026-10-16 実画面で確認: name=advertisingAnalysisFileType、
+#   値 01=配信日 / 02=有料広告 / 03=求人)。どのラジオも読み上げ名は共通の「出力ファイル種類」で、
+#   「求人」の文字で探すと画面上部の「求人」タブを押してしまい、求人一覧へ移動していた。
+UNIT_RADIO_NAME = "advertisingAnalysisFileType"
+UNIT_RADIO_JOB = "03"
+
+
+async def _check_unit_job(page) -> bool:
+    """集計単位「求人」を選ぶ。選べて、分析の画面のままのときだけ True。"""
+    sel = f'input[name="{UNIT_RADIO_NAME}"][value="{UNIT_RADIO_JOB}"]'
+    try:
+        radio = page.locator(sel).first
+        if not await radio.count():
+            return False
+        label = page.locator(f"label:has({sel})").first
+        await (label if await label.count() else radio).click()
+        await asyncio.sleep(0.2)
+        return bool(await radio.is_checked()) and "/advertising/analysis" in page.url
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _find_period_input(page):
     for sel in PERIOD_INPUT_CANDIDATES:
         try:
@@ -405,7 +427,7 @@ async def _create_week(page, out_dir: Path, login_id: str, start: date) -> None:
         raise RuntimeError(f"「{RADIO_KIND_PAID}」を選べない")
     await asyncio.sleep(0.3)
     await _set_period(page, start, week_end(start))
-    if not await _click_text(page, RADIO_UNIT_JOB):
+    if not await _check_unit_job(page):
         await _dump_debug(page, out_dir, "billing_unit_missing")
         raise RuntimeError(f"集計単位「{RADIO_UNIT_JOB}」を選べない")
     await asyncio.sleep(0.2)

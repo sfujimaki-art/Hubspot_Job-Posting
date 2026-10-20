@@ -35,6 +35,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+try:  # パッケージ/直接実行の両対応 (この file は 2 通りの名前で import される)
+    from scripts.job_application_sync.fetchers import aw_pace as _aw_pace
+except ImportError:  # pragma: no cover
+    try:
+        from job_application_sync.fetchers import aw_pace as _aw_pace  # type: ignore
+    except ImportError:
+        import aw_pace as _aw_pace  # type: ignore
+
 
 # Phase 0b 実測 URL
 # ★ビューポートを明示的に大きく固定する (2026-08-07)。
@@ -265,7 +273,25 @@ def _is_authenticated_url(url: str) -> bool:
       (「アカウント登録・ログイン選択」画面) で、どちらの語も含まない。
     """
     path = url.split("?")[0].split("#")[0].rstrip("/")
-    return any(path.endswith(p) for p in ("/dashboards", "/entries"))
+    # /job_offers (求人一覧) も認証済み。ログイン後にここへ着く社があり、dashboards で
+    # ないだけで毎晩「ログイン失敗」にしていた (2026-10-19、グリーンパックス)。
+    return any(path.endswith(p) for p in ("/dashboards", "/entries", "/job_offers"))
+
+
+def _login_stop_url(url: str) -> bool:
+    """ログインの結果として、待っても先に進まない画面か (ID/PW誤り・規約の再同意)。"""
+    return "login_failed=true" in url or "usage_re_agreement" in url
+
+
+def login_fail_reason(url: str) -> str:
+    """ログイン後に着いた画面 → 原因の短い言葉 (例外文と Slack の分類に使う)。"""
+    if "login_failed=true" in url:
+        return "ID か PW が違います"
+    if "usage_re_agreement" in url:
+        return "利用規約の再同意が必要です"
+    if url.split("?")[0].rstrip("/").endswith("/interaction"):
+        return "エアワークの利用登録・ログイン選択の画面です (このIDにエアワークが紐付いていない可能性)"
+    return "管理画面に入れません"
 
 
 async def establish_aw_session(
@@ -293,6 +319,7 @@ async def establish_aw_session(
         ctx = await browser.new_context(accept_downloads=True,
                                         viewport=VIEWPORT,
                                         storage_state=str(sp))
+        await _aw_pace.install(ctx)   # ページの移動は PC 全体で 1 秒以上あける
         page = await ctx.new_page()
         try:
             await page.goto(URL_DASHBOARD, wait_until="domcontentloaded",
@@ -316,6 +343,7 @@ async def establish_aw_session(
 
     # 2) full login (初回 or セッション切れ)
     ctx = await browser.new_context(accept_downloads=True, viewport=VIEWPORT)
+    await _aw_pace.install(ctx)       # ページの移動は PC 全体で 1 秒以上あける
     page = await ctx.new_page()
     await page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
     # airwork → connect.airregi.jp のリダイレクト完了と描画を待つ (best effort)
@@ -340,15 +368,24 @@ async def establish_aw_session(
         if output_dir:
             await _dump_debug(page, output_dir, "login_submit_not_found")
         raise RuntimeError("AirRegi SSO の submit ボタン未検出")
+    # 管理画面に着くまで待つ。ID/PW誤り・規約の再同意の画面に着いたら待たずに失敗にする
+    # (2026-10-19: 毎晩の 38 社が 1 社 45 秒ずつ待っていた)。
+    err: Optional[Exception] = None
     try:
-        await page.wait_for_url("**/dashboards*", timeout=45000)
+        # wait_until="commit": 管理画面の読み込み (load) の完了までは待たない。
+        # (2026-10-20 笠岡***: dashboards に着いていたのに load が 45 秒で終わらず失敗にしていた)
+        await page.wait_for_url(
+            lambda u: _is_authenticated_url(u) or _login_stop_url(u), timeout=45000,
+            wait_until="commit")
     except Exception as e:  # noqa: BLE001
+        err = e
+    if not _is_authenticated_url(page.url):
         if output_dir:
             await _dump_debug(page, output_dir, "login_failed")
         raise RuntimeError(
-            f"ログイン後 dashboards に遷移せず (login_id={login_id}, "
-            f"last_url={page.url[:80]})"
-        ) from e
+            f"ログイン後 dashboards に遷移せず: {login_fail_reason(page.url)} "
+            f"(login_id={login_id}, last_url={page.url[:80]})"
+        ) from err
 
     # 3) 新セッション保存 (次回から再利用)
     if sp:

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from datetime import date, datetime
 from pathlib import Path
@@ -65,6 +66,9 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
 
 # A-2 を関数呼出で再利用
 from scripts.job_application_sync import airwork_import as awi  # noqa: E402
+from scripts.job_application_sync import aw_listing_images as _images  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_pace as _aw_pace  # noqa: E402
+from scripts.job_application_sync.fetchers import aw_urgent_queue as _urgent  # noqa: E402
 
 
 
@@ -203,6 +207,57 @@ def _rotate_slice(accounts: list, limit: int, out_dir: Path, key: str) -> list:
     return sliced
 
 
+LAST_OK_PATH = STATE_DIR / "aw_crawl_last_ok.json"
+
+
+def _load_last_ok(path: Path = None) -> dict:
+    """login_id → 最後に求人を取れた時刻 (epoch 秒)。無ければ空。"""
+    p = path or LAST_OK_PATH
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _record_last_ok(login_id: str, when: float = None, path: Path = None) -> None:
+    """取れた社の時刻を記録する。社ごとに書くので、途中で止まっても続きから回れる。
+
+    巡回と「すぐ取りに行く」処理の両方が書くので、毎回読み直してから1社分だけ足す。
+    """
+    p = path or LAST_OK_PATH
+    try:
+        data = _load_last_ok(p)
+        data[login_id] = float(when if when is not None else time.time())
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ★ID/PW 誤り・規約の再同意で止まった社の時刻 (2026-10-19)。同じ夜の 2・3 回目は
+#   回し直さない。人が直すまで結果は変わらず、誤った PW のログインを一晩に何度も
+#   繰り返すだけになるため (毎晩 36 社)。次の夜はまた 1 回試す。
+LOGIN_STOP_PATH = STATE_DIR / "aw_crawl_login_stop.json"
+
+
+def _is_login_stop(error: str) -> bool:
+    e = str(error or "")
+    return "login_failed=true" in e or "usage_re_agreement" in e
+
+
+def _order_stale_first(accounts: list, last_ok: dict) -> list:
+    """最後に取れたのが古い社から並べる (一度も取れていない社が先頭)。同じなら元の順。
+
+    ★2026-10-16 (ユーザー承認 A): 以前は「何社目まで進んだか」の番号で回していた。
+      対象の社の一覧は回ごとに変わる (新しい応募・受注で増減し、順番も詰め直される) ので、
+      番号がずれて同じ社を何度も取っていた (10/14〜15 の6回・のべ60社で、別々の社は31社)。
+      最後に取れた時刻で並べれば、一覧が変わっても取れていない社から順に回る。
+    """
+    return sorted(accounts, key=lambda a: last_ok.get(a.get("login_id", ""), 0.0))
+
+
 def _classify_error(err: str) -> str:
     """NG理由を住み分け用に分類 (login失敗/生成/その他)."""
     e = (err or "").lower()
@@ -273,6 +328,13 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
     async with sem:
         login_id = acc.get("login_id", "")
         company = acc.get("company_name", "")
+        # ★AirWork の CloudFront が 403 を返した後は触らない。触る前は、応募の取り込みと
+        #   共通の「社と社の間の最低間隔」を守る (2026-10-13、fetchers/aw_pace.py)。
+        if _aw_pace.is_blocked():
+            return {"login_id": login_id, "company": company,
+                    "status": "not_ready" if phase == "collect" else "error",
+                    "error": "AirWork が403を返したため、アクセスを止めています"}
+        await asyncio.to_thread(_aw_pace.wait_company_turn)
         try:
             t0 = datetime.now()
 
@@ -312,11 +374,33 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
                                      strict_client_code=False, **xkw),
             )
             t1 = datetime.now()
-            return {
+            out = {
                 "login_id": login_id, "company": company, "status": "ok",
                 "xlsx_path": str(xlsx_path), "result": result,
                 "duration_sec": (t1 - t0).total_seconds(),
             }
+            # ★2026-10-16 (ユーザー指示「画像は求人と一緒に」): 取り込んだ直後に、この社の
+            #   公開中の求人の画像の URL を公開ページから読み、変わったものだけ書く。
+            #   AirWork の管理画面には入らない (ログイン不要の公開ページ)。失敗しても求人は成功のまま。
+            if not dry_run and os.environ.get("JAS_AW_IMAGES", "1") != "0":
+                try:
+                    out["images"] = await asyncio.to_thread(
+                        _images.update_company_images, login_id,
+                        os.environ.get("HUBSPOT_ACCESS_TOKEN", ""), recruit_url)
+                except Exception as e:  # noqa: BLE001
+                    out["images"] = {"error": type(e).__name__}
+                print(f"  画像 ({plog.mask_name(company)}): {out['images']}", flush=True)
+            # ★2026-10-16 (ユーザー指示「課金も求人と一緒に」): 直近の完了週の有料広告実績が
+            #   まだなら、この社の作成ボタンを押して待ち行列に積む (できあがりは数分〜15分後。
+            #   取りに行くのは 5 分ごとの urgent の回の billing-collect)。週に 1 回だけ押す。
+            if not dry_run and os.environ.get("JAS_AW_BILLING", "1") != "0":
+                try:
+                    out["billing"] = await _billing_create_if_due(
+                        login_id, acc.get("password", ""), company, headless)
+                except Exception as e:  # noqa: BLE001
+                    out["billing"] = f"error:{type(e).__name__}"
+                print(f"  課金 ({plog.mask_name(company)}): {out['billing']}", flush=True)
+            return out
         except AWNotReadyError as e:
             # Phase2で生成物未完 → 再キュー
             return {"login_id": login_id, "company": company,
@@ -342,6 +426,23 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
 # ============================================================================
 # orchestrator 本体
 # ============================================================================
+def _images_total(results: list[dict]) -> dict:
+    """社ごとの画像の件数を合計する (読めなかった理由ごとの件数も)。画像の処理が無ければ空。"""
+    tot: dict = {}
+    for r in results:
+        st = r.get("images")
+        if not isinstance(st, dict) or "error" in st:
+            continue
+        for k, v in st.items():
+            if isinstance(v, dict):
+                sub = tot.setdefault(k, {})
+                for kk, vv in v.items():
+                    sub[kk] = sub.get(kk, 0) + int(vv)
+            elif isinstance(v, int):
+                tot[k] = tot.get(k, 0) + v
+    return tot
+
+
 def _sanitize(r: dict) -> dict:
     """ログ書出前のフィールド除去 (PW 等の機微情報を念のため落とす)。
 
@@ -423,7 +524,9 @@ async def orchestrate(parallel: int = 5,
                       from_active_deals: bool = False,
                       from_applications: bool = False,
                       applications_cutoff: str = "",
-                      phase: str = "full") -> dict:
+                      phase: str = "full",
+                      from_urgent_queue: bool = False,
+                      skip_ok_since: float = 0.0) -> dict:
     """AW アカウントを並列処理。
 
     Args:
@@ -520,6 +623,24 @@ async def orchestrate(parallel: int = 5,
         return {"ok": ok, "ng": ng, "not_ready": nr, "total": total,
                 "log": str(log_path)}
 
+    accounts = []
+    if from_urgent_queue:
+        # ★2026-10-16: 応募の求人が HubSpot に無かった社だけを取る (fetchers/aw_urgent_queue.py)。
+        pend = _urgent.pending()
+        if not pend:
+            print("[orchestrate] すぐ取りに行く待ち行列は空です", flush=True)
+            return {"ok": 0, "ng": 0, "total": 0, "log": None}
+        index: dict = {}
+        for prefer in ("A", "B"):
+            for a in iter_aw_accounts(active_only=False, prefer=prefer):
+                index.setdefault(a.get("login_id"), a)
+        for lid in pend:
+            if lid in index:
+                accounts.append(index[lid])
+            else:   # シートから消えた社は取りに行けない
+                _urgent.finish(lid, ok=False)
+        print(f"[orchestrate] すぐ取りに行く待ち行列: {len(pend)}社 → "
+              f"今回 {min(len(accounts), limit or len(accounts))}社", flush=True)
     if from_applications:
         # 応募起点(ブートストラップ, 2026-07-23): AW求人がHubSpotに未存在の導入期に、
         # 「応募が来た社」の求人を一括習得するための入口。日常の差分検知は別(温存)。
@@ -543,16 +664,24 @@ async def orchestrate(parallel: int = 5,
         print(f"[orchestrate] --from-applications: 応募{len(items)}件 → "
               f"AW解決アカウント {len(accounts)}社(cutoff={applications_cutoff})",
               flush=True)
-    elif from_active_deals:
+    if from_active_deals:
         # Deal起点: アクティブDeal(納品管理pipeline)のkanri_mail → AWアカウント解決。
         # シート順(古い会社混入)を排除し「現役顧客」のみを巡回対象にする。
+        # ★2026-10-16 (ユーザー承認 B): --from-applications と一緒に指定したら両方を足す
+        #   (受注中の全社 + 受注の一覧に無いが最近応募が来た社)。同じ login_id は1つにする。
         deal_mails = _fetch_active_deal_mails()
-        accounts, unresolved = resolve_accounts_for_mails(
+        deal_accounts, unresolved = resolve_accounts_for_mails(
             deal_mails, active_only=True, prefer="A")
+        have = {a.get("login_id") for a in accounts}
+        for a in deal_accounts:
+            if a.get("login_id") not in have:
+                have.add(a.get("login_id"))
+                accounts.append(a)
         print(
             f"[orchestrate] --from-active-deals: Deal管理メール "
             f"{len(set(m.lower() for m in deal_mails))}ユニーク → "
-            f"AW解決 {len(accounts)} / 未解決 {len(unresolved)}",
+            f"AW解決 {len(deal_accounts)} (応募起点と合わせて {len(accounts)}社) / "
+            f"未解決 {len(unresolved)}",
             flush=True,
         )
         # 未解決(シートID/PW整備で埋まる分)をログ出力
@@ -564,7 +693,7 @@ async def orchestrate(parallel: int = 5,
                 {"unresolved_count": len(unresolved), "mails": unresolved},
                 ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[orchestrate] 未解決メール一覧: {ur_path}", flush=True)
-    else:
+    if not (from_applications or from_active_deals or from_urgent_queue):
         # 顧客管理シートは下=最新。最新顧客から検証するため逆順(下から)で処理する。
         accounts = list(iter_aw_accounts(active_only=True))[::-1]
     if target_login_ids:
@@ -577,9 +706,27 @@ async def orchestrate(parallel: int = 5,
         )
     # incremental: 全社一斉を避け「N社ずつローテーション」で巡回 (2026-07-09)。
     # from_active_deals/from_applications + limit のときカーソルを進めて続きから処理。
-    if limit and (from_active_deals or from_applications) and not target_login_ids:
-        accounts = _rotate_slice(accounts, limit, out_dir, key=phase)
-    elif limit:
+    if (from_active_deals or from_applications) and not target_login_ids:
+        last_ok = _load_last_ok()
+        accounts = _order_stale_first(accounts, last_ok)
+        if skip_ok_since:
+            # ★2026-10-16 (ユーザー指示「一回ゆっくりでもいいからやりきって」): 同じ夜の
+            #   2 回目以降は、この夜すでに取れた社を飛ばし、取れなかった社だけ回る。
+            before = len(accounts)
+            accounts = [a for a in accounts
+                        if last_ok.get(a.get("login_id", ""), 0.0) < skip_ok_since]
+            stopped = _load_last_ok(LOGIN_STOP_PATH)
+            n_ok = before - len(accounts)
+            before = len(accounts)
+            accounts = [a for a in accounts
+                        if stopped.get(a.get("login_id", ""), 0.0) < skip_ok_since]
+            print(f"[orchestrate] この回で取れた社 {n_ok}社と、ID/PW誤り・規約の再同意で"
+                  f"止まった社 {before - len(accounts)}社を除き、"
+                  f"残り {len(accounts)}社を処理", flush=True)
+        if limit:
+            print(f"[orchestrate] 最後に取れたのが古い順に {min(limit, len(accounts))}/"
+                  f"{len(accounts)}社を処理", flush=True)
+    if limit:
         accounts = accounts[:limit]
     total = len(accounts)
     print(
@@ -598,6 +745,13 @@ async def orchestrate(parallel: int = 5,
     async def _wrapped(acc: dict) -> dict:
         r = await process_one(sem, acc, out_dir, dry_run, headless, phase=phase)
         done_count["n"] += 1
+        if r["status"] == "ok" and phase == "full" and not dry_run:
+            _record_last_ok(r.get("login_id", ""))
+        elif (r["status"] == "error" and phase == "full" and not dry_run
+              and _is_login_stop(r.get("error", ""))):
+            _record_last_ok(r.get("login_id", ""), path=LOGIN_STOP_PATH)
+        if from_urgent_queue and not dry_run:
+            _urgent.finish(r.get("login_id", ""), ok=r["status"] == "ok")
         marker = {"ok": "OK ", "queued": "QUEUED ",
                   "error": "NG "}.get(r["status"], r["status"] + " ")
         print(
@@ -684,6 +838,9 @@ async def orchestrate(parallel: int = 5,
                     status=r.get("status"), error=r.get("error", ""),
                     result=r.get("result"))
 
+    img = _images_total(sanitized)
+    if img:
+        print(f"[orchestrate] 画像の合計: {img}", flush=True)
     print(
         f"[orchestrate-done] ok={ok} ng={ng} total={total} log={log_path}",
         flush=True,
@@ -719,6 +876,51 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+async def _billing_create_if_due(login_id: str, password: str, company: str,
+                                 headless: bool = True) -> str:
+    """直近の完了週の有料広告実績を、まだ取っていなければ作成だけする。結果の種類を返す。
+
+    skip   : 保存済み・データ無しと確定済み・作成済みで待ち行列にある
+    queued : 作成した (待ち行列に積んだ)
+    saved  : 作成済みのファイルが残っていて、その場で保存できた
+    empty  : その週のデータが無い (以後その週は押さない)
+    それ以外は fetch_aw_billing_weeks の status (error / not_ready)。
+    """
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    out_dir = bf.DEFAULT_OUT_DIR
+    week = bf.last_full_week()
+    wk = week.isoformat()
+    with _billing_state_lock():
+        empty = _load_json(BILLING_EMPTY_PATH)
+        queue = _load_json(BILLING_QUEUE_PATH)
+    if (bf.has_saved(out_dir, login_id, week) or wk in empty.get(login_id, [])
+            or (queue.get(login_id) or {}).get("week_start") == wk):
+        return "skip"
+    if _aw_pace.is_blocked():
+        return "not_ready"
+    res = await bf.fetch_aw_billing_weeks(login_id, password, [week], out_dir,
+                                          headless=headless, mode="create")
+    st = next((x for w, x, _ in res if w == week), "error")
+    with _billing_state_lock():
+        empty = _load_json(BILLING_EMPTY_PATH)
+        queue = _load_json(BILLING_QUEUE_PATH)
+        if st == "empty":
+            lst = empty.setdefault(login_id, [])
+            if wk not in lst:
+                lst.append(wk)
+            _save_json(BILLING_EMPTY_PATH, empty)
+        elif st == "queued":
+            queue[login_id] = {"company": company, "week_start": wk,
+                               "triggered_at": datetime.now().isoformat()}
+            _save_json(BILLING_QUEUE_PATH, queue)
+    return st
+
+
+def _billing_state_lock():
+    """課金の待ち行列・データ無しの記録を、巡回と urgent の回で同時に書き換えないための鍵。"""
+    return _aw_pace._file_lock(BILLING_QUEUE_PATH.with_suffix(".lock"))
+
+
 def _billing_status(week_results: list, mode: str) -> str:
     """週ごとの結果から 1 アカウントの status を決める。"""
     st = {s for _, s, _ in week_results}
@@ -739,6 +941,12 @@ async def process_billing_one(sem: asyncio.Semaphore, acc: dict, weeks: list,
         login_id = acc.get("login_id", "")
         company = acc.get("company_name", "")
         pw = acc.get("password", "")
+        # ★2026-10-16: 求人・応募の取得と同じく、403 で止めている間は触らず、
+        #   社の始まりは PC 全体で 30〜50 秒ずらす (以前は課金だけ間隔を守っていなかった)。
+        if _aw_pace.is_blocked():
+            return {"login_id": login_id, "company": company, "status": "not_ready",
+                    "error": "AirWork が403を返したため、アクセスを止めています"}
+        await asyncio.to_thread(_aw_pace.wait_company_turn)
         t0 = datetime.now()
         try:
             res = await bf.fetch_aw_billing_weeks(
@@ -794,8 +1002,13 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
     sem = asyncio.Semaphore(parallel)
     empty = _load_json(BILLING_EMPTY_PATH)   # {login_id: [週の月曜 ISO,...]} データ無し確定の週
 
+    queued_now = _load_json(BILLING_QUEUE_PATH)
+
     def pending_weeks(lid: str) -> list:
         skip = set(empty.get(lid, []))
+        # 作成済みで受け取り待ちの週は、もう一度作成しない (2026-10-16)
+        if (queued_now.get(lid) or {}).get("week_start"):
+            skip.add(queued_now[lid]["week_start"])
         return [w for w in weeks if w.isoformat() not in skip
                 and not bf.has_saved(out_dir, lid, w)]
 
@@ -805,6 +1018,24 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
         slice_n = limit if limit else int(os.environ.get("AW_COLLECT_SLICE", "20"))
         q_slice = _rotate_slice(q_items, slice_n, out_dir, key="billing-collect")
         jobs = []
+        # ★2026-10-16: 作成から 24 時間でファイルは消える。20 時間を過ぎた分は待ち行列から外し、
+        #   次の巡回で作り直す (いつまでも not_ready で残り続けないように)。
+        stale_h = float(os.environ.get("AW_BILLING_QUEUE_MAX_HOURS", "20"))
+        now = datetime.now()
+        for lid, meta in list(queue.items()):
+            try:
+                age = (now - datetime.fromisoformat(meta.get("triggered_at", ""))).total_seconds()
+            except Exception:  # noqa: BLE001
+                age = 0
+            if age > stale_h * 3600:
+                queue.pop(lid, None)
+        if len(queue) != len(q_items):
+            with _billing_state_lock():
+                cur = _load_json(BILLING_QUEUE_PATH)
+                for lid in [k for k, _ in q_items if k not in queue]:
+                    cur.pop(lid, None)
+                _save_json(BILLING_QUEUE_PATH, cur)
+        q_slice = [kv for kv in q_slice if kv[0] in queue]
         for lid, meta in q_slice:
             try:
                 wk = date.fromisoformat(meta.get("week_start", ""))
@@ -823,6 +1054,18 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
             accounts = accounts[:limit]
         jobs = [(a, pending_weeks(a.get("login_id", ""))) for a in accounts]
         jobs = [(a, w) for a, w in jobs if w]
+        # ★2026-10-20: 巡回で ID/PW 誤り・規約の再同意と分かった社 (20 時間以内) は、
+        #   作成のやり直しでもログインしない。巡回の最後の作成のやり直しが、この 36 社に
+        #   誤ったパスワードのログインをもう一度ずつしていた (1 社 60〜90 秒の順番も使う)。
+        stop_h = float(os.environ.get("AW_LOGIN_STOP_HOURS", "20"))
+        stopped = _load_last_ok(LOGIN_STOP_PATH)
+        cutoff = time.time() - stop_h * 3600
+        n_before = len(jobs)
+        jobs = [(a, w) for a, w in jobs
+                if stopped.get(a.get("login_id", ""), 0.0) < cutoff]
+        if len(jobs) != n_before:
+            print(f"[orchestrate] ID/PW誤り・規約の再同意で止まっている {n_before - len(jobs)}社は"
+                  f"作成しません", flush=True)
         print(f"[orchestrate] phase={phase}: 対象 {len(jobs)}社 / 週 "
               f"{weeks[0].isoformat() if weeks else '-'}〜{weeks[-1].isoformat() if weeks else '-'}"
               f" ({len(weeks)}週), parallel={parallel}", flush=True)
@@ -849,26 +1092,28 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
     results = await asyncio.gather(*[_wrapped(a, w) for a, w in jobs])
 
     # --- 状態の更新 (キュー / データ無しの週) ---
-    queue = _load_json(BILLING_QUEUE_PATH)
-    for r in results:
-        lid = r["login_id"]
-        for wk, st in (r.get("week_status") or {}).items():
-            if st == "empty":
-                lst = empty.setdefault(lid, [])
-                if wk not in lst:
-                    lst.append(wk)
-        if phase == "billing-create" and r["status"] == "queued":
-            first = next((w for w, s in (r.get("week_status") or {}).items()
-                          if s == "queued"), "")
-            queue[lid] = {"company": r.get("company", ""), "week_start": first,
-                          "triggered_at": datetime.now().isoformat()}
-        elif phase == "billing-collect":
-            if r["status"] == "ok":
-                queue.pop(lid, None)
-        elif phase == "billing-full":
-            queue.pop(lid, None) if r["status"] == "ok" else None
-    _save_json(BILLING_EMPTY_PATH, empty)
-    _save_json(BILLING_QUEUE_PATH, queue)
+    with _billing_state_lock():
+        empty = _load_json(BILLING_EMPTY_PATH)   # 巡回が並行して書いた分を取り込む
+        queue = _load_json(BILLING_QUEUE_PATH)
+        for r in results:
+            lid = r["login_id"]
+            for wk, st in (r.get("week_status") or {}).items():
+                if st == "empty":
+                    lst = empty.setdefault(lid, [])
+                    if wk not in lst:
+                        lst.append(wk)
+            if phase == "billing-create" and r["status"] == "queued":
+                first = next((w for w, s in (r.get("week_status") or {}).items()
+                              if s == "queued"), "")
+                queue[lid] = {"company": r.get("company", ""), "week_start": first,
+                              "triggered_at": datetime.now().isoformat()}
+            elif phase == "billing-collect":
+                if r["status"] == "ok":
+                    queue.pop(lid, None)
+            elif phase == "billing-full":
+                queue.pop(lid, None) if r["status"] == "ok" else None
+        _save_json(BILLING_EMPTY_PATH, empty)
+        _save_json(BILLING_QUEUE_PATH, queue)
 
     summary = _write_account_results(results, out_dir, phase)
     print(f"[orchestrate] 住み分け({phase}): {summary}", flush=True)
@@ -945,6 +1190,10 @@ def parse_args(argv=None):
     p.add_argument("--from-applications", action="store_true",
                    help="応募起点(導入期ブートストラップ): 応募が来た社の求人を一括習得。"
                         "シート1のAW応募→AWアカウント解決を対象にする")
+    p.add_argument("--from-urgent-queue", action="store_true",
+                   help="応募の求人が HubSpot に無かった社だけを取る (aw_urgent_queue)")
+    p.add_argument("--skip-ok-since", type=float, default=0.0,
+                   help="この時刻 (epoch 秒) 以降に求人を取れた社は飛ばす (同じ夜のやり直し用)")
     p.add_argument("--applications-cutoff", default="",
                    help="--from-applications の応募日カットオフ(ISO YYYY-MM-DD, 空=全件)")
     p.add_argument("--phase",
@@ -995,6 +1244,8 @@ def main(argv=None):
         from_applications=args.from_applications,
         applications_cutoff=args.applications_cutoff,
         phase=args.phase,
+        from_urgent_queue=args.from_urgent_queue,
+        skip_ok_since=args.skip_ok_since,
     ))
 
 

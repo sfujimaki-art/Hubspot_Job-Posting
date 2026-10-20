@@ -20,6 +20,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from .fetchers import account_loader as al
@@ -366,6 +367,36 @@ class AccountResolver:
             return cands[0], True
         return None, False
 
+    def explain(self, item: QueueItem) -> str:
+        """resolve が None を返した通知について、突合できなかった理由を人向けに返す。
+
+        ★2026-10-16 ユーザー指示「エラーの報告内容で原因を特定できるようにしてほしい」。
+          以前の通知は「会社名の登録が無い可能性」としか書かず、何を直せばよいか
+          分からなかった。resolve と同じ索引を見て、どこで止まったかを書く。
+        """
+        mails = [m for m in dict.fromkeys([item.login_id] + list(item.login_ids or []))
+                 if _norm(m)]
+        mail_rows = {m: len(self.idx_mail_multi.get(_norm(m)) or []) for m in mails}
+        hit = {m: n for m, n in mail_rows.items() if n}
+        comp = _norm_company(item.company)
+        comp_rows = self.idx_comp_norm.get(comp) or [] if comp else []
+        if not comp and not hit:
+            return "通知の会社名が空か法人格だけで、メールも顧客管理シートにありません"
+        if hit:
+            m, n = next(iter(hit.items()))
+            return (f"メール {m[:24]} はシートの{n}行にありますが、通知の会社名"
+                    f"「{item.company[:20]}」と一致する行が無いため1社に絞れません"
+                    f"（同じメールを複数の社で使っている・社名の表記が違う）")
+        if len(comp_rows) > 1:
+            return (f"会社名が一致する行が{len(comp_rows)}行あり、行ごとにログイン情報が"
+                    f"違うため事業所を決められません。通知のメール "
+                    f"{(mails[0] if mails else '')[:24]} がシートにありません")
+        if len(comp_rows) == 1:
+            return "会社名は1行に一致しましたが、突合の条件を満たしませんでした（要調査）"
+        return (f"会社名「{item.company[:20]}」もメール "
+                f"{(mails[0] if mails else '(なし)')[:24]} も顧客管理シートにありません"
+                f"（新しい顧客か、社名の表記が違う）")
+
     def resolve(self, item: QueueItem) -> Optional[ResolvedAccount]:
         """queue項目 → ResolvedAccount。突合できなければ None (=要報告)."""
         lid = _norm(item.login_id)
@@ -489,6 +520,14 @@ S1_MARK_ACCEPTED = "受入済"     # こちら側で処理した印
 _S1_APP_SUBJECTS = ("応募がありました", "応募通知メール")
 # 列挿入に耐えるため header/data はやや広め(A:Q)に読む。
 _S1_READ_RANGE = "A1:Q"
+# ★見出しが壊れたときのために、見出しで列を決められた回の列の位置を覚えておく (2026-10-19)。
+#   10/17 19:10〜10/19 8:45、シート1の1行目 (見出し) が応募メールで上書きされ、
+#   媒体の列を「媒体リンク」列と取り違えて、約37時間 応募を1件も読めなかった。
+S1_COLUMNS_STATE = Path(os.environ.get(
+    "JAS_S1_COLUMNS_STATE", "data/job_application_sync/sheet1_columns.json"))
+# 直前の read_new_items_from_sheet1 の診断 (呼び出し側が Slack に知らせるのに使う)。
+LAST_S1_DIAG: dict = {}
+_S1_COL_KEYS = ("media", "from", "company", "subject", "date", "marker")
 
 
 def _norm_header(h: str) -> str:
@@ -588,7 +627,7 @@ def _fill_s1_by_content(cols: dict, rows: list) -> None:
     taken = {v for v in cols.values() if v is not None}
     ncol = max((len(r) for r in rows), default=0)
 
-    def best(pat, floor, uniq_min=None, uniq_max=None):
+    def best(pat, floor, uniq_min=None, uniq_max=None, skip_url=False):
         """該当率が最も高い列。uniq_* で「値の種類の多さ」も条件にできる."""
         top, rate = None, 0.0
         for ci in range(ncol):
@@ -596,6 +635,8 @@ def _fill_s1_by_content(cols: dict, rows: list) -> None:
                 continue
             vals = [str(r[ci]).strip() for r in rows
                     if len(r) > ci and str(r[ci]).strip()]
+            if skip_url:
+                vals = [v for v in vals if not v.lower().startswith("http")]
             if not vals:
                 continue
             uniq = len(set(vals)) / len(vals)
@@ -616,7 +657,9 @@ def _fill_s1_by_content(cols: dict, rows: list) -> None:
     if cols.get("media") is None:
         # 閾値は実測で決める(2026-08-25, 399行): 媒体列49.4% / 差出人列0.3%。
         # 差が大きいので 0.20 で十分に分かれ、媒体の種類が増えても耐える。
-        ci = best(_S1_AUTOSEND_PAT, 0.20)
+        # ★URL は数えない (2026-10-19)。「媒体リンク」列は https://…airwork… の URL が
+        #   並ぶので媒体列より該当率が高くなり、見出しが壊れた 10/17〜19 に取り違えた。
+        ci = best(_S1_AUTOSEND_PAT, 0.20, skip_url=True)
         if ci is not None:
             cols["media"] = ci
             taken.add(ci)
@@ -687,6 +730,70 @@ def _s1_date_recent(d: str, cutoff_iso: str) -> bool:
     return iso >= cutoff_iso
 
 
+def _s1_missing_by_name(header: list) -> list[str]:
+    """見出しの名前で引けなかった列 (媒体・顧客・応募管理シート)。空なら見出しは正常。"""
+    names = {_norm_header(str(h)) for h in header}
+    return [k for k, cands in (("media", _S1_HDR_MEDIA), ("from", _S1_HDR_FROM),
+                               ("company", _S1_HDR_COMPANY))
+            if not any(n in names for n in cands)]
+
+
+def _load_s1_columns() -> dict:
+    try:
+        d = json.loads(Path(S1_COLUMNS_STATE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    cols = d.get("columns") or {}
+    if all(isinstance(cols.get(k), int) for k in _S1_COL_KEYS):
+        return {k: cols[k] for k in _S1_COL_KEYS}
+    return {}
+
+
+def _save_s1_columns(cols: dict) -> None:
+    if not all(isinstance(cols.get(k), int) for k in _S1_COL_KEYS):
+        return
+    new = {k: cols[k] for k in _S1_COL_KEYS}
+    if _load_s1_columns() == new:
+        return
+    p = Path(S1_COLUMNS_STATE)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"columns": new, "saved_at": time.time()},
+                                  ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass  # 記録できなくても読み取りは続ける (次の正常な回で書き直す)
+
+
+def _s1_saved_ok(cols: dict, rows: list) -> bool:
+    """覚えていた列の位置が、今の中身と合っているか (直近の行で確かめる)。"""
+    recent = rows[-2000:]
+
+    def vals(ci):
+        return [str(r[ci]).strip() for r in recent
+                if len(r) > ci and str(r[ci]).strip()]
+
+    subj = vals(cols["subject"])
+    if not any(any(k in v for k in _S1_APP_SUBJECTS) for v in subj):
+        return False
+    media = [v for v in vals(cols["media"]) if not v.lower().startswith("http")]
+    if not media or sum(1 for v in media if _S1_AUTOSEND_PAT.search(v)) / len(media) < 0.20:
+        return False
+    frm = vals(cols["from"])
+    return bool(frm) and sum(1 for v in frm if _S1_MAIL_PAT.search(v)) / len(frm) >= _S1_MAIL_MIN
+
+
+def _s1_looks_like_mail(row: list, cols: dict) -> bool:
+    """1行目が見出しではなく通知メールの行か (書き込み側に見出しを上書きされた状態)。"""
+    def g(k):
+        i = cols.get(k)
+        return str(row[i]).strip() if i is not None and len(row) > i else ""
+    return (any(k in g("subject") for k in _S1_APP_SUBJECTS)
+            or (bool(re.match(r"\d{4}/\d{1,2}/\d{1,2}", g("date")))
+                and bool(_S1_MAIL_PAT.search(g("from")))))
+
+
 def read_new_items_from_sheet1(
     sheet_id: str = "", *, cutoff_iso: str = "", media_filter: str = "HR",
     limit: Optional[int] = None,
@@ -705,14 +812,36 @@ def read_new_items_from_sheet1(
     ws = al.sheet_retry(lambda: gc.open_by_key(sid).worksheet(SHEET1_TAB))
     # header + data を A:Q で取得(列挿入headroom)。全列get_all_valuesは52k行で重い。
     vals = al.sheet_retry(ws.get, _S1_READ_RANGE)  # 既定=FORMATTED_VALUE
+    LAST_S1_DIAG.clear()
     if not vals:
+        LAST_S1_DIAG.update(column_source="empty", missing_by_name=[],
+                            header_is_mail=False, recent_app_rows=0,
+                            recent_aw=0, recent_hr=0)
         return []
     header, data = vals[0], vals[1:]
     cols = _resolve_s1_columns(header, data)
+    # ★見出しが壊れたら、前に見出しで決められた列の位置を使う (2026-10-19)。
+    #   中身と合わなければ (列の挿入など) 中身から決めた位置を使う。
+    missing_by_name = _s1_missing_by_name(header)
+    column_source = "header"
+    if missing_by_name:
+        saved = _load_s1_columns()
+        if saved and _s1_saved_ok(saved, data):
+            cols, column_source = saved, "saved"
+        else:
+            column_source = "content"
+    else:
+        _save_s1_columns(cols)
+    # 見出しの行が通知メールで上書きされていたら、その行も応募として読む
+    header_is_mail = bool(missing_by_name) and _s1_looks_like_mail(header, cols)
     # 突合キー(会社名)と応募判定(件名)は必須。欠けたら位置依存へ落とさず明示エラー。
     missing = [k for k in ("subject", "media", "from", "company")
                if cols.get(k) is None]
     if missing:
+        LAST_S1_DIAG.update(column_source="unresolved",
+                            missing_by_name=missing_by_name,
+                            header_is_mail=header_is_mail, recent_app_rows=0,
+                            recent_aw=0, recent_hr=0, columns=dict(cols))
         raise RuntimeError(
             f"シート1の列をヘッダ名/内容で特定できず: {missing} "
             f"(header={[_norm_header(str(h)) for h in header]}) — "
@@ -725,7 +854,13 @@ def read_new_items_from_sheet1(
     # 同一内容の通知が何件目かを数える (row_id の衝突回避。下の生成箇所参照)
     _dup_seen: dict[str, int] = {}
     import hashlib
-    for i, r in enumerate(data, start=2):  # data先頭=シート行2
+    # 1行目 (上書きされた見出し) は最後に読む。先に読むと、同じ内容の行の
+    # 「何件目か」がずれて、処理済みの行の ID が変わってしまう。
+    rows_in_order = list(enumerate(data, start=2))  # data先頭=シート行2
+    if header_is_mail:
+        rows_in_order.append((1, header))
+    recent = {"app": 0, "AW": 0, "HR": 0}
+    for i, r in rows_in_order:
         def g(name: str) -> str:
             idx = col(name)
             if idx is None:
@@ -735,17 +870,23 @@ def read_new_items_from_sheet1(
         subj = g("subject")
         if not any(k in subj for k in _S1_APP_SUBJECTS):
             continue
-        if g("marker") in S1_MARKS_DONE:
-            continue  # 既に処理済(マーカー列=行削除に強い判定)
+        date = g("date")
+        in_window = not cutoff_iso or _s1_date_recent(date, cutoff_iso)
         media_type = _media_type_from_b(g("media"))
         mt = media_type.lower()
         media = ("HR" if ("hr" in mt or "ハッカー" in media_type)
                  else "AW" if ("airwork" in mt or "ワーク" in media_type)
                  else "OTHER")
+        if in_window:
+            # 処理済みかどうかに関係なく数える (急に0件になったことに気づくため)
+            recent["app"] += 1
+            if media in recent:
+                recent[media] += 1
+        if g("marker") in S1_MARKS_DONE:
+            continue  # 既に処理済(マーカー列=行削除に強い判定)
         if media_filter != "BOTH" and media != media_filter:
             continue
-        date = g("date")
-        if cutoff_iso and not _s1_date_recent(date, cutoff_iso):
+        if not in_window:
             continue
         company = re.sub(r"[（(].+?[)）]", "", g("company")).strip()
         # 安定ID = 内容ハッシュ + 同一内容の出現順 (行番号非依存=削除に強い)
@@ -780,6 +921,12 @@ def read_new_items_from_sheet1(
         ))
         if limit and len(items) >= limit:
             break
+    LAST_S1_DIAG.update(column_source=column_source,
+                        missing_by_name=missing_by_name,
+                        header_is_mail=header_is_mail,
+                        recent_app_rows=recent["app"],
+                        recent_aw=recent["AW"], recent_hr=recent["HR"],
+                        columns=dict(cols))
     return items
 
 

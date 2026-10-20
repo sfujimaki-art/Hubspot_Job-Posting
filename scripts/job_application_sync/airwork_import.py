@@ -980,6 +980,9 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
             "ends_ok": e_ok, "ends_ng": e_ng,
             "updates_ok": u_ok, "updates_ng": u_ng,
             "creates_ok": c_ok, "creates_ng": c_ng,
+            # 求人ID → LISTING の id (既存 + 今回作成)。応募の自己修復が、作った直後の
+            # 求人を Search の反映を待たずに使うため (2026-10-13)。
+            "listing_ids": {**{j: v["id"] for j, v in existing.items()}, **idmap},
         })
         print(f"  更新: OK={u_ok} NG={u_ng}")
         print(f"  作成: OK={c_ok} NG={c_ng}")
