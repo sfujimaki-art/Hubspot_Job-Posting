@@ -1054,6 +1054,18 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
             accounts = accounts[:limit]
         jobs = [(a, pending_weeks(a.get("login_id", ""))) for a in accounts]
         jobs = [(a, w) for a, w in jobs if w]
+        # ★2026-10-20: 巡回で ID/PW 誤り・規約の再同意と分かった社 (20 時間以内) は、
+        #   作成のやり直しでもログインしない。巡回の最後の作成のやり直しが、この 36 社に
+        #   誤ったパスワードのログインをもう一度ずつしていた (1 社 60〜90 秒の順番も使う)。
+        stop_h = float(os.environ.get("AW_LOGIN_STOP_HOURS", "20"))
+        stopped = _load_last_ok(LOGIN_STOP_PATH)
+        cutoff = time.time() - stop_h * 3600
+        n_before = len(jobs)
+        jobs = [(a, w) for a, w in jobs
+                if stopped.get(a.get("login_id", ""), 0.0) < cutoff]
+        if len(jobs) != n_before:
+            print(f"[orchestrate] ID/PW誤り・規約の再同意で止まっている {n_before - len(jobs)}社は"
+                  f"作成しません", flush=True)
         print(f"[orchestrate] phase={phase}: 対象 {len(jobs)}社 / 週 "
               f"{weeks[0].isoformat() if weeks else '-'}〜{weeks[-1].isoformat() if weeks else '-'}"
               f" ({len(weeks)}週), parallel={parallel}", flush=True)

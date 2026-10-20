@@ -269,3 +269,24 @@ def test_ID_PW誤りと規約の再同意の社は同じ夜にやり直さない
     seen.clear()
     asyncio.run(orch.orchestrate(**dict(kw, skip_ok_since=600.0)))   # 次の夜
     assert sorted(seen) == ["good", "net", "pw", "tos"]
+
+
+def test_課金の作成のやり直しは_ID_PW誤りで止まった社にログインしない(monkeypatch, tmp_path):
+    from scripts.job_application_sync.fetchers import aw_billing_fetcher as bf
+    week = bf.last_full_week()
+    monkeypatch.setattr(orch, "_select_billing_accounts", lambda fad, t: [
+        {"login_id": x, "password": "p", "company_name": x} for x in ("pw", "ok")])
+    monkeypatch.setattr(bf, "has_saved", lambda d, lid, w: False)
+    orch._record_last_ok("pw", orch.time.time() - 3600, path=orch.LOGIN_STOP_PATH)   # 1 時間前に止まった
+    seen = []
+
+    async def fake_one(sem, acc, weeks, out_dir, headless, mode):
+        seen.append(acc["login_id"])
+        return {"login_id": acc["login_id"], "company": "", "status": "queued",
+                "week_status": {w.isoformat(): "queued" for w in weeks}}
+    monkeypatch.setattr(orch, "process_billing_one", fake_one)
+    monkeypatch.setattr(orch, "_write_account_results", lambda *a, **k: {})
+    monkeypatch.setattr(orch, "_slack_notify", lambda m: None)
+    asyncio.run(orch.orchestrate_billing("billing-create", [week], out_dir=tmp_path, log_dir=tmp_path,
+                                         from_active_deals=True))
+    assert seen == ["ok"]
