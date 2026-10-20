@@ -1,0 +1,48 @@
+# 報告シートURL 取引→求人票 (毎日)
+# 取引の customer_sheet_url を、紐付く求人票の customer_sheet_url が空のときだけ写す。
+# 値が違う求人票は書き換えず、件数と求人票IDをログに出す。
+# 求人票の値は応募の customer_sheet_url_synced (計算項目) に流れ、
+# HR_HR の応募の架電画面が報告シートを開くのに使う。
+#
+# 必要 Secrets: HUBSPOT_ACCESS_TOKEN (応募連携・求人デイリーと共通)
+# ほかのワークフローとファイルを分けている (求人デイリー・応募連携は別の人も直すため)。
+
+name: Sheet URL Copy
+
+on:
+  schedule:
+    - cron: "10 17 * * *"   # JST 02:10 (求人取込 01:00 と取引まわり 01:40 の後)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "ドライラン (書込なし)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: sheet-url-copy
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install deps
+        run: pip install requests python-dotenv
+      - name: Copy sheet URL (deal -> listing, empty only)
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          # 定期実行は書き込む。手動は既定でドライラン。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            FLAG="--dry-run"
+          else
+            FLAG="--actual"
+          fi
+          python scripts/job_application_sync/sync_sheet_url.py $FLAG
