@@ -285,3 +285,67 @@ def test_更新値の計画_今と同じ値は書かず_対象外は未転記に
     assert p == {"oubosaki_shokushu": "ドライバー", "moyori_eki": "見本駅",
                  "hubspot_owner_id": "O-1", "kokyakushiitotenkijoukyou": "未転記"}
     # (古い応募なので一次対応の要否は付けない / 人が直した本人希望は守る)
+
+
+class _OrderClient(MigClient):
+    """付ける・外すの順番を記録し、指定した応募者で失敗する。"""
+
+    def __init__(self, fail_on=None, **kw):
+        super().__init__(**kw)
+        self.ops: list = []
+        self.fail_on = fail_on
+
+    def associate_appointment_to_listing(self, appointment_id, listing_id):
+        if appointment_id == self.fail_on:
+            raise RuntimeError("HTTP 500 (test)")
+        self.ops.append(("付ける", appointment_id, listing_id))
+        super().associate_appointment_to_listing(appointment_id, listing_id)
+
+    def remove_appointment_listing(self, appointment_id, listing_id):
+        self.ops.append(("外す", appointment_id, listing_id))
+        super().remove_appointment_listing(appointment_id, listing_id)
+
+
+def _three():
+    recs = _recs(*[_row(messageId=f"m{i}", HubSpot登録="受入済", HubSpot応募者ID=f"A{i}")
+                   for i in (1, 2, 3)])
+    appts = [{"id": f"A{i}", "properties": {}} for i in (1, 2, 3)]
+    return recs, appts
+
+
+def test_付け替えは新しい求人を付けてから古い求人を外す():
+    recs, appts = _three()
+    cli = _OrderClient(appt_listings={"A1": ["L-HR"]}, listings_hr={"11694710": "L-HR"},
+                       listing_deals={"L-HR": ["D1"]})
+    rows = M.build_plan(appts[:1], recs, cli, fetch_page=lambda u: PAGE)
+    stat = M.apply(appts[:1], rows, recs, cli, fetch_page=lambda u: PAGE,
+                   make_listing=rl.create_listing)
+    assert cli.ops == [("付ける", "A1", "L-NEW1"), ("外す", "A1", "L-HR")]
+    assert stat["stopped_at"] == "" and stat["unlinked_old"] == 1
+
+
+def test_付け替えは失敗が1件出たらそこで止め_以降は触らない():
+    recs, appts = _three()
+    cli = _OrderClient(fail_on="A2",
+                       appt_listings={a: ["L-HR"] for a in ("A1", "A2", "A3")},
+                       listings_hr={"11694710": "L-HR"}, listing_deals={"L-HR": ["D1"]})
+    rows = M.build_plan(appts, recs, cli, fetch_page=lambda u: PAGE)
+    stat = M.apply(appts, rows, recs, cli, fetch_page=lambda u: PAGE,
+                   make_listing=rl.create_listing)
+    assert stat["failed"] == 1 and stat["stopped_at"] == "A2"
+    assert [o[1] for o in cli.ops] == ["A1", "A1"]       # A2 は外していない・A3 は触らない
+    assert [u["id"] for u in cli.updated_appts] == ["A1"]
+
+
+def test_作った求人を取引に付けられなければ止める():
+    recs, appts = _three()
+
+    class NoLink(MigClient):
+        def associate_listing_deals(self, listing_id, deal_ids):
+            return 0
+    cli = NoLink(appt_listings={"A1": ["L-HR"]}, listings_hr={"11694710": "L-HR"},
+                 listing_deals={"L-HR": ["D1"]})
+    rows = M.build_plan(appts[:1], recs, cli, fetch_page=lambda u: PAGE)
+    stat = M.apply(appts[:1], rows, recs, cli, fetch_page=lambda u: PAGE,
+                   make_listing=rl.create_listing)
+    assert stat["stopped_at"] == "A1" and cli.associations == [] and cli.removed == []

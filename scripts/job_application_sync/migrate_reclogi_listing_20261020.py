@@ -164,37 +164,59 @@ def backup(appts: list, plan_rows: list, out_dir: Path) -> Path:
 def apply(appts: list, plan_rows: list, recs_by_appt: dict, client,
           fetch_page: Callable[[str], Optional[str]] = None,
           make_listing: Callable = None) -> dict:
-    """付け替えを実行する。backup() の後に呼ぶ。"""
-    stat = {"listing_created": 0, "relinked": 0, "updated": 0, "skipped": 0, "failed": 0}
+    """付け替えを1件ずつ実行する。backup() の後に呼ぶ。
+
+    ★失敗が1件でも出たらそこで止める (stat["stopped_at"] に応募者ID)。止めたあとの
+      応募者は触らないので、原因を直して流し直せばよい (作った求人は次は「既存」になる)。
+    ★新しい求人を先に付けてから古い求人を外す。逆だと、付ける段で失敗したとき
+      応募者がどの求人にも付いていない状態で残る。
+    ★作った求人を取引に付けられなかったときも止める (計画では取引が決まっていたため)。
+    """
+    stat = {"listing_created": 0, "relinked": 0, "unlinked_old": 0, "updated": 0,
+            "skipped": 0, "failed": 0, "stopped_at": ""}
     lid_of: dict = {}
     props_of = {str(o["id"]): o.get("properties") or {} for o in appts}
-    for row in plan_rows:
-        rid = row["reclogi_id"]
-        if row["action"] in ("作成予定",) and rid not in lid_of:
-            rec = recs_by_appt[row["appointment_id"]]
-            prep = rl.prepare_listing(client, rid, rec.get(rl.C_JOB_URL),
-                                      rec.get(rl.C_HR_JOB_ID), rec.get(rl.C_SHOP_ID),
-                                      dry_run=False, fetch_page=fetch_page,
-                                      make_listing=make_listing,
-                                      job_name=rec.get(rl.C_JOB_NAME))
-            lid_of[rid] = prep["listing_id"]
-            stat["listing_created"] += prep["action"] == "作成"
-        elif row["listing_id"]:
-            lid_of.setdefault(rid, row["listing_id"])
+
+    def stop(aid: str, why: str) -> dict:
+        stat["failed"] += 1
+        stat["stopped_at"] = aid
+        print(f"  ★失敗のため停止 応募者={aid}: {why}", flush=True)
+        return stat
+
     for row in plan_rows:
         aid, rid = row["appointment_id"], row["reclogi_id"]
-        lid = lid_of.get(rid) if rid else None
-        if not lid:
+        if row["action"] == "付け替え済み" or not rid:
             stat["skipped"] += 1
             continue
+        rec = recs_by_appt[aid]
         try:
-            for old in row["current_listings"]:
-                if old != lid:
-                    client.remove_appointment_listing(aid, old)
+            if rid not in lid_of:
+                if row["action"] == "作成予定":
+                    prep = rl.prepare_listing(client, rid, rec.get(rl.C_JOB_URL),
+                                              rec.get(rl.C_HR_JOB_ID), rec.get(rl.C_SHOP_ID),
+                                              dry_run=False, fetch_page=fetch_page,
+                                              make_listing=make_listing,
+                                              job_name=rec.get(rl.C_JOB_NAME))
+                    if prep["action"] not in ("作成", "既存") or not prep["listing_id"]:
+                        return stop(aid, f"リクロジ求人を用意できない ({prep['action']})")
+                    lid_of[rid] = prep["listing_id"]
+                    if prep["action"] == "作成":
+                        stat["listing_created"] += 1
+                        if row["deals"] and prep["linked_deals"] == 0:
+                            return stop(aid, f"作った求人 {prep['listing_id']} を取引に付けられない")
+                elif row["listing_id"]:
+                    lid_of[rid] = row["listing_id"]
+                else:
+                    stat["skipped"] += 1
+                    continue
+            lid = lid_of[rid]
             if lid not in row["current_listings"]:
                 client.associate_appointment_to_listing(aid, lid)
                 stat["relinked"] += 1
-            rec = recs_by_appt[aid]
+            for old in row["current_listings"]:
+                if old != lid:
+                    client.remove_appointment_listing(aid, old)
+                    stat["unlinked_old"] += 1
             props = plan_update_props(
                 props_of.get(aid, {}),
                 client.get_oubosaki_props(lid, ai.RECLOGI_MEDIA, "", rid),
@@ -202,9 +224,9 @@ def apply(appts: list, plan_rows: list, recs_by_appt: dict, client,
             if props:
                 client.update_appointment(aid, props)
                 stat["updated"] += 1
+            print(f"  済 応募者={aid} → 求人 {lid} (更新 {len(props)}項目)", flush=True)
         except Exception as e:  # noqa: BLE001
-            stat["failed"] += 1
-            print(f"  ★失敗 応募者={aid}: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            return stop(aid, f"{type(e).__name__}: {str(e)[:160]}")
     return stat
 
 
@@ -247,9 +269,16 @@ def main(argv=None) -> int:
         print("\n(dry-run: HubSpot には書いていません)")
         return 0
     path = backup(appts, rows, Path(a.backup_dir))
-    print(f"\n控え: {path}")
+    # 控えが読み戻せて全対象が入っていることを確かめてから書く
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    if len(saved) != len(appts):
+        print(f"控えの件数が合わない ({len(saved)} / {len(appts)}) → 書かずに終了")
+        return 2
+    print(f"\n控え: {path} ({len(saved)}件)")
     stat = apply(appts, rows, recs_by_appt, client)
     print(f"結果: {stat}")
+    if stat["stopped_at"]:
+        print(f"★応募者 {stat['stopped_at']} で止めました。以降は触っていません")
     return 1 if stat["failed"] else 0
 
 
