@@ -52,19 +52,55 @@ def _values(rows: list, header=HEADER) -> list:
 
 
 class FakeWs:
-    """gspread の worksheet の代わり。get_all_values と batch_update だけ。"""
+    """gspread の worksheet の代わり。
 
-    def __init__(self, values):
+    batch_update は本物 (gspread 6.2.1) と同じく、渡された data の range を
+    「'タブ名'!A1」に書き換える (書いた件数を後から range で数えると外れる)。
+    """
+
+    def __init__(self, values, title="リクロジ応募"):
         self.values = [list(r) for r in values]
+        self.title = title
         self.writes: list = []
 
     def get_all_values(self):
         return [list(r) for r in self.values]
 
+    def row_values(self, n):
+        return list(self.values[n - 1]) if n <= len(self.values) else []
+
+    def col_values(self, n):
+        out = [r[n - 1] if len(r) >= n else "" for r in self.values]
+        while out and not out[-1]:
+            out.pop()
+        return out
+
+    def batch_get(self, ranges):
+        out = []
+        for rng in ranges:
+            v = self._get(rng)
+            out.append([[v]] if v else [])
+        return out
+
+    @staticmethod
+    def _rc(rng):
+        col = "".join(c for c in rng if c.isalpha())
+        row = int("".join(c for c in rng if c.isdigit()))
+        ci = 0
+        for ch in col:
+            ci = ci * 26 + (ord(ch) - 64)
+        return row, ci
+
+    def _get(self, rng):
+        row, ci = self._rc(rng)
+        r = self.values[row - 1] if row <= len(self.values) else []
+        return r[ci - 1] if ci <= len(r) else ""
+
     def batch_update(self, data):
-        self.writes.append(data)
+        self.writes.append([dict(d) for d in data])
         for d in data:
             rng = d["range"]
+            d["range"] = f"'{self.title}'!{rng}"     # 本物と同じ書き換え
             col = "".join(c for c in rng if c.isalpha())
             row = int("".join(c for c in rng if c.isdigit()))
             ci = 0
@@ -201,6 +237,7 @@ def test_求人があれば紐付けて受入済と応募者IDを書く(tmp_path
     cli = FakeClient(listings_hr={"11694710": "L-1"})
     s = _run(ws, cli, ledger=S.Ledger(tmp_path / "l.json"))
     assert s["targets"] == 1 and s["linked"] == 1
+    assert s["written"] == 1      # gspread が range を書き換えても件数を数え損ねない
     assert len(cli.created_appts) == 1
     props = cli.created_appts[0]["properties"]
     assert props["oubobaitaimei"] == "リクロジメディア"

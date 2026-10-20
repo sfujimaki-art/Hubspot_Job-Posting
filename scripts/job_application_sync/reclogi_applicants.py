@@ -469,9 +469,205 @@ def write_back(ws, updates: dict) -> int:
         if appt:
             data.append({"range": f"{aq._col_letter(c_id)}{rec.sheet_row}",
                          "values": [[str(appt)]]})
+    # ★送る前に数える。gspread の batch_update は data の range を「'タブ名'!A1」に
+    #   書き換える (6.2.1 で確認) ので、送った後に range で数えると0になる
+    #   (2026-10-20 本番初回: 実際は17行書けていたのにログは「書き戻し=0行」)。
+    n = sum(1 for d in data if d["range"].startswith(aq._col_letter(c_st)))
     if data:
         al.sheet_retry(ws.batch_update, data)
-    return sum(1 for d in data if d["range"].startswith(aq._col_letter(c_st)))
+    return n
+
+
+# ============================================================================
+# シート1 (現場の作業シート) のリクロジ行: 顧客=応募者ページURL / 担当CS=コンサル担当の姓
+# ============================================================================
+S1_ID_HEADER = "messageId"         # 「messageId（自動転記用・編集しないでください）」等。含む列で引く
+S1_CUSTOMER_HEADER = "顧客"         # 通常は宛先メール。リクロジ行は support@reclogi.jp が入る
+S1_CS_HEADER = "担当CS"
+RECLOGI_SENDER = "support@reclogi.jp"
+APPT_URL_TMPL = "https://app.hubspot.com/contacts/23708633/record/0-421/{}"
+# シート1に行が出てこないまま、受信からこの日数を過ぎたら探すのをやめる
+# (GAS の転記はふつう数分。現場が消した行を永遠に探さない)
+S1_GIVE_UP_DAYS = int(os.environ.get("JAS_RECLOGI_S1_GIVE_UP_DAYS", "3"))
+S1_DONE, S1_GAVE_UP = "done", "gave_up"
+S1_KEYS = ("id", "customer", "cs")
+_MAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def s1_columns(header: list) -> dict:
+    """シート1のヘッダ → {"id"|"customer"|"cs": 列index or None}。位置は見ない。"""
+    cols = {"id": None, "customer": None, "cs": None}
+    for i, h in enumerate(header):
+        k = _norm_header(h)
+        if cols["id"] is None and S1_ID_HEADER.lower() in k.lower():
+            cols["id"] = i
+        elif cols["customer"] is None and k == S1_CUSTOMER_HEADER:
+            cols["customer"] = i
+        elif cols["cs"] is None and k == S1_CS_HEADER:
+            cols["cs"] = i
+    return cols
+
+
+def customer_writable(cur: str) -> bool:
+    """顧客欄に応募者ページURLを書いてよいか: 空か、宛先 (support@reclogi.jp) のままのときだけ。"""
+    v = str(cur or "").strip()
+    if not v:
+        return True
+    if "http" in v.lower():
+        return False
+    return {m.lower() for m in _MAIL_RE.findall(v)} == {RECLOGI_SENDER}
+
+
+def cs_writable(cur: str) -> bool:
+    """担当CS欄は空のときだけ書く (現場が書いた名前を潰さない)。"""
+    return not str(cur or "").strip()
+
+
+def appt_url(appointment_id: str) -> str:
+    return APPT_URL_TMPL.format(appointment_id)
+
+
+def open_sheet1():
+    """同じブックのタブ「シート1」。シートIDが無ければ None。"""
+    sid = os.environ.get("JAS_APPLICANT_QUEUE_SHEET_ID", "") or aq.QUEUE_SHEET_ID
+    if not sid:
+        return None
+    gc = aq._sheets_client()
+    return al.sheet_retry(gc.open_by_key, sid).worksheet(aq.SHEET1_TAB)
+
+
+def _cell(vr) -> str:
+    try:
+        return str(vr[0][0] or "").strip()
+    except (IndexError, TypeError, KeyError):
+        return ""
+
+
+def consultant_last_name(client, listing_id: str) -> str:
+    """求人の今の契約 (latest_live) のコンサル担当の姓。取れなければ空。"""
+    get_c = getattr(client, "get_listing_consultant", None)
+    get_n = getattr(client, "get_owner_last_name", None)
+    if not (listing_id and get_c and get_n):
+        return ""
+    owner = get_c(listing_id, MEDIA, "")
+    return (get_n(owner) or "").strip() if owner else ""
+
+
+def _too_old(received_iso: str, today: str, days: int) -> bool:
+    try:
+        d = datetime.strptime(received_iso, "%Y-%m-%d").date()
+        t = datetime.strptime(today, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return False             # 受信日が読めないものは諦めない
+    return (t - d).days > days
+
+
+def sync_sheet1(ws1, items: list, client, ledger=None, today: str = "") -> dict:
+    """シート1のリクロジ行の 顧客/担当CS を書く。
+
+    items: [{"key", "mid", "appt", "listing", "received"}]
+    - 行は messageId 列だけを読んで引く (シート1は約7万行あるので全体は読まない)
+    - 書く直前に messageId・顧客・担当CS を読み直し、同じ ID のときだけ書く
+      (並べ替え・削除で別の行に書かない)
+    - 行が見つからない: 次の回に再試行。受信から S1_GIVE_UP_DAYS 日を過ぎたら諦める
+    台帳の項目 "s1" に done / gave_up を残す (ledger が None なら残さない)。
+    """
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    out = {"s1_targets": len(items), "s1_rows": 0, "s1_customer": 0, "s1_cs": 0,
+           "s1_waiting": 0, "s1_gave_up": 0}
+    if not items:
+        return out
+
+    def mark(key: str, state: str) -> None:
+        if ledger is None:
+            return
+        e = ledger.data.setdefault(key, {"attempts": 0, "status": "DONE"})
+        e["s1"] = state
+        e["updated"] = datetime.now().isoformat()
+
+    cols = s1_columns(al.sheet_retry(ws1.row_values, 1))
+    if cols["id"] is None or (cols["customer"] is None and cols["cs"] is None):
+        found_cols = {k: v is not None for k, v in cols.items()}
+        plog.public(f"[reclogi] ⚠️ シート1の列が見つからない {found_cols} "
+                    f"→ 顧客/担当CS は書かない (次の回に再試行)")
+        out["s1_waiting"] = len(items)
+        return out
+    for k, name in (("customer", S1_CUSTOMER_HEADER), ("cs", S1_CS_HEADER)):
+        if cols[k] is None:
+            plog.public(f"[reclogi] ⚠️ シート1に「{name}」列が見つからない → その列は書かない")
+    row_of: dict = {}
+    for n, v in enumerate(al.sheet_retry(ws1.col_values, cols["id"] + 1), start=1):
+        v = str(v or "").strip()
+        if n > 1 and v:
+            row_of[v] = n            # 同じIDが2行あれば下 (後から転記された方)
+    found = []
+    for it in items:
+        r = row_of.get(it["mid"])
+        if r:
+            found.append((it, r))
+        elif _too_old(it.get("received", ""), today, S1_GIVE_UP_DAYS):
+            out["s1_gave_up"] += 1
+            mark(it["key"], S1_GAVE_UP)
+            plog.detail("reclogi_s1_gave_up", message_id=it["mid"])
+        else:
+            out["s1_waiting"] += 1   # GAS の転記がまだ。次の回に再試行
+    if not found:
+        return out
+    keys = [k for k in S1_KEYS if cols[k] is not None]
+    L = {k: aq._col_letter(cols[k]) for k in keys}
+    cur = al.sheet_retry(ws1.batch_get, [f"{L[k]}{r}" for _it, r in found for k in keys])
+    data, done = [], []
+    for i, (it, r) in enumerate(found):
+        got = dict(zip(keys, (_cell(v) for v in cur[i * len(keys):(i + 1) * len(keys)])))
+        if got.get("id") != it["mid"]:
+            out["s1_waiting"] += 1   # 読んでから並べ替えられた。次の回に引き直す
+            continue
+        if "customer" in L and customer_writable(got.get("customer", "")):
+            data.append({"range": f"{L['customer']}{r}", "values": [[appt_url(it["appt"])]]})
+            out["s1_customer"] += 1
+        if "cs" in L and cs_writable(got.get("cs", "")):
+            listing = it.get("listing") or ""
+            if not listing and hasattr(client, "get_appointment_listing"):
+                listing = client.get_appointment_listing(it["appt"]) or ""
+            name = consultant_last_name(client, listing)
+            if name:
+                data.append({"range": f"{L['cs']}{r}", "values": [[name]]})
+                out["s1_cs"] += 1
+        done.append(it["key"])
+    if data:
+        al.sheet_retry(ws1.batch_update, data)
+    for key in done:
+        mark(key, S1_DONE)
+    out["s1_rows"] = len(done)
+    return out
+
+
+def s1_items(recs: list, ledger, fresh: dict) -> list:
+    """シート1に書く対象。応募者IDがあり (受入済/求人未特定)、台帳でシート1が未済の行。
+
+    fresh: この回に作った {台帳の鍵: (応募者ID, 求人ID)}。タブはこの回の書き戻し前に
+    読んだものなので、この回の分は fresh から取る。
+    """
+    items = []
+    for rec in recs:
+        mid = rec.get(C_MESSAGE_ID)
+        if not (rec.key and mid):
+            continue
+        e = (ledger.data.get(rec.key) or {}) if ledger is not None else {}
+        if e.get("s1") in (S1_DONE, S1_GAVE_UP):
+            continue
+        is_fresh = rec.key in fresh
+        appt, listing = fresh.get(rec.key, ("", ""))
+        status = ST_DONE if is_fresh else (rec.get(C_STATUS) or e.get("sheet_status", ""))
+        appt = appt or rec.get(C_APPT_ID) or e.get("appointment_id", "")
+        if not appt or status not in (ST_DONE, ST_UNLINKED):
+            continue
+        items.append({"key": rec.key, "mid": mid, "appt": str(appt),
+                      "listing": listing or e.get("listing_id", ""),
+                      # この回に作ったものは諦めの判定に掛けない
+                      "received": "" if is_fresh else
+                      (_iso_date(rec.get(C_RECEIVED)) or _iso_date(rec.get(C_APPLIED_AT)))})
+    return items
 
 
 # ============================================================================
@@ -490,14 +686,18 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
         notify: Optional[Callable[[str], object]] = None,
         ws=None, client=None,
         fetch_page: Callable[[str], Optional[str]] = fetch_job_page,
-        make_listing: Callable[[dict], Optional[str]] = create_listing) -> dict:
+        make_listing: Callable[[dict], Optional[str]] = create_listing,
+        ws1=None) -> dict:
     """タブ「リクロジ応募」の未処理行を取り込む。summary を返す。
 
     ledger: applicant_sync の台帳。鍵は "RL-<messageId>"。
       - 書き戻しに失敗しても二重に取り込まない (DONE は飛ばし、書き戻しだけやり直す)
       - HubSpot のエラーは max_attempts 回まで空欄のまま再試行し、超えたら「エラー: …」を書く
-    ws / client / fetch_page / make_listing はテスト用の差し替え口。
+    応募者ができた行は、同じ回にシート1の 顧客/担当CS も書く (sync_sheet1)。
+    ws / client / fetch_page / make_listing / ws1 はテスト用の差し替え口
+    (ws を渡して ws1 を渡さないときはシート1を触らない)。
     """
+    use_s1 = ws is None or ws1 is not None
     s = {"rows": 0, "targets": 0, "linked": 0, "unlinked": 0, "dup": 0, "error": 0,
          "gave_up": 0, "listing_found": 0, "listing_created": 0, "listing_create_failed": 0,
          "page_unavailable": 0, "rewrite": 0, "written": 0, "dry_run": dry_run}
@@ -528,7 +728,8 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
             continue
         targets.append(rec)
     s["targets"] = len(targets)
-    if not targets and not updates:
+    s1_pending = s1_items(recs, ledger, {}) if use_s1 else []
+    if not targets and not updates and not s1_pending:
         plog.public(f"[reclogi] 未処理なし (行={s['rows']})")
         return s
 
@@ -574,12 +775,13 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
     if dry_run:
         plog.public(f"[reclogi] dry-run: 対象={s['targets']} 求人あり={s['listing_found']} "
                     f"求人を作る予定={s['listing_created']} ページなし={s['page_unavailable']} "
-                    f"(HubSpot・シートには書かない)")
+                    f"シート1待ち={len(s1_pending)} (HubSpot・シートには書かない)")
         return s
 
     # 2. 応募者: applicant_import の流れをそのまま通す
-    results = ai.run_import(rows, _KnownListings(client, known))
+    results = ai.run_import(rows, _KnownListings(client, known)) if rows else []
     failed_rows = []
+    fresh: dict = {}
     for rec, res in zip(targets, results):
         st = _status_of(res)
         if st is not None:
@@ -587,8 +789,11 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
               "dup" if res.status == "skip_duplicate" else "unlinked"] += 1
             if ledger is not None:
                 ledger.mark(rec.key, "DONE")
-                ledger.data[rec.key].update(sheet_status=st[0], appointment_id=st[1])
+                ledger.data[rec.key].update(sheet_status=st[0], appointment_id=st[1],
+                                            listing_id=res.listing_id or "")
             updates[rec.key] = st
+            if st[1]:
+                fresh[rec.key] = (st[1], res.listing_id or "")
             continue
         s["error"] += 1
         msg = (res.message or "不明なエラー")[:200]
@@ -609,6 +814,20 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
     except Exception as e:  # noqa: BLE001
         plog.public(f"[reclogi] ⚠️ シートへの書き戻し失敗 (次の回にやり直す): "
                     f"{type(e).__name__}: {str(e)[:120]}")
+    # 4. シート1の 顧客/担当CS (失敗しても次の回にやり直す。本線は止めない)
+    if use_s1:
+        try:
+            items = s1_items(recs, ledger, fresh)
+            w1 = (ws1 if ws1 is not None else open_sheet1()) if items else None
+            if w1 is not None:
+                s.update(sync_sheet1(w1, items, client, ledger))
+        except Exception as e:  # noqa: BLE001
+            plog.public(f"[reclogi] ⚠️ シート1への書き込み失敗 (次の回にやり直す): "
+                        f"{type(e).__name__}: {str(e)[:120]}")
+        if s.get("s1_targets"):
+            plog.public(f"[reclogi] シート1: 対象={s['s1_targets']} 書いた行={s['s1_rows']} "
+                        f"(顧客={s['s1_customer']} 担当CS={s['s1_cs']}) "
+                        f"転記待ち={s['s1_waiting']} 諦め={s['s1_gave_up']}")
     plog.public(f"[reclogi] 対象={s['targets']} 紐付け={s['linked']} 求人未特定={s['unlinked']} "
                 f"重複={s['dup']} エラー={s['error']} (諦め={s['gave_up']}) / "
                 f"求人あり={s['listing_found']} 作成={s['listing_created']} "

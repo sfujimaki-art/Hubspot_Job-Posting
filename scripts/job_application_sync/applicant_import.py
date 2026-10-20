@@ -89,9 +89,11 @@ except ImportError:  # pragma: no cover — CIはスクリプト直実行
 
 DELIVERY_PIPELINE = "21596025"   # 納品管理PL
 # 取引から読む項目: 今の契約の属性 + 並べ替えの根拠 + 一次対応8項目(暗黙知)
+# consultant (コンサル担当・OWNER参照) はリクロジ行のシート1「担当CS」に使う (2026-10-20)
 DEAL_READ_PROPS = (["dealname", "contract_plan", "service1", "itijitaiou",
                     "dealstage", "pipeline", "contract_start_date", "createdate",
-                    DM.PROP_CODE, "hrhacker_shop_ids"] + list(DM.ANMOKUCHI_PROPS))
+                    DM.PROP_CODE, "hrhacker_shop_ids", "consultant"]
+                   + list(DM.ANMOKUCHI_PROPS))
 
 
 def deal_current_props(deal_ids: list, deals: dict) -> dict:
@@ -822,25 +824,78 @@ class RealHubSpotClient:
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
         # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
         # + 一次対応8項目(暗黙知)。取引群は1回だけ解決して両方に使う。
+        ids, deals = self._listing_deal_group(lp, listing_id, media, login_id)
+        props.update(deal_current_props(ids, deals))
+        props.update(anmokuchi_transfer_props(ids, deals))
+        return props
+
+    def _listing_deal_group(self, lp: dict, listing_id: str, media: str,
+                            login_id: str) -> tuple:
+        """求人の「今の契約」を選ぶ元になる取引群 → (取引ID一覧, {id: props})。
+        決められないときは ([], {})。応募へ取引名を写すときとシート1の担当CSで共用。"""
         # ★求人に持ち主コードが判定済み (resolve_listing_owner・2026-10-05) なら、
         #   そのコードの取引群を使う。店舗IDの共有は関係ない。
         owner = (lp.get(DM.LISTING_OWNER) or "").strip()
         if owner:
             deals = self._deals_by_code(owner)
-            props.update(deal_current_props(list(deals), deals))
-            props.update(anmokuchi_transfer_props(list(deals), deals))
-            return props
+            return list(deals), deals
         # ★店舗IDを別会社と共有している求人は、どの会社の契約か決まらない。
         #   別会社の取引名・要否・一次対応の条件を入れるより、空で人に回す。
         if self._shop_is_shared(lp.get("id_shop_hrhakkaa")):
-            return props
+            return [], {}
         ids, deals = self._resolve_deal_group(listing_id, media, login_id)
         if DM.spans_codes(ids, deals):
             # 別会社の取引に同時に紐付いている / 管理用メールを別会社と共有
-            return props
-        props.update(deal_current_props(ids, deals))
-        props.update(anmokuchi_transfer_props(ids, deals))
-        return props
+            return [], {}
+        return ids, deals
+
+    def get_listing_consultant(self, listing_id: str, media: str = "",
+                               login_id: str = "") -> Optional[str]:
+        """求人の「今の契約」(応募へ取引名を写すのと同じ latest_live) のコンサル担当 (owner ID)。
+        決まらない・空・取得失敗は None。"""
+        try:
+            lp = self._requests.get(
+                f"{self.BASE}/crm/v3/objects/0-420/{listing_id}"
+                f"?properties=id_shop_hrhakkaa,{DM.LISTING_OWNER}",
+                headers=self.headers, timeout=20).json().get("properties") or {}
+        except Exception:  # noqa: BLE001
+            return None
+        ids, deals = self._listing_deal_group(lp, listing_id, media, login_id)
+        did = DM.latest_live(ids, deals)
+        return (str(deals[did].get("consultant") or "").strip() or None) if did else None
+
+    def get_owner_last_name(self, owner_id: str) -> Optional[str]:
+        """owner の姓。同じ owner は1実行1回だけ引く。無効化されたユーザーも引く。取れなければ None。"""
+        cache = self.__dict__.setdefault("_owner_last", {})
+        oid = str(owner_id or "").strip()
+        if not oid:
+            return None
+        if oid not in cache:
+            cache[oid] = None
+            for archived in ("false", "true"):
+                try:
+                    r = self._requests.get(
+                        f"{self.BASE}/crm/v3/owners/{oid}?idProperty=id&archived={archived}",
+                        headers=self.headers, timeout=20)
+                except Exception:  # noqa: BLE001
+                    break
+                if r.status_code == 200:
+                    cache[oid] = str(r.json().get("lastName") or "").strip() or None
+                    break
+                if r.status_code != 404:
+                    break
+        return cache[oid]
+
+    def get_appointment_listing(self, appointment_id: str) -> Optional[str]:
+        """応募者に紐付く求人 (先頭1件)。無い・取得失敗は None。"""
+        try:
+            a = self._requests.get(
+                f"{self.BASE}/crm/v4/objects/0-421/{appointment_id}/associations/0-420",
+                headers=self.headers, timeout=20).json().get("results", [])
+        except Exception:  # noqa: BLE001
+            return None
+        ids = sorted(str(x.get("toObjectId")) for x in a if x.get("toObjectId"))
+        return ids[0] if ids else None
 
     def copy_listing_note(self, listing_id: str,
                           appointment_id: str) -> Optional[str]:
