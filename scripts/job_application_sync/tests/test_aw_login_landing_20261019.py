@@ -58,10 +58,10 @@ class _LoginPage:
     async def wait_for_load_state(self, *a, **k):
         pass
 
-    async def wait_for_url(self, pred, timeout):
+    async def wait_for_url(self, pred, timeout, wait_until="load"):
         self.url = self.end_url
-        self.waited = timeout
-        if not pred(self.url):
+        self.waited = (timeout, wait_until)
+        if not pred(self.url) or getattr(self, "slow_load", False):
             raise TimeoutError("45 s")
 
 
@@ -191,3 +191,11 @@ def test_応募者一覧でログイン選択に飛ばされたら1回だけロ�
                                            storage_state_path=sp))
     # 保存セッションで 1 回、捨ててからもう 1 回 (2 回目はセッションのファイルが無い)
     assert calls == [True, False]
+
+
+def test_管理画面に着いていれば読み込みが遅くても成功(_no_form):
+    """2026-10-20 笠岡***: last_url が dashboards なのに「管理画面に入れません」で失敗していた。"""
+    page = _LoginPage(f"{AW}/dashboards")
+    page.slow_load = True
+    ctx, got = asyncio.run(awf.establish_aw_session(_Browser(page), "id", "pw"))
+    assert got is page and page.waited == (45000, "commit")

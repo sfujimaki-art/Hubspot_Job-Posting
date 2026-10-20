@@ -372,11 +372,14 @@ async def establish_aw_session(
     # (2026-10-19: 毎晩の 38 社が 1 社 45 秒ずつ待っていた)。
     err: Optional[Exception] = None
     try:
+        # wait_until="commit": 管理画面の読み込み (load) の完了までは待たない。
+        # (2026-10-20 笠岡***: dashboards に着いていたのに load が 45 秒で終わらず失敗にしていた)
         await page.wait_for_url(
-            lambda u: _is_authenticated_url(u) or _login_stop_url(u), timeout=45000)
+            lambda u: _is_authenticated_url(u) or _login_stop_url(u), timeout=45000,
+            wait_until="commit")
     except Exception as e:  # noqa: BLE001
         err = e
-    if err is not None or not _is_authenticated_url(page.url):
+    if not _is_authenticated_url(page.url):
         if output_dir:
             await _dump_debug(page, output_dir, "login_failed")
         raise RuntimeError(
