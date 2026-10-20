@@ -489,7 +489,8 @@ APPT_URL_TMPL = "https://app.hubspot.com/contacts/23708633/record/0-421/{}"
 # シート1に行が出てこないまま、受信からこの日数を過ぎたら探すのをやめる
 # (GAS の転記はふつう数分。現場が消した行を永遠に探さない)
 S1_GIVE_UP_DAYS = int(os.environ.get("JAS_RECLOGI_S1_GIVE_UP_DAYS", "3"))
-S1_DONE, S1_GAVE_UP = "done", "gave_up"
+# partial = 顧客は済んだが担当CSの姓が取れなかった。担当CSだけ次の回にやり直す
+S1_DONE, S1_GAVE_UP, S1_PARTIAL = "done", "gave_up", "partial"
 S1_KEYS = ("id", "customer", "cs")
 _MAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
@@ -505,6 +506,58 @@ def s1_columns(header: list) -> dict:
             cols["customer"] = i
         elif cols["cs"] is None and k == S1_CS_HEADER:
             cols["cs"] = i
+    return cols
+
+
+_MSGID_RE = re.compile(r"^[0-9a-f]{16}$")
+S1_SAMPLE_ROWS = 3000        # 中身で列を決めるときに見る末尾の行数
+S1_SAMPLE_MIN = 3            # 値がこれより少ない列は候補にしない
+S1_MIN_WIDTH = 27            # 見出しが短くても AA 列までは候補にする
+
+
+def msgid_column_by_content(block: list, skip: set = frozenset()) -> tuple:
+    """末尾の行の値 → (messageId の列index or None, 候補の列index一覧)。
+
+    値の過半が 16桁の16進 (Gmail の messageId) の列。候補が2列以上なら決めない。
+    """
+    width = max((len(r) for r in block), default=0)
+    cands = []
+    for ci in range(width):
+        if ci in skip:
+            continue
+        vals = [str(r[ci]).strip() for r in block if len(r) > ci and str(r[ci]).strip()]
+        if len(vals) >= S1_SAMPLE_MIN and \
+                sum(1 for v in vals if _MSGID_RE.match(v)) * 2 > len(vals):
+            cands.append(ci)
+    return (cands[0] if len(cands) == 1 else None), cands
+
+
+def resolve_s1_columns(ws1) -> dict:
+    """シート1の列。messageId は (a) 見出しに messageId を含む列、(b) 無ければ中身で引く。
+
+    ★(b) が要る理由 (2026-10-20 実測): AA1 に見出しが無く、データ行の値
+      (16桁の16進) が入っていた。現場の並べ替え等で見出しセルが動いたとみられ、
+      GAS は AA1 が空のときしか見出しを書かないので自然には直らない。
+      applicant_queue._resolve_s1_columns と同じく、見出しは手がかりに留める。
+    """
+    header = al.sheet_retry(ws1.row_values, 1)
+    cols = s1_columns(header)
+    if cols["id"] is not None:
+        return cols
+    width = max(len(header), S1_MIN_WIDTH)
+    # データの最終行: A列 (件名) と顧客列の長い方 (片方の末尾が空でも取りこぼさない)
+    anchors = sorted({0} | ({cols["customer"]} if cols["customer"] is not None else set()))
+    last = max(len(al.sheet_retry(ws1.col_values, c + 1)) for c in anchors)
+    if last < 2:
+        return cols
+    start = max(2, last - S1_SAMPLE_ROWS + 1)
+    block = al.sheet_retry(ws1.get, f"A{start}:{aq._col_letter(width - 1)}{last}")
+    skip = {v for k, v in cols.items() if v is not None}
+    ci, cands = msgid_column_by_content(block, skip)
+    if ci is None and len(cands) > 1:
+        plog.public(f"[reclogi] ⚠️ シート1の messageId 列の候補が複数 "
+                    f"{[aq._col_letter(c) for c in cands]} → 書かない")
+    cols["id"] = ci
     return cols
 
 
@@ -574,7 +627,7 @@ def sync_sheet1(ws1, items: list, client, ledger=None, today: str = "") -> dict:
     """
     today = today or datetime.now().strftime("%Y-%m-%d")
     out = {"s1_targets": len(items), "s1_rows": 0, "s1_customer": 0, "s1_cs": 0,
-           "s1_waiting": 0, "s1_gave_up": 0}
+           "s1_waiting": 0, "s1_gave_up": 0, "s1_partial": 0}
     if not items:
         return out
 
@@ -585,7 +638,7 @@ def sync_sheet1(ws1, items: list, client, ledger=None, today: str = "") -> dict:
         e["s1"] = state
         e["updated"] = datetime.now().isoformat()
 
-    cols = s1_columns(al.sheet_retry(ws1.row_values, 1))
+    cols = resolve_s1_columns(ws1)
     if cols["id"] is None or (cols["customer"] is None and cols["cs"] is None):
         found_cols = {k: v is not None for k, v in cols.items()}
         plog.public(f"[reclogi] ⚠️ シート1の列が見つからない {found_cols} "
@@ -616,7 +669,7 @@ def sync_sheet1(ws1, items: list, client, ledger=None, today: str = "") -> dict:
     keys = [k for k in S1_KEYS if cols[k] is not None]
     L = {k: aq._col_letter(cols[k]) for k in keys}
     cur = al.sheet_retry(ws1.batch_get, [f"{L[k]}{r}" for _it, r in found for k in keys])
-    data, done = [], []
+    data, states = [], {}
     for i, (it, r) in enumerate(found):
         got = dict(zip(keys, (_cell(v) for v in cur[i * len(keys):(i + 1) * len(keys)])))
         if got.get("id") != it["mid"]:
@@ -633,12 +686,21 @@ def sync_sheet1(ws1, items: list, client, ledger=None, today: str = "") -> dict:
             if name:
                 data.append({"range": f"{L['cs']}{r}", "values": [[name]]})
                 out["s1_cs"] += 1
-        done.append(it["key"])
+            elif _too_old(it.get("received", ""), today, S1_GIVE_UP_DAYS):
+                states[it["key"]] = S1_GAVE_UP
+                out["s1_gave_up"] += 1
+                continue
+            else:
+                # 姓が取れない (取引がまだ求人に付いていない・一時エラー)。担当CSだけ次の回に
+                states[it["key"]] = S1_PARTIAL
+                out["s1_partial"] += 1
+                continue
+        states[it["key"]] = S1_DONE
     if data:
         al.sheet_retry(ws1.batch_update, data)
-    for key in done:
-        mark(key, S1_DONE)
-    out["s1_rows"] = len(done)
+    for key, state in states.items():
+        mark(key, state)
+    out["s1_rows"] = sum(1 for v in states.values() if v != S1_GAVE_UP)
     return out
 
 
@@ -827,7 +889,7 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
         if s.get("s1_targets"):
             plog.public(f"[reclogi] シート1: 対象={s['s1_targets']} 書いた行={s['s1_rows']} "
                         f"(顧客={s['s1_customer']} 担当CS={s['s1_cs']}) "
-                        f"転記待ち={s['s1_waiting']} 諦め={s['s1_gave_up']}")
+                        f"担当CS待ち={s.get('s1_partial', 0)} 転記待ち={s['s1_waiting']} 諦め={s['s1_gave_up']}")
     plog.public(f"[reclogi] 対象={s['targets']} 紐付け={s['linked']} 求人未特定={s['unlinked']} "
                 f"重複={s['dup']} エラー={s['error']} (諦め={s['gave_up']}) / "
                 f"求人あり={s['listing_found']} 作成={s['listing_created']} "

@@ -75,6 +75,18 @@ class FakeWs:
             out.pop()
         return out
 
+    def get(self, rng):
+        """'A2:AA10' の範囲 (行ごとに末尾の空は詰める・本物と同じ)。"""
+        a, b = rng.split(":")
+        (r1, c1), (r2, c2) = self._rc(a), self._rc(b)
+        out = []
+        for r in self.values[r1 - 1:r2]:
+            row = list(r[c1 - 1:c2])
+            while row and not str(row[-1]).strip():
+                row.pop()
+            out.append(row)
+        return out
+
     def batch_get(self, ranges):
         out = []
         for rng in ranges:
