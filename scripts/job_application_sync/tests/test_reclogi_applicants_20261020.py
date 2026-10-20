@@ -33,7 +33,7 @@ def _row(**over) -> dict:
     v.update({
         "messageId": "msg-0001", "受信日時": "2026-10-14 12:55", "応募ID": "A-0001",
         "応募日時": "2026-10-14 12:54", "応募企業名": "株式会社サンプル運輸",
-        "HRハッカー求人ID": "11694710", "店舗id": "1154643",
+        "応募求人ID": "10756", "HRハッカー求人ID": "11694710", "店舗id": "1154643",
         "掲載求人URL": "https://reclogi.jp/job-data/10756",
         "姓": "見本", "名": "太郎", "姓（カナ）": "ミホン", "名（カナ）": "タロウ",
         "性別": "男性", "生年月日": "1990-07-27", "年齢": "",
@@ -134,7 +134,7 @@ def test_行をApplicantRowに変換する():
     _, recs = rl.records_from_values(_values([_row()]))
     a = rl.to_applicant_row(recs[0])
     assert a.media == "リクロジメディア"
-    assert a.media_job_id == "11694710"
+    assert a.media_job_id == "10756"               # リクロジ求人ID
     assert a.name == "見本 太郎" and a.kana == "ミホン タロウ"
     assert a.phone == "08000000000"
     assert a.email == "taro.sample@example.com"
@@ -145,7 +145,8 @@ def test_行をApplicantRowに変換する():
     assert a.addr_rest == "見本町 1-2-3 サンプルハイツ101"
     assert a.extra == {"hoyuushikaku": "普通自動車免許", "jikopr": "ダミーの自己PR",
                        "oubodouki": "ダミーの志望動機",
-                       "oubosaki_kyuujin_url": "https://reclogi.jp/job-data/10756"}
+                       "oubosaki_kyuujin_url": "https://reclogi.jp/job-data/10756",
+                       "reclogi_oubo_id": "A-0001", "honnin_kibou_kinyuuran": "ダミーの希望"}
 
 
 def test_列の順番が変わっても列を足されても同じ結果():
@@ -202,22 +203,47 @@ def test_求人IDの欄が無いページは読めない扱い():
     assert rl.parse_job_page("<html><body>この求人の掲載は終了しました</body></html>")["hr_job_id"] == ""
 
 
-def test_作る求人はHRハッカー取込と同じキーで_CSV検出とステータスは付けない():
+def test_リクロジの求人はid_reclogiで作り_HRの鍵は入れない():
     p = rl.build_listing_props(rl.parse_job_page(FIXTURE.read_text(encoding="utf-8")),
-                               "https://reclogi.jp/job-data/10756",
-                               "2026-10-20", "2026-10-20T00:00:00Z")
-    assert p["id_hrhakkaa"] == "11694710"            # HRハッカー取込の upsert キー
-    assert p["id_shop_hrhakkaa"] == "1154643"        # 取引への紐付けキー
-    assert p["url_hrhakkaa"].endswith("/11694710")
-    assert p["hs_name"] == "大型ドライバー"
-    assert p["shuyoushukkoubaitai"] == "HRハッカー" and p["kanri_kubun"] == "弊社管理"
-    assert p["torikomi_riyuu"] == "リクロジ応募から作成"
-    for k in ("saishuu_csv_kenshutsu_bi", "konkai_csv_kenshutsu_flag",
-              "kyuujin_status", "hs_pipeline_stage", "baitai_genjoukyou_hrhakkaa"):
-        assert k not in p
-    assert p["zhizhong"] == "大型ドライバー" and p["qinwude"] == "新潟県長岡市"
+                               "https://reclogi.jp/job-data/10756", "2026-10-20T00:00:00Z")
+    assert p["id_reclogi"] == "10756"
+    assert p["url_reclogi"] == "https://reclogi.jp/job-data/10756"
+    assert p["reclogi_moto_hr_kyuujin_id"] == "11694710"     # 参考用
+    assert p["baitai_genjoukyou_reclogi"] == "掲載中"
+    for k in ("id_hrhakkaa", "id_shop_hrhakkaa", "url_hrhakkaa",
+              "saishuu_csv_kenshutsu_bi", "konkai_csv_kenshutsu_flag",
+              "baitai_genjoukyou_hrhakkaa", "shuyoushukkoubaitai"):
+        assert k not in p, k            # HR取込・持ち主判定・夜間紐付けに拾わせない
+    assert p["kyuujin_status"] == "公開中"
+    from scripts.job_application_sync import listing_stage
+    assert p["hs_pipeline"] == listing_stage.PIPELINE_ID          # HR の求人と同じ
+    assert p["hs_pipeline_stage"] == listing_stage.STAGE_BOSHUU
+    assert p["hs_name"] == "大型ドライバー" and p["zhizhong"] == "大型ドライバー"
+    assert p["shigotonaiyou"].startswith("大型トラック")
+    assert p["qinwude"] == "新潟県長岡市" and p["kinmujikan"].startswith("14:00")
     assert p["todoufuken"] == "新潟県" and p["shikuchouson"] == "長岡市"
-    assert p["kyuuyokeitai"] == "月給" and p["kyuujitsu"].startswith("・年間休日")
+    assert p["guyongxingtai"] == "full_time" and p["kyuuyokeitai"] == "月給"
+    assert p["hissushikaku_shousai"].startswith("【必須条件】")
+    assert "nianshouxiaxian" not in p                   # 月給から年収は計算しない
+    assert p["kanri_kubun"] == "弊社管理" and p["torikomi_riyuu"] == "リクロジ応募から作成"
+    assert p["douki_moto_filename"] == "https://reclogi.jp/job-data/10756"
+    assert p["doukisaishuujikoku"] == "2026-10-20T00:00:00Z"
+
+
+def test_年収は単位が年のときだけ入れる_知らない雇用形態は書かない():
+    parsed = dict(rl.parse_job_page(FIXTURE.read_text(encoding="utf-8")),
+                  salary_unit="YEAR", salary_min="3000000", salary_max="4000000",
+                  employment="嘱託", salary_type="出来高")
+    p = rl.build_listing_props(parsed, "https://reclogi.jp/job-data/10756")
+    assert (p["nianshouxiaxian"], p["nianshoushangxian"]) == ("3000000", "4000000")
+    assert "guyongxingtai" not in p and "kyuuyokeitai" not in p
+
+
+def test_主要出稿媒体は定数が決まるまで書かない(monkeypatch):
+    parsed = rl.parse_job_page(FIXTURE.read_text(encoding="utf-8"))
+    assert "shuyoushukkoubaitai" not in rl.build_listing_props(parsed, "u")
+    monkeypatch.setattr(rl, "RECLOGI_SHUYOU_BAITAI", "リクロジ")
+    assert rl.build_listing_props(parsed, "u")["shuyoushukkoubaitai"] == "リクロジ"
 
 
 def test_取得するのはリクロジの求人URLだけ(monkeypatch):
@@ -229,15 +255,51 @@ def test_取得するのはリクロジの求人URLだけ(monkeypatch):
 
 # ---------------------------------------------------------------- run (シート+HubSpot)
 class FakeClient(ai.DryRunClient):
-    def __init__(self, **kw):
+    """DryRunClient + リクロジの求人まわりの読み書き (記録だけ)。"""
+
+    def __init__(self, listings_reclogi=None, listing_deals=None, listing_props=None,
+                 shop_deals=None, code_deals=None, inactive=(), **kw):
         super().__init__(**kw)
-        self.known_props = {"hoyuushikaku", "jikopr", "oubodouki", "oubosaki_kyuujin_url"}
+        self.known_props = {"hoyuushikaku", "jikopr", "oubodouki", "oubosaki_kyuujin_url",
+                            "reclogi_oubo_id", "reclogi_oubo_page_url",
+                            "honnin_kibou_kinyuuran", "moyori_eki"}
+        self.listings_reclogi = dict(listings_reclogi or {})
+        self.listing_deals = listing_deals or {}
+        self.listing_props = listing_props or {}
+        self.shop_deals = shop_deals or {}
+        self.code_deals = code_deals or {}
+        self.inactive = set(inactive)
+        self.created_listings: list = []
+        self.deal_links: list = []
+
+    def read_listing(self, listing_id, properties):
+        return self.listing_props.get(listing_id, {})
+
+    def get_listing_deals(self, listing_id):
+        return list(self.listing_deals.get(listing_id, []))
+
+    def deals_with_shop(self, shop_id):
+        return dict(self.shop_deals.get(shop_id, {}))
+
+    def deals_by_code(self, code):
+        return dict(self.code_deals.get(code, {}))
+
+    def owner_is_active(self, owner_id):
+        return owner_id not in self.inactive
+
+    def create_listing(self, properties):
+        self.created_listings.append(properties)
+        return f"L-NEW{len(self.created_listings)}"
+
+    def associate_listing_deals(self, listing_id, deal_ids):
+        self.deal_links.append((listing_id, list(deal_ids)))
+        return len(deal_ids)
 
 
 def _run(ws, client, ledger=None, dry_run=False, page=None, made=None, **kw):
     made = made if made is not None else []
 
-    def make_listing(props):
+    def make_listing(client, props):
         made.append(props)
         return "L-NEW"
     return rl.run(dry_run=dry_run, ledger=ledger, ws=ws, client=client,
@@ -246,14 +308,16 @@ def _run(ws, client, ledger=None, dry_run=False, page=None, made=None, **kw):
 
 def test_求人があれば紐付けて受入済と応募者IDを書く(tmp_path):
     ws = FakeWs(_values([_row(), _row(messageId="msg-0002", HubSpot登録="対象外")]))
-    cli = FakeClient(listings_hr={"11694710": "L-1"})
+    cli = FakeClient(listings_reclogi={"10756": "L-1"})
     s = _run(ws, cli, ledger=S.Ledger(tmp_path / "l.json"))
     assert s["targets"] == 1 and s["linked"] == 1
     assert s["written"] == 1      # gspread が range を書き換えても件数を数え損ねない
     assert len(cli.created_appts) == 1
     props = cli.created_appts[0]["properties"]
     assert props["oubobaitaimei"] == "リクロジメディア"
-    assert props["oubokyuujinmemo"] == "11694710"
+    assert props["oubokyuujinmemo"] == "10756"         # リクロジ求人ID
+    assert props["yingmujinglu"] == ai.RECLOGI_YINGMUJINGLU
+    assert props["reclogi_oubo_id"] == "A-0001"
     assert props["oubosaki_kyuujin_url"] == "https://reclogi.jp/job-data/10756"
     assert props["jikopr"] == "ダミーの自己PR"
     assert cli.associations == [{"appointment_id": cli.created_appts[0]["id"],
@@ -270,7 +334,7 @@ def test_求人が無ければページから作って紐付ける(tmp_path):
     s = _run(ws, cli, ledger=S.Ledger(tmp_path / "l.json"),
              page=FIXTURE.read_text(encoding="utf-8"), made=made)
     assert s["listing_created"] == 1 and s["linked"] == 1
-    assert made[0]["id_hrhakkaa"] == "11694710"
+    assert made[0]["id_reclogi"] == "10756" and "id_hrhakkaa" not in made[0]
     # 作った直後は検索に出ないので、作ったIDをそのまま使う
     assert cli.associations[0]["listing_id"] == "L-NEW"
     assert ws.cell(2, "HubSpot登録") == "受入済"
@@ -327,11 +391,11 @@ def test_エラーは上限まで空欄のまま再試行し_超えたらエラ�
     ledger = S.Ledger(tmp_path / "l.json")
     sent: list = []
     for i in range(2):
-        s = _run(ws, _ErrClient(listings_hr={"11694710": "L-1"}), ledger=ledger,
+        s = _run(ws, _ErrClient(listings_reclogi={"10756": "L-1"}), ledger=ledger,
                  max_attempts=3, notify=sent.append)
         assert s["error"] == 1 and s["gave_up"] == 0
         assert ws.cell(2, "HubSpot登録") == "" and sent == []
-    s = _run(ws, _ErrClient(listings_hr={"11694710": "L-1"}), ledger=ledger,
+    s = _run(ws, _ErrClient(listings_reclogi={"10756": "L-1"}), ledger=ledger,
              max_attempts=3, notify=sent.append)
     assert s["gave_up"] == 1
     assert ws.cell(2, "HubSpot登録").startswith("エラー: RuntimeError")
@@ -346,11 +410,11 @@ class _FailWriteWs(FakeWs):
 def test_書き戻しに失敗しても二重に取り込まず_次の回に書き戻しだけやり直す(tmp_path):
     ledger = S.Ledger(tmp_path / "l.json")
     bad = _FailWriteWs(_values([_row()]))
-    cli = FakeClient(listings_hr={"11694710": "L-1"})
+    cli = FakeClient(listings_reclogi={"10756": "L-1"})
     s = _run(bad, cli, ledger=ledger)
     assert s["linked"] == 1 and s["written"] == 0 and len(cli.created_appts) == 1
     good = FakeWs(bad.values)
-    cli2 = FakeClient(listings_hr={"11694710": "L-1"})
+    cli2 = FakeClient(listings_reclogi={"10756": "L-1"})
     s2 = _run(good, cli2, ledger=ledger)
     assert s2["targets"] == 0 and s2["rewrite"] == 1 and cli2.created_appts == []
     assert good.cell(2, "HubSpot登録") == "受入済"
@@ -359,7 +423,7 @@ def test_書き戻しに失敗しても二重に取り込まず_次の回に書�
 
 def test_書き戻しは書く直前にmessageIdで行を引き直す(tmp_path):
     ws = FakeWs(_values([_row(messageId="msg-x", HubSpot登録="対象外"), _row()]))
-    cli = FakeClient(listings_hr={"11694710": "L-1"})
+    cli = FakeClient(listings_reclogi={"10756": "L-1"})
     orig = ws.get_all_values
     calls = {"n": 0}
 
@@ -393,23 +457,25 @@ def test_必要な列が無いタブは読まない():
 
 
 # ---------------------------------------------------------------- 求人検索と relink
-def test_応募取込の求人検索はHRハッカー求人IDで引く():
+def test_応募取込の求人検索はリクロジ求人IDでid_reclogiを引く():
     row = ai.ApplicantRow(name="見本 太郎", kana="", phone="08000000000",
                           email="t@example.com", apply_date="2026-10-14",
-                          media="リクロジメディア", media_job_id="11694710")
-    cli = ai.DryRunClient(listings_hr={"11694710": "L-1"})
+                          media="リクロジメディア", media_job_id="10756")
+    cli = ai.DryRunClient(listings_hr={"10756": "L-HR"})   # HR の求人には紐付けない
+    cli.listings_reclogi = {"10756": "L-1"}
     res = ai.process_applicant(row, cli)
     assert res.status == "linked" and res.listing_id == "L-1"
-    assert cli.search_log[0] == {"op": "search_listing_hr", "key": {"id_hrhakkaa": "11694710"}}
+    assert cli.search_log[0] == {"op": "search_listing_reclogi", "key": {"id_reclogi": "10756"}}
+    assert cli.created_appts[0]["properties"]["yingmujinglu"] == ai.RECLOGI_YINGMUJINGLU
 
 
 @pytest.mark.parametrize("media, expected", [
-    ("リクロジメディア", (True, "リクロジメディア")),   # 以前は AirWork 扱いだった
-    ("HRハッカー", (True, "HRハッカー")),
-    ("AirWork", (False, "AirWork")),
-    ("", (False, "AirWork")),
+    ("リクロジメディア", ("id_reclogi", "リクロジメディア")),   # 以前は AirWork 扱いだった
+    ("HRハッカー", ("id_hrhakkaa", "HRハッカー")),
+    ("AirWork", ("id_airwork", "AirWork")),
+    ("", ("id_airwork", "AirWork")),
 ])
-def test_relinkはリクロジメディアをHRハッカー求人IDで引き直す(media, expected):
+def test_relinkはリクロジメディアをid_reclogiで引き直す(media, expected):
     assert S.relink_media(media) == expected
 
 

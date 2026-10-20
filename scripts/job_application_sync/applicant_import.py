@@ -92,7 +92,7 @@ DELIVERY_PIPELINE = "21596025"   # 納品管理PL
 # consultant (コンサル担当・OWNER参照) はリクロジ行のシート1「担当CS」に使う (2026-10-20)
 DEAL_READ_PROPS = (["dealname", "contract_plan", "service1", "itijitaiou",
                     "dealstage", "pipeline", "contract_start_date", "createdate",
-                    DM.PROP_CODE, "hrhacker_shop_ids", "consultant"]
+                    DM.PROP_CODE, "hrhacker_shop_ids", "consultant", "hubspot_owner_id"]
                    + list(DM.ANMOKUCHI_PROPS))
 
 
@@ -168,8 +168,12 @@ def _aw_login_to_mail(login_id: str) -> str:
     return _AW_LOGIN_MAIL_CACHE.get(login_id, "")
 
 # ---- oubobaitaimei enum 値 (Phase 0 実測 12択 + リクロジメディア) -------------
-# 自社求人サイト reclogi.jp。求人は HRハッカーの求人なので id_hrhakkaa で引く (2026-10-20)
+# 自社求人サイト reclogi.jp。求人はリクロジ専用の LISTING (id_reclogi) で引く
+# (2026-10-20 ユーザー決定: 媒体ごとに求人を分ける。HRハッカーの求人には紐付けない)
 RECLOGI_MEDIA = "リクロジメディア"
+# リクロジの応募の応募経路 (yingmujinglu)。ユーザーの指示は「もともとある自社媒体」だが
+# 選択肢は website/job_board/... しか無く未決。仮に website (自社サイト)。決まったらここだけ直す
+RECLOGI_YINGMUJINGLU = "website"
 OUBO_BAITAI_VALUES = {
     "HRハッカー", "AirWork", "jobギア", "ジモティー", "Indeed", "ぶるる",
     "エンゲージ", "ジョブオプLite", "求人ボックス", "ガテン系求人", "その他", "未設定",
@@ -320,6 +324,7 @@ class ProcessResult:
 # ============================================================================
 class HubSpotClient(Protocol):
     def search_listing_hr(self, media_job_id: str) -> Optional[str]: ...
+    def search_listing_reclogi(self, reclogi_job_id: str) -> Optional[str]: ...
     def search_listing_aw(self, media_job_id: str, airwork_login_id: str) -> Optional[str]: ...
     def search_listing_aw_by_id(self, media_job_id: str) -> list[str]: ...
     def find_existing_appointment(
@@ -362,6 +367,7 @@ class DryRunClient:
     ):
         self.listings_hr = listings_hr or {}
         self.listings_aw = listings_aw or {}
+        self.listings_reclogi: dict = {}       # {id_reclogi: listing_id} (テストで差し込む)
         self.existing_appts = existing_appts or {}
         self.search_log: list = []
         self.created_appts: list = []
@@ -372,6 +378,11 @@ class DryRunClient:
     def search_listing_hr(self, media_job_id: str) -> Optional[str]:
         self.search_log.append({"op": "search_listing_hr", "key": {"id_hrhakkaa": media_job_id}})
         return self.listings_hr.get(media_job_id)
+
+    def search_listing_reclogi(self, reclogi_job_id: str) -> Optional[str]:
+        self.search_log.append({"op": "search_listing_reclogi",
+                                "key": {"id_reclogi": reclogi_job_id}})
+        return self.listings_reclogi.get(reclogi_job_id)
 
     def search_listing_aw(self, media_job_id: str, airwork_login_id: str) -> Optional[str]:
         # 必ず id_airwork + airwork_account_login_id の両方を使う (v0.2 AW LISTING 複合ユニーク)
@@ -502,6 +513,21 @@ class RealHubSpotClient:
             return None
         results = r.json().get("results", [])
         return results[0]["id"] if results else None
+
+    def search_listing_reclogi(self, reclogi_job_id: str) -> Optional[str]:
+        """リクロジの求人 (id_reclogi)。2件以上なら決めない (None)。"""
+        body = {
+            "filterGroups": [{"filters": [
+                {"propertyName": "id_reclogi", "operator": "EQ", "value": str(reclogi_job_id)},
+            ]}],
+            "properties": ["hs_object_id"],
+            "limit": 2,
+        }
+        r = self._post("/crm/v3/objects/0-420/search", body)
+        if r.status_code >= 300:
+            return None
+        results = r.json().get("results", [])
+        return results[0]["id"] if len(results) == 1 else None
 
     def search_listing_aw(self, media_job_id: str, airwork_login_id: str) -> Optional[str]:
         body = {
@@ -801,7 +827,7 @@ class RealHubSpotClient:
             lp = self._requests.get(
                 f"{self.BASE}/crm/v3/objects/0-420/{listing_id}?properties="
                 "hs_name,shigotonaiyou,zhizhong,qinwude,kinmujikan,"
-                "kinmukeitai,kyuuyokeitai,url_airwork,id_shop_hrhakkaa,"
+                "kinmukeitai,kyuuyokeitai,url_airwork,url_reclogi,id_shop_hrhakkaa,"
                 f"{DM.LISTING_OWNER}",
                 headers=self.headers, timeout=20).json().get("properties") or {}
         except Exception:  # noqa: BLE001
@@ -820,6 +846,9 @@ class RealHubSpotClient:
         # URL: HR=求人IDから個別URL生成 / AW=LISTINGのurl_airwork
         if media == "HRハッカー" and media_job_id:
             props["oubosaki_kyuujin_url"] = HR_JOB_URL_TMPL.format(media_job_id)
+        elif media == RECLOGI_MEDIA:
+            if lp.get("url_reclogi"):
+                props["oubosaki_kyuujin_url"] = lp["url_reclogi"]
         elif lp.get("url_airwork"):
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
         # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
@@ -885,6 +914,83 @@ class RealHubSpotClient:
                 if r.status_code != 404:
                     break
         return cache[oid]
+
+    # ---- リクロジの求人を作って取引に付けるための読み書き (2026-10-20) ----
+    def read_listing(self, listing_id: str, properties: list) -> dict:
+        """求人のプロパティ。取れなければ {}。"""
+        try:
+            r = self._requests.get(
+                f"{self.BASE}/crm/v3/objects/0-420/{listing_id}"
+                f"?properties={','.join(properties)}", headers=self.headers, timeout=20)
+            r.raise_for_status()
+            return r.json().get("properties") or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def get_listing_deals(self, listing_id: str) -> list:
+        """求人に紐付く取引ID (昇順)。取れなければ []。"""
+        try:
+            a = self._requests.get(
+                f"{self.BASE}/crm/v4/objects/0-420/{listing_id}/associations/0-3",
+                headers=self.headers, timeout=20).json().get("results", [])
+        except Exception:  # noqa: BLE001
+            return []
+        return sorted({str(x.get("toObjectId")) for x in a if x.get("toObjectId")})
+
+    def deals_with_shop(self, shop_id: str) -> dict:
+        """納品管理PLで hrhacker_shop_ids に店舗IDを持つ取引 {id: props}。失敗は例外。"""
+        r = self._requests.post(
+            f"{self.BASE}/crm/v3/objects/0-3/search", headers=self.headers,
+            json={"filterGroups": [{"filters": [
+                {"propertyName": "hrhacker_shop_ids", "operator": "CONTAINS_TOKEN",
+                 "value": str(shop_id).strip()},
+                {"propertyName": "pipeline", "operator": "EQ", "value": DELIVERY_PIPELINE}]}],
+                "properties": DEAL_READ_PROPS, "limit": 100}, timeout=20)
+        r.raise_for_status()
+        return {str(o["id"]): o.get("properties") or {} for o in r.json().get("results", [])}
+
+    def deals_by_code(self, code: str) -> dict:
+        return self._deals_by_code(code)
+
+    def owner_is_active(self, owner_id: str) -> bool:
+        """有効なユーザーか (owners API の archived=false で引けるか)。"""
+        try:
+            r = self._requests.get(
+                f"{self.BASE}/crm/v3/owners/{owner_id}?idProperty=id&archived=false",
+                headers=self.headers, timeout=20)
+            return r.status_code == 200
+        except Exception:  # noqa: BLE001
+            return False
+
+    def create_listing(self, properties: dict) -> str:
+        r = self._post("/crm/v3/objects/0-420", {"properties": properties})
+        r.raise_for_status()
+        return str(r.json()["id"])
+
+    def associate_listing_deals(self, listing_id: str, deal_ids: list) -> int:
+        """求人→取引の default 紐付け。作れた本数を返す (sync_deal_association と同じ作り方)。"""
+        try:
+            from . import sync_deal_association as SDA
+        except ImportError:  # pragma: no cover
+            import sync_deal_association as SDA  # type: ignore
+        ok, _fail = SDA.associate_batch([(str(listing_id), str(d)) for d in deal_ids])
+        return len(ok)
+
+    def remove_appointment_listing(self, appointment_id: str, listing_id: str) -> None:
+        r = self._requests.delete(
+            f"{self.BASE}/crm/v4/objects/0-421/{appointment_id}/associations/0-420/{listing_id}",
+            headers=self.headers, timeout=20)
+        r.raise_for_status()
+
+    def get_appointment_listings(self, appointment_id: str) -> list:
+        """応募者に紐付く求人すべて (昇順)。取れなければ []。"""
+        try:
+            a = self._requests.get(
+                f"{self.BASE}/crm/v4/objects/0-421/{appointment_id}/associations/0-420",
+                headers=self.headers, timeout=20).json().get("results", [])
+        except Exception:  # noqa: BLE001
+            return []
+        return sorted({str(x.get("toObjectId")) for x in a if x.get("toObjectId")})
 
     def get_appointment_listing(self, appointment_id: str) -> Optional[str]:
         """応募者に紐付く求人 (先頭1件)。無い・取得失敗は None。"""
@@ -1206,6 +1312,11 @@ def strip_ichijitaiou_if_stale(props: dict, apply_date: str,
     return True
 
 
+def _yingmujinglu(media: str) -> str:
+    """応募経路。求人媒体経由は job_board 固定、リクロジ (自社媒体) は RECLOGI_YINGMUJINGLU。"""
+    return RECLOGI_YINGMUJINGLU if media == RECLOGI_MEDIA else "job_board"
+
+
 def build_appointment_properties(
     row: ApplicantRow, *, linked: bool, ichijitaiou: Optional[str] = None,
     owner_id: Optional[str] = None,
@@ -1244,7 +1355,7 @@ def build_appointment_properties(
         "shikuchousonikajuusho": row.addr_rest,
         # 応募経路: 全応募が求人媒体経由のため job_board 固定 (媒体の詳細は
         # oubobaitaimei が保持。2026-07-27 ユーザー確定)
-        "yingmujinglu": "job_board",
+        "yingmujinglu": _yingmujinglu(row.media),
         # 応募開始(デフォルトカード表示用)。00:00 UTC=09:00 JST で日付ズレなし
         "hs_appointment_start": (f"{row.apply_date}T00:00:00Z"
                                  if len(row.apply_date) == 10 else ""),
@@ -1304,10 +1415,13 @@ def _process_applicant(
     # 1. LISTING検索 (媒体別)
     listing_id: Optional[str] = None
     unlinked_message = "LISTING検索ヒットゼロ → §24ガードに従いAssociation張らず"
-    if row.media in ("HRハッカー", RECLOGI_MEDIA):
-        # リクロジの求人は HRハッカーの求人。応募の HRハッカー求人ID で引く (2026-10-20)
+    if row.media == "HRハッカー":
         if row.media_job_id:
             listing_id = client.search_listing_hr(row.media_job_id)
+    elif row.media == RECLOGI_MEDIA:
+        # リクロジ専用の求人 (id_reclogi)。媒体求人ID = リクロジ求人ID (2026-10-20)
+        if row.media_job_id:
+            listing_id = client.search_listing_reclogi(row.media_job_id)
     elif row.media == "AirWork":
         if row.media_job_id:
             login_id = row.airwork_login_id or default_login_id
@@ -1349,7 +1463,7 @@ def _process_applicant(
             "todoufuken": row.pref, "shikuchouson": row.city,
             "shikuchousonikajuusho": row.addr_rest,
             "ouboshashimei_kana": row.kana,
-            "yingmujinglu": "job_board",
+            "yingmujinglu": _yingmujinglu(row.media),
         }.items() if v}
         if listing_id:
             own = client.get_listing_owner(listing_id)

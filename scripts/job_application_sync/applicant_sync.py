@@ -1074,19 +1074,21 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
 
 
 def relink_media(media: str) -> tuple:
-    """応募の媒体名 → (HRハッカー求人IDで引くか, get_oubosaki_props に渡す媒体名)。
+    """応募の媒体名 → (求人を引くプロパティ, get_oubosaki_props に渡す媒体名)。
 
-    リクロジメディアの応募は oubokyuujinmemo に HRハッカー求人ID を持つので
-    id_hrhakkaa で引く (2026-10-20)。以前の判定 ("HR"/"ハッカー" を含むか) では
-    AirWork 扱いになり id_airwork で引いて永久に紐付かなかった。
+    リクロジメディアの応募は oubokyuujinmemo にリクロジ求人ID を持つので
+    id_reclogi で引く (2026-10-20 ユーザー決定: リクロジは専用の求人)。
+    以前の判定 ("HR"/"ハッカー" を含むか) では AirWork 扱いになり、
+    id_airwork で引いて永久に紐付かなかった。
     媒体名はそのまま渡す (HRハッカーとして渡すと応募先求人URLが
     HRハッカーの URL で上書きされる)。
     """
     media = media or ""
     if media == ai.RECLOGI_MEDIA:
-        return True, ai.RECLOGI_MEDIA
-    is_hr = "HR" in media or "ハッカー" in media
-    return is_hr, ("HRハッカー" if is_hr else "AirWork")
+        return "id_reclogi", ai.RECLOGI_MEDIA
+    if "HR" in media or "ハッカー" in media:
+        return "id_hrhakkaa", "HRハッカー"
+    return "id_airwork", "AirWork"
 
 
 def relink(dry_run: bool = False, limit: int = 1000,
@@ -1107,8 +1109,8 @@ def relink(dry_run: bool = False, limit: int = 1000,
     H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     cli = ai.RealHubSpotClient(token)
 
-    # 1) 対象外APPOINTMENTを収集して (appt_id, jid, is_hr) を作る (検索はまだしない)
-    targets = []  # [(appt_id, jid, is_hr)]
+    # 1) 対象外APPOINTMENTを収集して (appt_id, jid, 引くプロパティ, 応募日, 媒体) を作る
+    targets = []  # [(appt_id, jid, prop, apply_date, media)]
     checked = 0
 
     def _collect(o) -> None:
@@ -1121,8 +1123,8 @@ def relink(dry_run: bool = False, limit: int = 1000,
             jid = m.group(1) if m else ""
         if not jid:
             return
-        is_hr, media = relink_media(p.get("oubobaitaimei") or "")
-        targets.append((o["id"], jid, is_hr,
+        prop, media = relink_media(p.get("oubobaitaimei") or "")
+        targets.append((o["id"], jid, prop,
                         str(p.get("yingmuri") or "")[:10], media))
 
     # yingmuri(応募日) は「古い応募に一次対応を付けない」ガードに使う (2026-08-07)
@@ -1205,14 +1207,14 @@ def relink(dry_run: bool = False, limit: int = 1000,
                     p.get("hubspot_owner_id"))  # 2件目=曖昧
             time.sleep(0.1)
         return m
-    hr_map = _listing_map([j for _, j, ish, _d, _m in targets if ish], "id_hrhakkaa")
-    aw_map = _listing_map([j for _, j, ish, _d, _m in targets if not ish], "id_airwork")
+    maps = {prop: _listing_map([j for _, j, pr, _d, _m in targets if pr == prop], prop)
+            for prop in sorted({pr for _, _j, pr, _d, _m in targets})}
 
     # 3) 突合できた対象外だけ Association + 対象外解除 + 一次対応引き継ぎ
     relinked = still = ambiguous = 0
     note_copied = 0
-    for appt_id, jid, is_hr, apply_date, media in targets:
-        hit = (hr_map if is_hr else aw_map).get(jid, "__miss__")
+    for appt_id, jid, prop, apply_date, media in targets:
+        hit = maps[prop].get(jid, "__miss__")
         if hit == "__miss__":
             still += 1
             continue

@@ -8,14 +8,17 @@
   2. 「HubSpot登録」が空の行だけを、既存の applicant_import の流れ
      (重複判定・担当者・取引からの写し・一次対応・古い応募の扱い・ピン留めメモ・紐付け)
      にそのまま通す。媒体名は「リクロジメディア」。
-  3. 求人は HRハッカー求人ID で LISTING (id_hrhakkaa) を引く。リクロジの求人は
-     HRハッカーの求人で、求人ページの「求人ID」欄に
-     「[リクロジ求人ID] 1 - 店舗ID - HRハッカー求人ID」と載っている
-     (2026-10-20 実ページ10件で、店舗IDが HubSpot の id_shop_hrhakkaa と10/10一致)。
-  4. 見つからないときだけ、掲載求人URLのページから求人を作る。プロパティは
-     HRハッカー取込 (hrhacker_import.build_create_props) に合わせる。
-     id_hrhakkaa を入れるので、後で HRハッカー取込が同じレコードを更新する
-     (取込の upsert キーは id_hrhakkaa。find_hubspot_jobs で引けたものは更新に回る)。
+  3. 求人はリクロジ専用の LISTING を「応募求人ID」(リクロジ求人ID) → id_reclogi で引く。
+     ★2026-10-20 ユーザー決定: HRハッカーの求人には紐付けない。求人は媒体ごとに分ける
+       (hrhacker_import の「媒体間でタイトル名寄せを行わない」と同じ設計)。
+  4. 見つからないときだけ、掲載求人URLのページから求人を作る (掲載終了=410 なら作らない)。
+     id_hrhakkaa / id_shop_hrhakkaa は入れない (HR取込・持ち主判定・夜間紐付けが
+     HR の求人と取り違えないように)。元の HRハッカー求人ID は reclogi_moto_hr_kyuujin_id に参考として残す。
+     作った求人はその場で取引に付ける (plan_listing_deals):
+       - 同じ HRハッカー求人ID の HR 求人があれば、その取引の紐付けを全部写し、
+         担当者・一次対応の要否 (求人の既定)・応募者管理シートURL も写す
+       - 無ければ店舗ID → 取引の hrhacker_shop_ids (sync_deal_association と同じ判定。
+         別会社と共有している店舗は付けない)
   5. 結果を最後の2列「HubSpot登録」「HubSpot応募者ID」に書き戻す。
 
 列は**ヘッダ名で引く** (現場が列を足すことがある)。
@@ -39,6 +42,7 @@ try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実�
     from . import applicant_import as ai
     from . import applicant_queue as aq
     from . import hrhacker_import as hi
+    from . import listing_stage as _stage
     from . import private_log as plog
     from .airwork_import import _KYUUYO_KEITAI_OK
     from .fetchers import account_loader as al
@@ -46,6 +50,7 @@ except ImportError:  # pragma: no cover
     from scripts.job_application_sync import applicant_import as ai  # type: ignore
     from scripts.job_application_sync import applicant_queue as aq  # type: ignore
     from scripts.job_application_sync import hrhacker_import as hi  # type: ignore
+    from scripts.job_application_sync import listing_stage as _stage  # type: ignore
     from scripts.job_application_sync import private_log as plog  # type: ignore
     from scripts.job_application_sync.airwork_import import _KYUUYO_KEITAI_OK  # type: ignore
     from scripts.job_application_sync.fetchers import account_loader as al  # type: ignore
@@ -58,6 +63,7 @@ C_MESSAGE_ID = "messageId"
 C_RECEIVED = "受信日時"
 C_APPLY_ID = "応募ID"
 C_APPLIED_AT = "応募日時"
+C_RECLOGI_JOB_ID = "応募求人ID"    # リクロジ求人ID (= id_reclogi)
 C_HR_JOB_ID = "HRハッカー求人ID"
 C_SHOP_ID = "店舗id"
 C_JOB_URL = "掲載求人URL"
@@ -77,14 +83,30 @@ C_STATUS = "HubSpot登録"          # ここから2列だけ Python が書く
 C_APPT_ID = "HubSpot応募者ID"
 REQUIRED_COLUMNS = (C_MESSAGE_ID, C_STATUS, C_APPT_ID)
 
-# 自由記述 → 応募者の既存プロパティ (0-421 に実在するものだけ。2026-10-20 確認)
-#   本人希望記入欄・応募ID・応募ページURL・ユーザーID は入れる先が無いので入れない
+# タブの列 → 応募者 (0-421) のプロパティ (0-421 に実在するものだけ。2026-10-20 確認)
+#   ユーザーID は入れる先が無いので入れない
 EXTRA_COLUMNS = {
     "保有資格": "hoyuushikaku",        # 保有資格
     "自己PR": "jikopr",                # 自己PR
     "志望動機": "oubodouki",           # 応募動機
     C_JOB_URL: "oubosaki_kyuujin_url",  # 応募先求人URL (応募した求人のページ)
+    C_APPLY_ID: "reclogi_oubo_id",              # リクロジ応募ID
+    "応募ページURL": "reclogi_oubo_page_url",   # リクロジ応募ページURL
+    "本人希望記入欄": "honnin_kibou_kinyuuran",  # 本人希望記入欄
+    "最寄駅": "moyori_eki",                     # 最寄駅
 }
+
+# ---- リクロジの求人 (0-420) ----------------------------------------------------
+# 主要出稿媒体 (shuyoushukkoubaitai) に入れる値。選択肢にリクロジがまだ無いので None = 書かない
+RECLOGI_SHUYOU_BAITAI: Optional[str] = None
+LISTED = "掲載中"                   # baitai_genjoukyou_reclogi (掲載中/掲載終了)
+# 雇用形態 (ページの表記) → guyongxingtai。ここに無い表記は書かない
+EMPLOYMENT_MAP = {"正社員": "full_time", "契約社員": "contract", "パート": "part_time",
+                  "アルバイト": "part_time", "パート・アルバイト": "part_time",
+                  "業務委託": "outsourced"}
+# HR の求人から写す項目 (取引の紐付けと一緒に)
+COPY_FROM_HR = ("hubspot_owner_id", "ichijitaiounoumu_deforuto", "customer_sheet_url")
+_JOB_URL_ID_RE = re.compile(r"reclogi\.jp/job-data/(\d+)")
 
 # ---- 「HubSpot登録」に書く値 --------------------------------------------------
 ST_DONE = "受入済"
@@ -180,6 +202,15 @@ def _join(*parts: str, sep: str = " ") -> str:
     return sep.join(p for p in (str(x or "").strip() for x in parts) if p)
 
 
+def reclogi_job_id(rec: ReclogiRecord) -> str:
+    """リクロジ求人ID。「応募求人ID」が空なら掲載求人URLの /job-data/{id} から。"""
+    v = re.sub(r"\D", "", rec.get(C_RECLOGI_JOB_ID))
+    if v:
+        return v
+    m = _JOB_URL_ID_RE.search(rec.get(C_JOB_URL))
+    return m.group(1) if m else ""
+
+
 def to_applicant_row(rec: ReclogiRecord) -> "ai.ApplicantRow":
     apply_date = _iso_date(rec.get(C_APPLIED_AT)) or _iso_date(rec.get(C_RECEIVED))
     birth = _iso_date(rec.get(C_BIRTH))
@@ -194,7 +225,7 @@ def to_applicant_row(rec: ReclogiRecord) -> "ai.ApplicantRow":
         email=ai.normalize_email(rec.get(C_MAIL)),
         apply_date=apply_date,
         media=MEDIA,
-        media_job_id=rec.get(C_HR_JOB_ID),
+        media_job_id=reclogi_job_id(rec),
         raw_lineno=rec.sheet_row,
         gender=ai.normalize_gender(rec.get(C_GENDER)),
         birthdate=birth,
@@ -304,7 +335,8 @@ def parse_job_page(page: str) -> dict:
     """
     out = {k: "" for k in ("reclogi_id", "shop_id", "hr_job_id", "title", "occupation",
                            "description", "employment", "worktime", "salary_type",
-                           "holidays", "pref", "city", "street", "postal")}
+                           "holidays", "pref", "city", "street", "postal", "qualification",
+                           "salary_min", "salary_max", "salary_unit", "url")}
     m = _JOB_ID_RE.search(page)
     if m:
         out["reclogi_id"], out["shop_id"], out["hr_job_id"] = m.group(1), m.group(3), m.group(4)
@@ -319,6 +351,9 @@ def parse_job_page(page: str) -> dict:
     out["employment"] = fields.get("雇用形態", "")
     out["worktime"] = fields.get("勤務時間", "")
     out["holidays"] = fields.get("休日・休暇", "")
+    out["qualification"] = fields.get("必要資格・応募資格", "")
+    can = re.search(r'<link rel="canonical" href="([^"]+)"', page)
+    out["url"] = can.group(1) if can else ""
     st = _SALARY_TYPE_RE.search(page)
     out["salary_type"] = _tidy(_html.unescape(st.group(1))) if st else ""
     jp = _job_posting(page)
@@ -326,6 +361,10 @@ def parse_job_page(page: str) -> dict:
     if not out["title"]:
         h1 = re.search(r'<h1[^>]*>(.*?)</h1>', page, re.S)
         out["title"] = _tidy(_html.unescape(re.sub(r"<[^>]+>", "", h1.group(1)))) if h1 else ""
+    val = ((jp.get("baseSalary") or {}).get("value") or {}) if jp else {}
+    out["salary_min"] = str(val.get("minValue") or "").strip()
+    out["salary_max"] = str(val.get("maxValue") or "").strip()
+    out["salary_unit"] = str(val.get("unitText") or "").strip().upper()
     addr = ((jp.get("jobLocation") or {}).get("address") or {}) if jp else {}
     out["pref"] = str(addr.get("addressRegion") or "").strip()
     out["city"] = str(addr.get("addressLocality") or "").strip()
@@ -356,52 +395,120 @@ def fetch_job_page(url: str) -> Optional[str]:
     return None
 
 
-def build_listing_props(parsed: dict, page_url: str,
-                        today_iso: str = "", now_iso: str = "") -> dict:
-    """ページの値 → 新規 LISTING のプロパティ。HRハッカー取込の作り方に合わせる。
+def build_listing_props(parsed: dict, page_url: str, now_iso: str = "") -> dict:
+    """ページの値 → リクロジの新規 LISTING のプロパティ。
 
-    - hrhacker_import.build_create_props をそのまま使う
-      (id_hrhakkaa / id_shop_hrhakkaa / url_hrhakkaa / hs_name / 主要出稿媒体 / 管理区分 等)
-    - CSV で見つけたわけではないので、CSV 検出の印 (最終CSV検出日・今回CSV検出フラグ) は付けない
-    - 公開状態はページからは分からない (実測: リクロジに載っている10件はすべて
-      HubSpot で 公開終了 / HR の原ステータス 非公開)。ステータスとステージは書かず、
-      HRハッカー取込が CSV で見つけたときに付ける
-    - 求人詳細は AirWork 取込 (_aw_listing_detail_props) と同じ項目に詰める
+    - id_hrhakkaa / id_shop_hrhakkaa は入れない (HR取込・持ち主判定・夜間紐付けの
+      対象にしない)。元の HRハッカー求人ID は reclogi_moto_hr_kyuujin_id に参考として残す
+    - ページが 200 で読めたときだけ呼ぶ = 掲載中。kyuujin_status=公開中 と、
+      HR の求人と同じパイプライン・ステージ (listing_stage) を付ける
+    - enum は許可値だけ。年収は給与の単位が年 (YEAR) のときだけ入れる
+      (月給から年収を計算はしない)
     """
-    today_iso = today_iso or datetime.now().strftime("%Y-%m-%d")
     now_iso = now_iso or datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-    row = {"media_job_id": parsed.get("hr_job_id", ""), "shop_id": parsed.get("shop_id", ""),
-           "job_name": parsed.get("title") or parsed.get("occupation") or ""}
-    p = hi.build_create_props(row, today_iso, now_iso, source_filename=page_url)
-    if not p:
+    rid = parsed.get("reclogi_id", "")
+    if not rid:
         return {}
-    p.pop(hi.PROP_SAISHUU_CSV_BI, None)
-    p.pop(hi.PROP_KONKAI_CSV_FLAG, None)
-    p[hi.PROP_TORIKOMI_RIYUU] = "リクロジ応募から作成"
+    url = parsed.get("url") or page_url
     pref = parsed.get("pref", "")
     pref = pref if pref in hi.PREFECTURES else ""
-    city = parsed.get("city", "")
-    for val, prop in ((parsed.get("description"), "shigotonaiyou"),
-                      (parsed.get("occupation"), "zhizhong"),
-                      ((pref + city) if pref else "", "qinwude"),
-                      (parsed.get("worktime"), "kinmujikan"),
-                      (parsed.get("holidays"), "kyuujitsu"),
-                      (pref, hi.PROP_PREFECTURE),
-                      (city if pref else "", hi.PROP_CITY)):
-        v = str(val or "").strip()
-        if v:
-            p[prop] = v
-    if parsed.get("salary_type") in _KYUUYO_KEITAI_OK:
-        p["kyuuyokeitai"] = parsed["salary_type"]
-    return p
+    city = parsed.get("city", "") if pref else ""
+    p = {
+        "id_reclogi": rid,
+        "url_reclogi": url,
+        "reclogi_moto_hr_kyuujin_id": parsed.get("hr_job_id", ""),
+        "baitai_genjoukyou_reclogi": LISTED,
+        "hs_name": parsed.get("title") or parsed.get("occupation") or f"リクロジ求人 {rid}",
+        "zhizhong": parsed.get("occupation", ""),
+        "shigotonaiyou": parsed.get("description", ""),
+        "qinwude": (pref + city) if pref else "",
+        "kinmujikan": parsed.get("worktime", ""),
+        hi.PROP_PREFECTURE: pref,
+        hi.PROP_CITY: city,
+        "hissushikaku_shousai": parsed.get("qualification", ""),
+        "guyongxingtai": EMPLOYMENT_MAP.get(parsed.get("employment", ""), ""),
+        "kyuuyokeitai": (parsed.get("salary_type")
+                         if parsed.get("salary_type") in _KYUUYO_KEITAI_OK else ""),
+        hi.PROP_HS_KYUUJIN_STATUS: "公開中",
+        hi.PROP_KANRI_KUBUN: "弊社管理",
+        hi.PROP_TORIKOMI_RIYUU: "リクロジ応募から作成",
+        hi.PROP_DOUKI_FILENAME: url,
+        hi.PROP_LAST_SYNCED: now_iso,
+    }
+    if parsed.get("salary_unit") == "YEAR":
+        p["nianshouxiaxian"] = parsed.get("salary_min", "")
+        p["nianshoushangxian"] = parsed.get("salary_max", "")
+    if RECLOGI_SHUYOU_BAITAI:
+        p[hi.PROP_MEDIA_NAME] = RECLOGI_SHUYOU_BAITAI
+    p.update(_stage.stage_props("公開中"))
+    return {k: v for k, v in p.items() if str(v or "").strip()}
 
 
-def create_listing(props: dict) -> Optional[str]:
+def _sda():
+    try:
+        from . import sync_deal_association as SDA
+    except ImportError:  # pragma: no cover
+        from scripts.job_application_sync import sync_deal_association as SDA  # type: ignore
+    return SDA
+
+
+def plan_listing_deals(client, hr_job_id: str, shop_id: str) -> dict:
+    """リクロジの求人を付ける取引と、HR の求人から写す値を決める (読むだけ)。
+
+    Returns: {"how": 決まり方, "deals": [取引ID], "copy": {プロパティ: 値}, "hr_listing": ID or ""}
+    1. 同じ HRハッカー求人ID の HR 求人があれば、その取引の紐付けを全部写す
+       (HR 求人の紐付けは夜間の sync_deal_association / relink_to_latest_deal が
+       既に面倒を見ている)。担当者・要否の既定・応募者管理シートURL も写す
+    2. 無い (または HR 求人に取引が無い) なら、店舗ID → 取引の hrhacker_shop_ids。
+       sync_deal_association.resolve_targets で決める (別会社にまたがれば付けない)
+    3. どちらも無ければ付けない
+    """
+    out = {"how": "", "deals": [], "copy": {}, "hr_listing": ""}
+    hr_lid = client.search_listing_hr(hr_job_id) if hr_job_id else None
+    if hr_lid:
+        out["hr_listing"] = hr_lid
+        cur = client.read_listing(hr_lid, list(COPY_FROM_HR))
+        out["copy"] = {k: cur[k] for k in COPY_FROM_HR if str(cur.get(k) or "").strip()}
+        deals = client.get_listing_deals(hr_lid)
+        if deals:
+            out.update(how="HR求人の取引を写す", deals=deals)
+            return out
+    if not shop_id:
+        out["how"] = "取引が見つからない (HR求人なし・店舗IDなし)"
+        return out
+    SDA = _sda()
+    try:
+        found = client.deals_with_shop(shop_id)
+    except Exception as e:  # noqa: BLE001
+        out["how"] = f"取引の検索に失敗 ({type(e).__name__})"
+        return out
+    cands = [d for d, pr in found.items() if shop_id in SDA._split(pr.get("hrhacker_shop_ids"))]
+    deals = dict(found)
+    for code in sorted({str(found[d].get(SDA.DS.PROP_CODE) or "").strip() for d in cands} - {""}):
+        deals.update(client.deals_by_code(code))
+    by_code = SDA.DM.group_by_code(deals)
+    targets, how = SDA.resolve_targets(cands, deals, by_code)
+    if not cands:
+        out["how"] = "取引が見つからない (店舗IDの取引なし)"
+        return out
+    out.update(how=f"店舗ID: {how}", deals=[d for d in targets if d])
+    if out["deals"] and "hubspot_owner_id" not in out["copy"]:
+        # 担当者は夜間の sync_deal_association.plan_owner と同じ条件
+        # (取得元が生きている取引で、担当者が有効なユーザー) のときだけ
+        src = SDA.owner_source(out["deals"], deals, by_code)
+        ow = str((deals.get(src) or {}).get("hubspot_owner_id") or "") if src else ""
+        if ow and SDA.DM.is_live(deals.get(src)) and client.owner_is_active(ow):
+            out["copy"]["hubspot_owner_id"] = ow
+    return out
+
+
+def create_listing(client, props: dict) -> Optional[str]:
     """LISTING を1件作り、HRハッカー取込と同じく暗黙知テンプレNoteを付ける。作れなければ None。"""
-    ok, ng, errors, idmap = hi.batch_create([{"properties": props}])
-    lid = idmap.get(props.get("id_hrhakkaa", ""))
-    if not lid:
-        plog.detail("reclogi_listing_create_failed", errors=errors[:3])
+    try:
+        lid = client.create_listing(props)
+    except Exception as e:  # noqa: BLE001
+        plog.public(f"[reclogi] 求人の作成失敗: {type(e).__name__}")
+        plog.detail("reclogi_listing_create_failed", error=str(e)[:500])
         return None
     try:
         try:
@@ -414,6 +521,56 @@ def create_listing(props: dict) -> Optional[str]:
     return lid
 
 
+def prepare_listing(client, rid: str, page_url: str, hr_job_id: str = "", shop_id: str = "",
+                    dry_run: bool = True,
+                    fetch_page: Callable[[str], Optional[str]] = None,
+                    make_listing: Callable = None) -> dict:
+    """リクロジ求人ID の LISTING を用意する。run と付け替えスクリプトで共用。
+
+    Returns: {"action": 既存/作成/作成予定/ページなし/食い違い/作成失敗,
+              "listing_id", "deals", "deal_how", "linked_deals", "props"}
+    hr_job_id / shop_id: タブ (メール) に書かれた値。ページの値と違えば作らない。
+    """
+    fetch_page = fetch_page or fetch_job_page
+    make_listing = make_listing or create_listing
+    out = {"action": "", "listing_id": None, "deals": [], "deal_how": "", "linked_deals": 0,
+           "props": {}}
+    lid = client.search_listing_reclogi(rid) if (client is not None and rid) else None
+    if lid:
+        out.update(action="既存", listing_id=lid)
+        return out
+    page = fetch_page(page_url)
+    parsed = parse_job_page(page) if page else {}
+    if not parsed.get("reclogi_id"):
+        out["action"] = "ページなし"      # 掲載終了 (410) など。応募者は求人未特定
+        return out
+    if parsed["reclogi_id"] != rid or (hr_job_id and parsed["hr_job_id"] != hr_job_id) \
+            or (shop_id and parsed["shop_id"] != shop_id):
+        out["action"] = "食い違い"        # メールとページで求人が違う。別の求人を作らない
+        plog.detail("reclogi_page_mismatch", reclogi_id=rid, page_reclogi_id=parsed["reclogi_id"],
+                    hr_job_id=hr_job_id, page_hr_job_id=parsed["hr_job_id"])
+        return out
+    plan = (plan_listing_deals(client, parsed["hr_job_id"], parsed["shop_id"])
+            if client is not None else {"how": "(HubSpot未接続)", "deals": [], "copy": {}})
+    props = build_listing_props(parsed, page_url)
+    props.update(plan["copy"])
+    out.update(deals=plan["deals"], deal_how=plan["how"], props=props)
+    if dry_run:
+        out["action"] = "作成予定"
+        return out
+    lid = make_listing(client, props)
+    if not lid:
+        out["action"] = "作成失敗"
+        return out
+    out.update(action="作成", listing_id=lid)
+    if plan["deals"]:
+        out["linked_deals"] = client.associate_listing_deals(lid, plan["deals"])
+    if out["linked_deals"] == 0:
+        plog.public(f"[reclogi] ⚠️ 作ったリクロジ求人を取引に付けられなかった ({plan['how']}) "
+                    f"→ 人の確認が必要 (夜間の紐付けは店舗IDの無い求人を拾わない)")
+    return out
+
+
 class _KnownListings:
     """直前に引いた/作った求人を search_listing_hr で返す (作った直後は検索の反映が遅れるため)。
     それ以外の呼び出しは元のクライアントへそのまま渡す。"""
@@ -422,8 +579,9 @@ class _KnownListings:
         self._inner = inner
         self._known = known
 
-    def search_listing_hr(self, media_job_id: str):
-        return self._known.get(media_job_id) or self._inner.search_listing_hr(media_job_id)
+    def search_listing_reclogi(self, reclogi_job_id: str):
+        return (self._known.get(reclogi_job_id)
+                or self._inner.search_listing_reclogi(reclogi_job_id))
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -748,7 +906,7 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
         notify: Optional[Callable[[str], object]] = None,
         ws=None, client=None,
         fetch_page: Callable[[str], Optional[str]] = fetch_job_page,
-        make_listing: Callable[[dict], Optional[str]] = create_listing,
+        make_listing: Callable = create_listing,
         ws1=None) -> dict:
     """タブ「リクロジ応募」の未処理行を取り込む。summary を返す。
 
@@ -800,39 +958,30 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
         client = ai.RealHubSpotClient(token) if (token or not dry_run) else None
     rows = [to_applicant_row(r) for r in targets]
 
-    # 1. 求人: HRハッカー求人IDで引く → 無ければページから作る (1回の実行で同じ求人は1回だけ)
+    # 1. 求人: リクロジ求人IDで引く → 無ければページから作って取引に付ける
+    #    (1回の実行で同じ求人は1回だけ)
     known: dict = {}
     by_job: dict = {}
     for rec, row in zip(targets, rows):
         if row.media_job_id:
             by_job.setdefault(row.media_job_id, rec)
-    for jid, rec in by_job.items():
-        lid = client.search_listing_hr(jid) if client is not None else None
-        if lid:
-            known[jid] = lid
+    for rid, rec in by_job.items():
+        r = prepare_listing(client, rid, rec.get(C_JOB_URL), rec.get(C_HR_JOB_ID),
+                            rec.get(C_SHOP_ID), dry_run=dry_run, fetch_page=fetch_page,
+                            make_listing=make_listing)
+        a = r["action"]
+        if a == "既存":
             s["listing_found"] += 1
-            continue
-        page = fetch_page(rec.get(C_JOB_URL))
-        parsed = parse_job_page(page) if page else {}
-        if not parsed.get("hr_job_id"):
-            s["page_unavailable"] += 1       # 掲載終了 (410) など。応募者は求人未特定で作る
-            continue
-        sheet_shop = rec.get(C_SHOP_ID)
-        if parsed["hr_job_id"] != jid or (sheet_shop and parsed["shop_id"] != sheet_shop):
-            # メールとページで求人が食い違う。別の求人を作らない
-            s["listing_create_failed"] += 1
-            plog.detail("reclogi_page_mismatch", sheet_row=rec.sheet_row, hr_job_id=jid,
-                        page_hr_job_id=parsed["hr_job_id"], page_shop_id=parsed["shop_id"])
-            continue
-        if dry_run:
-            s["listing_created"] += 1         # 作る予定の件数
-            continue
-        lid = make_listing(build_listing_props(parsed, rec.get(C_JOB_URL)))
-        if lid:
-            known[jid] = lid
+        elif a in ("作成", "作成予定"):
             s["listing_created"] += 1
+            s["listing_deals_linked"] = s.get("listing_deals_linked", 0) + (
+                r["linked_deals"] if a == "作成" else len(r["deals"]))
+        elif a == "ページなし":
+            s["page_unavailable"] += 1
         else:
             s["listing_create_failed"] += 1
+        if r["listing_id"]:
+            known[rid] = r["listing_id"]
 
     if dry_run:
         plog.public(f"[reclogi] dry-run: 対象={s['targets']} 求人あり={s['listing_found']} "

@@ -186,7 +186,7 @@ def test_応募者を作った回にシート1も書く(tmp_path):
     ws = FakeWs(_values([_row()]))
     ws1 = _s1([("msg-0001", "support@reclogi.jp", "")])
     cli = S1Client(consultants={"L-1": "O-1"}, names={"O-1": "見本"},
-                   listings_hr={"11694710": "L-1"})
+                   listings_reclogi={"10756": "L-1"})
     ledger = S.Ledger(tmp_path / "l.json")
     s = rl.run(dry_run=False, ledger=ledger, ws=ws, ws1=ws1, client=cli)
     appt = cli.created_appts[0]["id"]
@@ -200,7 +200,7 @@ def test_シート1の行が後から来たら次の回に書く(tmp_path):
     ws = FakeWs(_values([_row()]))
     ws1 = _s1([])                                         # GAS の転記がまだ
     cli = S1Client(consultants={"L-1": "O-1"}, names={"O-1": "見本"},
-                   listings_hr={"11694710": "L-1"})
+                   listings_reclogi={"10756": "L-1"})
     ledger = S.Ledger(tmp_path / "l.json")
     s = rl.run(dry_run=False, ledger=ledger, ws=ws, ws1=ws1, client=cli)
     assert s["s1_waiting"] == 1 and "s1" not in ledger.data["RL-msg-0001"]
@@ -226,7 +226,7 @@ def test_シート1が落ちても取り込みと書き戻しは済む(tmp_path)
         def row_values(self, n):
             raise RuntimeError("503 (test)")
     ws = FakeWs(_values([_row()]))
-    cli = S1Client(listings_hr={"11694710": "L-1"})
+    cli = S1Client(listings_reclogi={"10756": "L-1"})
     ledger = S.Ledger(tmp_path / "l.json")
     s = rl.run(dry_run=False, ledger=ledger, ws=ws, ws1=Broken([S1_HEADER]), client=cli)
     assert s["linked"] == 1 and ws.cell(2, "HubSpot登録") == "受入済"
