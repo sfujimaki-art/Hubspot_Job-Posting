@@ -33,6 +33,7 @@ import html as _html
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
@@ -831,7 +832,9 @@ def consultant_last_name(client, listing_id: str) -> str:
     if not (listing_id and get_c and get_n):
         return ""
     owner = get_c(listing_id, MEDIA, "")
-    return (get_n(owner) or "").strip() if owner else ""
+    # HubSpot のユーザー名に部首の文字 (例「⽥」U+2F65) が入っていることがある。
+    # 見た目は同じでもシートで「田」と検索して引っかからないので、NFKC で普通の文字にそろえる (2026-10-20)
+    return unicodedata.normalize("NFKC", get_n(owner) or "").strip() if owner else ""
 
 
 def _too_old(received_iso: str, today: str, days: int) -> bool:
