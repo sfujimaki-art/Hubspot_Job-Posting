@@ -340,15 +340,24 @@ def test_求人が無ければページから作って紐付ける(tmp_path):
     assert ws.cell(2, "HubSpot登録") == "受入済"
 
 
-def test_ページが取れなければ求人未特定で応募者だけ作る(tmp_path):
+def test_掲載終了でHR求人も無ければ求人未特定で応募者だけ作る(tmp_path):
     ws = FakeWs(_values([_row()]))
     cli = FakeClient()
     made: list = []
-    s = _run(ws, cli, ledger=S.Ledger(tmp_path / "l.json"), page=None, made=made)
+    s = _run(ws, cli, ledger=S.Ledger(tmp_path / "l.json"), page=rl.PAGE_GONE, made=made)
     assert made == [] and s["page_unavailable"] == 1 and s["unlinked"] == 1
     assert cli.created_appts[0]["properties"]["kokyakushiitotenkijoukyou"] == "対象外"
     assert ws.cell(2, "HubSpot登録") == "求人未特定"
     assert ws.cell(2, "HubSpot応募者ID") == cli.created_appts[0]["id"]
+
+
+def test_ページが一時的に取れなければ応募者ごと次の回にやり直す(tmp_path):
+    ws = FakeWs(_values([_row()]))
+    cli = FakeClient()
+    ledger = S.Ledger(tmp_path / "l.json")
+    s = _run(ws, cli, ledger=ledger, page=None)
+    assert s["deferred"] == 1 and cli.created_appts == [] and ws.writes == []
+    assert ledger.data == {}                      # 失敗回数にも数えない
 
 
 def test_メールとページで求人が違えば求人を作らない(tmp_path):

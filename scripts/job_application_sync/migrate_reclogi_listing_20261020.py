@@ -125,7 +125,8 @@ def build_plan(appts: list, recs_by_appt: dict, client,
         aid = str(o["id"])
         rec = recs_by_appt.get(aid)
         row = {"appointment_id": aid, "current_listings": client.get_appointment_listings(aid),
-               "reclogi_id": "", "action": "", "listing_id": None, "deals": [], "deal_how": ""}
+               "reclogi_id": "", "action": "", "kind": "", "listing_id": None, "deals": [],
+               "deal_how": ""}
         if rec is None:
             row["action"] = "タブに行が無い (手で確認)"
             rows.append(row)
@@ -135,9 +136,11 @@ def build_plan(appts: list, recs_by_appt: dict, client,
         if rid not in cache:
             cache[rid] = rl.prepare_listing(client, rid, rec.get(rl.C_JOB_URL),
                                             rec.get(rl.C_HR_JOB_ID), rec.get(rl.C_SHOP_ID),
-                                            dry_run=True, fetch_page=fetch_page)
+                                            dry_run=True, fetch_page=fetch_page,
+                                            job_name=rec.get(rl.C_JOB_NAME))
         prep = cache[rid]
-        row.update(action=prep["action"], listing_id=prep["listing_id"],
+        row.update(action=prep["action"], kind=prep.get("kind", ""),
+                   listing_id=prep["listing_id"],
                    deals=prep["deals"], deal_how=prep["deal_how"])
         if prep["action"] == "既存":
             row["deals"] = client.get_listing_deals(prep["listing_id"])
@@ -172,7 +175,8 @@ def apply(appts: list, plan_rows: list, recs_by_appt: dict, client,
             prep = rl.prepare_listing(client, rid, rec.get(rl.C_JOB_URL),
                                       rec.get(rl.C_HR_JOB_ID), rec.get(rl.C_SHOP_ID),
                                       dry_run=False, fetch_page=fetch_page,
-                                      make_listing=make_listing)
+                                      make_listing=make_listing,
+                                      job_name=rec.get(rl.C_JOB_NAME))
             lid_of[rid] = prep["listing_id"]
             stat["listing_created"] += prep["action"] == "作成"
         elif row["listing_id"]:
@@ -205,14 +209,16 @@ def apply(appts: list, plan_rows: list, recs_by_appt: dict, client,
 
 
 def print_plan(rows: list) -> None:
-    print("応募者ID\t今の求人\tリクロジ求人ID\t新しい求人\t取引")
+    print("応募者ID\t今の求人\tリクロジ求人ID\t新しい求人\t作成種別\t取引")
     for r in rows:
         new = r["listing_id"] or ("(作る)" if r["action"] == "作成予定" else "-")
+        kind = r["kind"] or ("既存" if r["action"] in ("既存", "付け替え済み") else "-")
         print(f"{r['appointment_id']}\t{','.join(r['current_listings']) or '-'}\t"
-              f"{r['reclogi_id'] or '-'}\t{new} [{r['action']}]\t"
+              f"{r['reclogi_id'] or '-'}\t{new} [{r['action']}]\t{kind}\t"
               f"{len(r['deals'])}件 {','.join(r['deals'])} ({r['deal_how'] or '-'})")
     from collections import Counter
-    print(f"\n対象 {len(rows)}件: {dict(Counter(r['action'] for r in rows))}")
+    print(f"\n対象 {len(rows)}件: {dict(Counter(r['action'] for r in rows))} / "
+          f"作成種別 {dict(Counter(r['kind'] for r in rows if r['kind']))}")
 
 
 def main(argv=None) -> int:

@@ -64,6 +64,7 @@ C_RECEIVED = "受信日時"
 C_APPLY_ID = "応募ID"
 C_APPLIED_AT = "応募日時"
 C_RECLOGI_JOB_ID = "応募求人ID"    # リクロジ求人ID (= id_reclogi)
+C_JOB_NAME = "応募求人名"
 C_HR_JOB_ID = "HRハッカー求人ID"
 C_SHOP_ID = "店舗id"
 C_JOB_URL = "掲載求人URL"
@@ -99,7 +100,11 @@ EXTRA_COLUMNS = {
 # ---- リクロジの求人 (0-420) ----------------------------------------------------
 # 主要出稿媒体 (shuyoushukkoubaitai) に入れる値。選択肢にリクロジがまだ無いので None = 書かない
 RECLOGI_SHUYOU_BAITAI: Optional[str] = None
-LISTED = "掲載中"                   # baitai_genjoukyou_reclogi (掲載中/掲載終了)
+LISTED, UNLISTED = "掲載中", "掲載終了"   # baitai_genjoukyou_reclogi
+# ページが掲載終了 (410/404) のとき、HR の求人から写す求人の中身
+HR_CONTENT_PROPS = ("hs_name", "zhizhong", "shigotonaiyou", "qinwude", "kinmujikan",
+                    "todoufuken", "shikuchouson", "guyongxingtai", "kyuuyokeitai",
+                    "nianshouxiaxian", "nianshoushangxian", "hissushikaku_shousai")
 # 雇用形態 (ページの表記) → guyongxingtai。ここに無い表記は書かない
 EMPLOYMENT_MAP = {"正社員": "full_time", "契約社員": "contract", "パート": "part_time",
                   "アルバイト": "part_time", "パート・アルバイト": "part_time",
@@ -373,8 +378,12 @@ def parse_job_page(page: str) -> dict:
     return out
 
 
+PAGE_GONE = ""            # fetch_job_page の戻り: 掲載終了 (410/404)
+
+
 def fetch_job_page(url: str) -> Optional[str]:
-    """求人ページの HTML。200 以外 (410=掲載終了 など)・取得失敗は None。
+    """求人ページの HTML。410/404 (掲載終了) は PAGE_GONE ("")。
+    それ以外の失敗 (5xx・403・通信断・URLがリクロジでない) は None = 今は分からない。
 
     文字コードは応答ヘッダに従う (2026-10-20 実測は UTF-8)。読めなければ cp932 も試す。
     """
@@ -385,6 +394,8 @@ def fetch_job_page(url: str) -> Optional[str]:
         r = requests.get(url.strip(), headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT_SEC)
     except requests.RequestException:
         return None
+    if r.status_code in (404, 410):
+        return PAGE_GONE
     if r.status_code != 200:
         return None
     for enc in [e for e in (r.encoding, "utf-8", "cp932") if e]:
@@ -502,6 +513,34 @@ def plan_listing_deals(client, hr_job_id: str, shop_id: str) -> dict:
     return out
 
 
+def build_ended_listing_props(hr_props: dict, rid: str, page_url: str, hr_job_id: str,
+                              job_name: str = "", now_iso: str = "") -> dict:
+    """ページが掲載終了 (410/404) のときのリクロジ求人のプロパティ。
+
+    求人の中身は同じ HRハッカー求人ID の HR 求人の値、名称はメールの応募求人名を優先。
+    状態は 公開終了 / 掲載終了 (ステージも listing_stage の公開終了に対応する値)。
+    id_hrhakkaa / id_shop_hrhakkaa は入れない (build_listing_props と同じ理由)。
+    """
+    now_iso = now_iso or datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    p = {k: hr_props.get(k) for k in HR_CONTENT_PROPS}
+    p.update({
+        "hs_name": job_name or hr_props.get("hs_name") or f"リクロジ求人 {rid}",
+        "id_reclogi": rid,
+        "url_reclogi": page_url,
+        "reclogi_moto_hr_kyuujin_id": hr_job_id,
+        "baitai_genjoukyou_reclogi": UNLISTED,
+        hi.PROP_HS_KYUUJIN_STATUS: "公開終了",
+        hi.PROP_KANRI_KUBUN: "弊社管理",
+        hi.PROP_TORIKOMI_RIYUU: "リクロジ応募から作成（ページ掲載終了）",
+        hi.PROP_DOUKI_FILENAME: page_url,
+        hi.PROP_LAST_SYNCED: now_iso,
+    })
+    if RECLOGI_SHUYOU_BAITAI:
+        p[hi.PROP_MEDIA_NAME] = RECLOGI_SHUYOU_BAITAI
+    p.update(_stage.stage_props("公開終了"))
+    return {k: v for k, v in p.items() if str(v or "").strip()}
+
+
 def create_listing(client, props: dict) -> Optional[str]:
     """LISTING を1件作り、HRハッカー取込と同じく暗黙知テンプレNoteを付ける。作れなければ None。"""
     try:
@@ -524,25 +563,36 @@ def create_listing(client, props: dict) -> Optional[str]:
 def prepare_listing(client, rid: str, page_url: str, hr_job_id: str = "", shop_id: str = "",
                     dry_run: bool = True,
                     fetch_page: Callable[[str], Optional[str]] = None,
-                    make_listing: Callable = None) -> dict:
+                    make_listing: Callable = None, job_name: str = "") -> dict:
     """リクロジ求人ID の LISTING を用意する。run と付け替えスクリプトで共用。
 
-    Returns: {"action": 既存/作成/作成予定/ページなし/食い違い/作成失敗,
-              "listing_id", "deals", "deal_how", "linked_deals", "props"}
-    hr_job_id / shop_id: タブ (メール) に書かれた値。ページの値と違えば作らない。
+    Returns: {"action": 既存/作成/作成予定/ページなし/ページ取得失敗/食い違い/作成失敗,
+              "kind": 掲載中/掲載終了 (作るとき), "listing_id", "deals", "deal_how",
+              "linked_deals", "props"}
+    hr_job_id / shop_id / job_name: タブ (メール) に書かれた値。
+    - ページが読める (200): ページから作る。ページの ID がメールと違えば作らない
+    - 掲載終了 (410/404): 同じ HRハッカー求人ID の HR 求人の値とメールの値で、公開終了の求人を作る。
+      HR 求人も無ければ作らない (ページなし = 応募者は求人未特定)
+    - それ以外の失敗: 作らない (ページ取得失敗 = 呼び出し側は次の回にやり直す)
     """
     fetch_page = fetch_page or fetch_job_page
     make_listing = make_listing or create_listing
-    out = {"action": "", "listing_id": None, "deals": [], "deal_how": "", "linked_deals": 0,
-           "props": {}}
+    out = {"action": "", "kind": "", "listing_id": None, "deals": [], "deal_how": "",
+           "linked_deals": 0, "props": {}}
     lid = client.search_listing_reclogi(rid) if (client is not None and rid) else None
     if lid:
         out.update(action="既存", listing_id=lid)
         return out
     page = fetch_page(page_url)
-    parsed = parse_job_page(page) if page else {}
+    if page is None:
+        out["action"] = "ページ取得失敗"
+        return out
+    if page == PAGE_GONE:
+        return _prepare_ended(out, client, rid, page_url, hr_job_id, shop_id, job_name,
+                              dry_run, make_listing)
+    parsed = parse_job_page(page)
     if not parsed.get("reclogi_id"):
-        out["action"] = "ページなし"      # 掲載終了 (410) など。応募者は求人未特定
+        out["action"] = "食い違い"        # 200 なのに求人IDの欄が読めない。作らない
         return out
     if parsed["reclogi_id"] != rid or (hr_job_id and parsed["hr_job_id"] != hr_job_id) \
             or (shop_id and parsed["shop_id"] != shop_id):
@@ -553,6 +603,26 @@ def prepare_listing(client, rid: str, page_url: str, hr_job_id: str = "", shop_i
     plan = (plan_listing_deals(client, parsed["hr_job_id"], parsed["shop_id"])
             if client is not None else {"how": "(HubSpot未接続)", "deals": [], "copy": {}})
     props = build_listing_props(parsed, page_url)
+    out["kind"] = LISTED
+    return _create_and_link(out, client, props, plan, dry_run, make_listing)
+
+
+def _prepare_ended(out: dict, client, rid, page_url, hr_job_id, shop_id, job_name,
+                   dry_run, make_listing) -> dict:
+    """掲載終了 (410/404) のリクロジ求人を、HR 求人の値とメールの値から用意する。"""
+    hr_lid = client.search_listing_hr(hr_job_id) if (client is not None and hr_job_id) else None
+    if not hr_lid:
+        out["action"] = "ページなし"      # HR 求人も無い。応募者は求人未特定
+        return out
+    hr_props = client.read_listing(hr_lid, list(HR_CONTENT_PROPS))
+    plan = plan_listing_deals(client, hr_job_id, shop_id)
+    props = build_ended_listing_props(hr_props, rid, page_url, hr_job_id, job_name)
+    out["kind"] = UNLISTED
+    return _create_and_link(out, client, props, plan, dry_run, make_listing)
+
+
+def _create_and_link(out: dict, client, props: dict, plan: dict, dry_run: bool,
+                     make_listing) -> dict:
     props.update(plan["copy"])
     out.update(deals=plan["deals"], deal_how=plan["how"], props=props)
     if dry_run:
@@ -961,6 +1031,7 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
     # 1. 求人: リクロジ求人IDで引く → 無ければページから作って取引に付ける
     #    (1回の実行で同じ求人は1回だけ)
     known: dict = {}
+    deferred: set = set()
     by_job: dict = {}
     for rec, row in zip(targets, rows):
         if row.media_job_id:
@@ -968,12 +1039,16 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
     for rid, rec in by_job.items():
         r = prepare_listing(client, rid, rec.get(C_JOB_URL), rec.get(C_HR_JOB_ID),
                             rec.get(C_SHOP_ID), dry_run=dry_run, fetch_page=fetch_page,
-                            make_listing=make_listing)
+                            make_listing=make_listing, job_name=rec.get(C_JOB_NAME))
         a = r["action"]
         if a == "既存":
             s["listing_found"] += 1
+        elif a == "ページ取得失敗":
+            deferred.add(rid)                 # 今は分からない。応募者ごと次の回にやり直す
         elif a in ("作成", "作成予定"):
             s["listing_created"] += 1
+            if r["kind"] == UNLISTED:
+                s["listing_created_ended"] = s.get("listing_created_ended", 0) + 1
             s["listing_deals_linked"] = s.get("listing_deals_linked", 0) + (
                 r["linked_deals"] if a == "作成" else len(r["deals"]))
         elif a == "ページなし":
@@ -988,6 +1063,12 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
                     f"求人を作る予定={s['listing_created']} ページなし={s['page_unavailable']} "
                     f"シート1待ち={len(s1_pending)} (HubSpot・シートには書かない)")
         return s
+
+    # ページが一時的に取れなかった求人への応募は、この回は取り込まない (欄は空のまま)
+    if deferred:
+        keep = [(rec, row) for rec, row in zip(targets, rows) if row.media_job_id not in deferred]
+        s["deferred"] = len(targets) - len(keep)
+        targets, rows = [x[0] for x in keep], [x[1] for x in keep]
 
     # 2. 応募者: applicant_import の流れをそのまま通す
     results = ai.run_import(rows, _KnownListings(client, known)) if rows else []
@@ -1042,6 +1123,8 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
     plog.public(f"[reclogi] 対象={s['targets']} 紐付け={s['linked']} 求人未特定={s['unlinked']} "
                 f"重複={s['dup']} エラー={s['error']} (諦め={s['gave_up']}) / "
                 f"求人あり={s['listing_found']} 作成={s['listing_created']} "
-                f"作成失敗={s['listing_create_failed']} ページなし={s['page_unavailable']} / "
+                f"作成失敗={s['listing_create_failed']} ページなし={s['page_unavailable']} "
+                f"(作成のうち掲載終了={s.get('listing_created_ended', 0)} "
+                f"次の回へ={s.get('deferred', 0)}) / "
                 f"書き戻し={s['written']}行 (うち前回分={s['rewrite']})")
     return s

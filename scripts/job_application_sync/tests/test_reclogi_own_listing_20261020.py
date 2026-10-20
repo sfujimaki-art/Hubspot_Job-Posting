@@ -98,10 +98,72 @@ def test_既にあれば作らない():
     assert r["action"] == "既存" and r["listing_id"] == "L-RL" and cli.created_listings == []
 
 
-def test_掲載終了_410_なら作らない():
+HR_CONTENT = {"hs_name": "HR側の案件名", "zhizhong": "大型ドライバー", "shigotonaiyou": "輸送業務",
+              "qinwude": "新潟県長岡市", "kinmujikan": "8:00-17:00", "todoufuken": "新潟県",
+              "shikuchouson": "長岡市", "guyongxingtai": "full_time", "kyuuyokeitai": "月給",
+              "nianshouxiaxian": "4000000", "nianshoushangxian": "5000000",
+              "hissushikaku_shousai": "中型免許", "id_hrhakkaa": "11694710",
+              "id_shop_hrhakkaa": "1154643", "url_hrhakkaa": "https://example.com/hr"}
+
+
+def test_掲載終了ならHR求人の値とメールの値で公開終了の求人を作る():
+    cli = FakeClient(listings_hr={"11694710": "L-HR"}, listing_deals={"L-HR": ["D1", "D2"]},
+                     listing_props={"L-HR": dict(HR_CONTENT, hubspot_owner_id="O-1")})
+    r = rl.prepare_listing(cli, "10756", URL, "11694710", "1154643", dry_run=False,
+                           fetch_page=lambda u: rl.PAGE_GONE, make_listing=rl.create_listing,
+                           job_name="メール側の求人名")
+    assert r["action"] == "作成" and r["kind"] == "掲載終了"
+    p = cli.created_listings[0]
+    assert p["hs_name"] == "メール側の求人名"                  # メールの応募求人名を優先
+    for k in ("zhizhong", "shigotonaiyou", "qinwude", "kinmujikan", "todoufuken",
+              "shikuchouson", "guyongxingtai", "kyuuyokeitai", "nianshouxiaxian",
+              "nianshoushangxian", "hissushikaku_shousai"):
+        assert p[k] == HR_CONTENT[k], k
+    for k in ("id_hrhakkaa", "id_shop_hrhakkaa", "url_hrhakkaa"):
+        assert k not in p, k
+    assert (p["id_reclogi"], p["url_reclogi"], p["reclogi_moto_hr_kyuujin_id"]) ==         ("10756", URL, "11694710")
+    assert p["kyuujin_status"] == "公開終了" and p["baitai_genjoukyou_reclogi"] == "掲載終了"
+    from scripts.job_application_sync import listing_stage
+    assert p["hs_pipeline"] == listing_stage.PIPELINE_ID
+    assert p["hs_pipeline_stage"] == listing_stage.STAGE_TEISHI
+    assert p["kanri_kubun"] == "弊社管理"
+    assert p["torikomi_riyuu"] == "リクロジ応募から作成（ページ掲載終了）"
+    assert p["hubspot_owner_id"] == "O-1"                        # HR 求人から写す
+    assert cli.deal_links == [("L-NEW1", ["D1", "D2"])]
+
+
+def test_掲載終了で名前がメールに無ければHR求人の名前():
+    cli = FakeClient(listings_hr={"11694710": "L-HR"}, listing_props={"L-HR": HR_CONTENT})
+    r = rl.prepare_listing(cli, "10756", URL, "11694710", dry_run=True,
+                           fetch_page=lambda u: rl.PAGE_GONE)
+    assert r["action"] == "作成予定" and r["props"]["hs_name"] == "HR側の案件名"
+
+
+def test_掲載終了でHR求人も無ければ作らない():
     cli = FakeClient()
-    r = rl.prepare_listing(cli, "10756", URL, dry_run=False, fetch_page=lambda u: None)
+    r = rl.prepare_listing(cli, "10756", URL, "11694710", dry_run=False,
+                           fetch_page=lambda u: rl.PAGE_GONE)
     assert r["action"] == "ページなし" and cli.created_listings == [] and cli.deal_links == []
+
+
+def test_ページが一時的に取れないときは作らない():
+    cli = FakeClient(listings_hr={"11694710": "L-HR"}, listing_props={"L-HR": HR_CONTENT})
+    r = rl.prepare_listing(cli, "10756", URL, "11694710", dry_run=False,
+                           fetch_page=lambda u: None)
+    assert r["action"] == "ページ取得失敗" and cli.created_listings == []
+
+
+@pytest.mark.parametrize("code, expected", [(200, "html"), (410, ""), (404, ""),
+                                            (503, None), (403, None)])
+def test_ページの取得結果を掲載終了と一時的な失敗に分ける(monkeypatch, code, expected):
+    import requests
+
+    class R:
+        status_code = code
+        encoding = "utf-8"
+        content = b"html"
+    monkeypatch.setattr(requests, "get", lambda *a, **k: R())
+    assert rl.fetch_job_page(URL) == expected
 
 
 def test_ページのリクロジ求人IDが違えば作らない():
@@ -173,13 +235,16 @@ def test_付け替えのdry_run計画():
     cli = MigClient(appt_listings={"A1": ["L-HR"], "A2": ["L-HR2"], "A3": ["L-HR"],
                                    "A4": ["L-HR"]},
                     listings_hr={"11694710": "L-HR"}, listing_deals={"L-HR": ["D1"]})
-    pages = {URL: PAGE}
+    pages = {URL: PAGE}                       # A2 の求人ページは掲載終了 (410)
     rows = M.build_plan([{"id": "A1"}, {"id": "A2"}, {"id": "A3"}, {"id": "A4"}], recs, cli,
-                        fetch_page=pages.get)
+                        fetch_page=lambda u: pages.get(u, rl.PAGE_GONE))
     by = {r["appointment_id"]: r for r in rows}
     assert by["A1"]["action"] == "作成予定" and by["A1"]["deals"] == ["D1"]
     assert by["A1"]["current_listings"] == ["L-HR"] and by["A1"]["reclogi_id"] == "10756"
-    assert by["A2"]["action"] == "ページなし"                 # 410 は作らない
+    assert by["A1"]["kind"] == "掲載中"
+    # 410 でも HR 求人の値で公開終了の求人を作る
+    assert by["A2"]["action"] == "作成予定" and by["A2"]["kind"] == "掲載終了"
+    assert by["A2"]["deals"] == ["D1"]
     assert by["A3"]["action"] == "作成予定"
     assert by["A4"]["action"].startswith("タブに行が無い")
     assert cli.created_listings == [] and cli.deal_links == [] and cli.removed == []
