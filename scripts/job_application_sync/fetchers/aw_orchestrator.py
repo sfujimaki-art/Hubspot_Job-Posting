@@ -49,6 +49,8 @@ if str(_REPO) not in sys.path:
 
 # 並列ジョブの依存 (別タスクで実装される / orchestrator 自体は import に依存しない)
 from scripts.job_application_sync import private_log as plog  # noqa: E402
+from scripts.job_application_sync import alert_text  # noqa: E402
+from scripts.job_application_sync import report_sheet  # noqa: E402
 from scripts.job_application_sync.fetchers.account_loader import (  # type: ignore  # noqa: E402
     iter_aw_accounts,
     resolve_accounts_for_mails,
@@ -269,6 +271,102 @@ def _classify_error(err: str) -> str:
     if any(k in e for k in ["not_ready", "生成", "timeout", "タイムアウト"]):
         return "generation"
     return "other"
+
+
+_IMAGE_REASON = {
+    "public_page_unavailable": ("公開ページが開けない",
+                                "エアワークで公開を終えた求人なら対応不要"),
+    "gallery_layout_unrecognized": ("公開ページの画像の並び方を読み取れない",
+                                    "対応不要 (読み取り側の改善で対応)"),
+}
+
+
+def _report_rows(results: list, notice: str) -> list:
+    """Slack の通知に添える対象一覧 (report_sheet の行)。エラーを先に並べる。
+
+    ログイン ID は伏せる (_mask)。例外文はログイン ID とメールを伏せてから書く。
+    """
+    errs, notes = [], []
+    for r in results:
+        company = r.get("company", "") or ""
+        lid = r.get("login_id", "") or ""
+        target = f"ログインID {_mask(lid)}" if lid else ""
+        st = r.get("status")
+        if st == "error":
+            cause, action = alert_text.classify_aw_error(r.get("error", ""))
+            if cause.startswith("原因を分類できません"):
+                cause = plog.redact(r.get("error", ""), [lid])[:300]
+            errs.append(report_sheet.row(notice, "NG", company, target, cause, action))
+            continue
+        res = r.get("result") if isinstance(r.get("result"), dict) else {}
+        hs_ng = {k: int(res.get(k) or 0) for k in ("creates_ng", "updates_ng", "ends_ng")}
+        if any(hs_ng.values()):
+            errs.append(report_sheet.row(
+                notice, "NG", company, target,
+                f"HubSpot への書き込みの失敗: 作成 {hs_ng['creates_ng']} / "
+                f"更新 {hs_ng['updates_ng']} / 公開終了 {hs_ng['ends_ng']}",
+                "非公開ログ (実行ログ) の airwork_import_*_errors を確認してください"))
+        cap = int(res.get("ends_skipped_cap") or 0)
+        if cap:
+            notes.append(report_sheet.row(
+                notice, "要確認", company, target,
+                f"エアワークの一覧から消えた公開中の求人 {cap}件の公開終了を見送りました"
+                f" (公開中の {int(_ev_ratio() * 100)}% を超えたため)",
+                "エアワークで公開を終えていれば、HubSpot で公開終了にしてください"))
+        if res.get("end_search_failed"):
+            notes.append(report_sheet.row(
+                notice, "要確認", company, target,
+                "HubSpot で公開中の求人を検索できず、公開終了を見送りました",
+                "次の巡回で自動で処理します (対応不要)"))
+        img = r.get("images")
+        if isinstance(img, dict) and "error" in img:
+            errs.append(report_sheet.row(notice, "NG", company, target,
+                                         f"画像の処理が失敗しました ({img['error']})",
+                                         "PC のログを確認してください"))
+        elif isinstance(img, dict):
+            if int(img.get("write_failed") or 0):
+                errs.append(report_sheet.row(
+                    notice, "NG", company, target,
+                    f"画像を HubSpot に書けませんでした {img['write_failed']}件",
+                    "PC のログを確認してください"))
+            for reason, n in (img.get("page_failed_reasons") or {}).items():
+                what, action = _IMAGE_REASON.get(reason, (reason, "PC のログを確認してください"))
+                notes.append(report_sheet.row(notice, "画像取れず", company, target,
+                                              f"{what}: {n}件", action))
+        bill = r.get("billing")
+        if isinstance(bill, str) and bill.startswith("error"):
+            errs.append(report_sheet.row(notice, "NG", company, target,
+                                         f"課金の作成に失敗しました ({bill})",
+                                         "次の回で自動でやり直します"))
+    return errs + notes
+
+
+def _ev_ratio() -> float:
+    try:
+        from scripts.job_application_sync import end_vanished_listings as _ev
+        return float(_ev.MAX_END_RATIO)
+    except Exception:  # noqa: BLE001
+        return 0.2
+
+
+def _billing_report_rows(results: list, notice: str) -> list:
+    rows = []
+    for r in results:
+        if r.get("status") != "error":
+            continue
+        lid = r.get("login_id", "") or ""
+        cause, action = alert_text.classify_aw_error(r.get("error", ""))
+        if cause.startswith("原因を分類できません"):
+            cause = plog.redact(r.get("error", ""), [lid])[:300]
+        rows.append(report_sheet.row(notice, "NG", r.get("company", ""),
+                                     f"ログインID {_mask(lid)}" if lid else "", cause, action))
+    return rows
+
+
+def _notify_with_report(message: str, rows: list, dry_run: bool = False) -> None:
+    """通知に対象一覧のタブの URL を付けて送る。一覧が書けなくても通知は送る。"""
+    url = "" if dry_run else report_sheet.publish(report_sheet.TAB_AW_CRAWL, rows)
+    _slack_notify(message + report_sheet.link_line(url, rows))
 
 
 def _slack_notify(message: str) -> None:
@@ -768,9 +866,11 @@ async def orchestrate(parallel: int = 5,
     # C: per-account結果を状態JSONに保存 + Slackサマリ (住み分け・ログ行き先A+B)
     acct_summary = _write_account_results(results, out_dir, phase)
     print(f"[orchestrate] 住み分け({phase}): {acct_summary}", flush=True)
-    _slack_notify(
+    notice = "至急の取得" if from_urgent_queue else f"求人の巡回({phase})"
+    _notify_with_report(
         f"🔄 AW巡回({phase}) {total}社処理: "
-        + " / ".join(f"{k}={v}" for k, v in acct_summary.items()))
+        + " / ".join(f"{k}={v}" for k, v in acct_summary.items()),
+        _report_rows(results, notice), dry_run)
 
     # --- Phase1(create): 生成トリガー成功社をキューに保存 (Phase2引き継ぎ) ---
     if phase == "create":
@@ -1117,8 +1217,9 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
 
     summary = _write_account_results(results, out_dir, phase)
     print(f"[orchestrate] 住み分け({phase}): {summary}", flush=True)
-    _slack_notify(f"🔄 AW有料広告実績({phase}) {total}社処理: "
-                  + " / ".join(f"{k}={v}" for k, v in summary.items()))
+    _notify_with_report(f"🔄 AW有料広告実績({phase}) {total}社処理: "
+                        + " / ".join(f"{k}={v}" for k, v in summary.items()),
+                        _billing_report_rows(results, f"課金の取得({phase})"))
     ok = sum(1 for r in results if r["status"] in ("ok", "queued"))
     ng = sum(1 for r in results if r["status"] == "error")
     nr = sum(1 for r in results if r["status"] == "not_ready")

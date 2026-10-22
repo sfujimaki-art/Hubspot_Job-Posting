@@ -35,7 +35,7 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(aq, "read_new_items_from_sheet1", lambda **k: [])
     monkeypatch.setattr(aq, "AccountResolver", lambda: _NoResolver())
     monkeypatch.setattr(S, "SESSION_DIR", tmp_path / "sess")
-    monkeypatch.setattr(S, "slack_notify", lambda message="", dry_run=False: None)
+    monkeypatch.setattr(S, "slack_notify", lambda message="", dry_run=False, rows=None: None)
 
     def fake_sheet(dry_run=True):
         state.sheet += 1

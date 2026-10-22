@@ -915,6 +915,7 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
     ends: list[dict] = []
     end_preview: list[dict] = []
     end_skipped_cap = 0
+    end_search_failed = False
     end_checked = export_is_complete(len(rows), len(valid_rows), skipped_no_id,
                                      limit, login_id)
     if end_checked and (not dry_run or os.environ.get("HUBSPOT_ACCESS_TOKEN")):
@@ -937,6 +938,7 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
                 ends, end_preview = [], []
         except Exception as e:
             ends, end_preview = [], []
+            end_search_failed = True
             print(f"WARN: 公開中求人の検索に失敗したため公開終了は見送り: {type(e).__name__}")
 
     summary = {
@@ -944,6 +946,7 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         "login_id": login_id,
         "ends_planned": len(ends),
         "ends_skipped_cap": end_skipped_cap,
+        "end_search_failed": end_search_failed,
         "export_complete": bool(end_checked),
         "csv_total_rows": len(rows),   # キー名は後方互換のため csv_ を維持
         "skipped_no_id": skipped_no_id,

@@ -56,6 +56,7 @@ from scripts.job_application_sync import hr_applicant_fields as hrf  # noqa: E40
 from scripts.job_application_sync import aw_prefetch  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_pace  # noqa: E402
 from scripts.job_application_sync import alert_text  # noqa: E402
+from scripts.job_application_sync import report_sheet  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_urgent_queue  # noqa: E402
 from scripts.job_application_sync.http_session import http as _http  # noqa: E402
 
@@ -252,9 +253,14 @@ class Ledger:
 # ============================================================================
 # Slack 通知 (放置ゼロ: 失敗を必ず報告)
 # ============================================================================
-def slack_notify(message: str, dry_run: bool = False) -> bool:
+def slack_notify(message: str, dry_run: bool = False, rows: Optional[list] = None) -> bool:
     # dry-run 時は実送信せず表示のみ (テストのSlackノイズ防止)
     # ★本文は会社名を含むので公開ログには出さない (2026-10-09)。非公開ログへ。
+    # rows: 通知の対象一覧 (report_sheet.row)。集約シートのタブに書き、URL を本文の末尾に付ける
+    #   (2026-10-23 ユーザー指示「対象案件 (特にエラー) をレポートで Slack に」)。
+    if rows and not dry_run:
+        message += report_sheet.link_line(
+            report_sheet.publish(report_sheet.TAB_APPLICANTS, rows), rows)
     if dry_run:
         plog.public(f"[slack(dry-run,未送信)] {len(message)}字 (本文は非公開ログ)")
         plog.detail("slack_unsent", reason="dry-run", message=message)
@@ -327,7 +333,8 @@ def _missing_aw_listings(job_ids: list[str], token: str) -> list[str]:
 
 def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
                     absent_out: Optional[list] = None,
-                    listing_ids_out: Optional[dict] = None) -> int:
+                    listing_ids_out: Optional[dict] = None,
+                    company: str = "") -> int:
     """自己修復: 応募の求人LISTINGが欠落 → その社の求人をfetch(session再利用)して upsert.
 
     生成待ちあり(timeout_min分)。欠落時のみ発火。
@@ -391,7 +398,11 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
                "relinkでも救済されません")
         print(f"[selfheal] {msg}", flush=True)
         try:
-            slack_notify(msg)
+            slack_notify(msg, rows=[report_sheet.row(
+                "応募の求人の取得", "NG", company, f"求人ID {j}",
+                "エアワークのエクスポートに、この求人がありません",
+                "エアワークで公開中か確かめてください。公開を終えた求人なら対応不要です")
+                for j in still])
         except Exception:  # noqa: BLE001
             pass
     return len(got)
@@ -598,7 +609,8 @@ def _process_aw_account_raw(
                             _raise_if_aw_blocked()
                             jobs_fetched = _ensure_aw_jobs(bid, b_pw, missing, out_dir,
                                                            absent_out=absent,
-                                                           listing_ids_out=lids)
+                                                           listing_ids_out=lids,
+                                                           company=company)
                         finally:
                             result["selfheal_sec"] = time.monotonic() - _t
                     known.update(absent)
@@ -971,6 +983,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 by_co.setdefault(k, []).append(u)
             today = datetime.now().strftime("%Y-%m-%d")
             lines = []
+            u_rows: list = []
             for (media, comp, _m), us in by_co.items():
                 nk = company_key(f"{media}|{comp}|{_m}")
                 if ledger.meta("unresolved_notified", nk).get("day") == today:
@@ -980,15 +993,20 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                     why = resolver.explain(us[0])
                 except Exception as e:  # noqa: BLE001 — 理由が取れなくても通知は送る
                     why = f"理由を判定できませんでした ({type(e).__name__})"
-                lines.append(f"・{comp[:24]} ({'エアワーク' if media == 'AW' else 'HRハッカー' if media == 'HR' else media}"
-                             f"・応募{len(us)}件): {why}")
+                media_ja = 'エアワーク' if media == 'AW' else 'HRハッカー' if media == 'HR' else media
+                lines.append(f"・{comp[:24]} ({media_ja}・応募{len(us)}件): {why}")
+                for u in us:
+                    u_rows.append(report_sheet.row(
+                        "応募の会社を特定できない", "NG", comp,
+                        f"{media_ja} シート1 {u.sheet_row}行目" if u.sheet_row else media_ja,
+                        why, "顧客管理シートを直すと、次の回から取り込みます"))
             if lines:
                 slack_notify(dry_run=dry_run, message=
                     f"⚠️ 応募連携: 応募の会社を顧客管理シートで特定できません ({len(lines)}社)\n"
                     + "\n".join(lines[:15])
                     + (f"\n…ほか{len(lines) - 15}社" if len(lines) > 15 else "")
                     + "\n→ 取り込みはされていません。シートを直すと次の回から取り込みます。"
-                      "同じ社のこの通知は1日1回です")
+                      "同じ社のこの通知は1日1回です", rows=u_rows)
 
         # ---- HR: 1マスターで日付範囲一括 (リクロジアドレスで100%突合) ----
         hr_items = grouped.get("HR::master", [])
@@ -1051,8 +1069,11 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 summary["failed"] += len(hr_items)
                 if atts >= MAX_ATTEMPTS and _first_report_today(ledger, "hr_fail_notified", "master"):
                     summary["reported"] += 1
+                    cause, action = alert_text.classify_hr_error(res["error"])
                     slack_notify(dry_run=dry_run, message=alert_text.hr_failure_message(
-                        res["error"], atts))
+                        res["error"], atts), rows=[report_sheet.row(
+                            "HRハッカーの取り込み失敗", "NG", "", f"応募 {len(hr_items)}件",
+                            f"{cause} ({atts}回目)", action)])
                 print(f"  {'❌' if atts >= MAX_ATTEMPTS else '⏳'} HR: "
                       f"{res['error']} ({atts}/{MAX_ATTEMPTS}回)", flush=True)
 
@@ -1087,7 +1108,13 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                         f"⚠️ 応募取り込み: {company} の企業AirWorkのIDかPWが"
                         f"顧客管理シートに入っていません (応募{len(group)}件)\n"
                         f"→ シートに入れると、次の回から自動で取り込みます。"
-                        f"入るまでこの社はログインせず、この通知も繰り返しません")
+                        f"入るまでこの社はログインせず、この通知も繰り返しません",
+                        rows=[report_sheet.row(
+                            "企業AirWorkのIDかPWが無い", "NG", company,
+                            f"シート1 {it.sheet_row}行目" if it.sheet_row else "",
+                            "顧客管理シートに企業AirWorkのIDかPWが入っていません",
+                            "顧客管理シートに入れると、次の回から取り込みます")
+                            for it in group])
                     print(f"  ❌ {plog.mask_name(company)}: 認証なし (応募{len(group)}件・"
                           f"ログインせず→Slack報告)", flush=True)
                     plog.detail("aw_no_auth", company=company, applicants=len(group))
@@ -1211,8 +1238,14 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                     sent = _first_report_today(ledger, "aw_fail_notified", ck)
                     if sent:
                         summary["reported"] += 1
+                        cause, action = alert_text.classify_aw_error(
+                            res["error"], blocked_403=aw_pace.is_blocked())
                         slack_notify(dry_run=dry_run, message=alert_text.aw_failure_message(
-                            company, res["error"], atts, blocked_403=aw_pace.is_blocked()))
+                            company, res["error"], atts, blocked_403=aw_pace.is_blocked()),
+                            rows=[report_sheet.row(
+                                "エアワークの応募の取り込み失敗", "NG", company,
+                                f"シート1 {it.sheet_row}行目" if it.sheet_row else "",
+                                f"{cause} ({atts}回目)", action) for it in group])
                     print(f"  ❌ {plog.mask_name(company)}: {plog.redact(res['error'])} "
                           f"({atts}回→{'Slack報告' if sent else 'Slack報告は本日済み'})", flush=True)
                 else:
@@ -1273,7 +1306,13 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 slack_notify(dry_run=dry_run, message=
                     f"⚠️ 顧客シート転記: 失敗{cs['fail']}社 "
                     f"(成功{cs['ok']}社/追記{cs['wrote']}行) "
-                    f"{'; '.join(cs['errors'][:3])}")
+                    f"{'; '.join(cs['errors'][:3])}",
+                    rows=[report_sheet.row("顧客シート転記の失敗", "NG", "",
+                                           f"シート {e.split(':', 1)[0]}",
+                                           e.split(':', 1)[-1].strip(),
+                                           "シートの共有 (サービスアカウントの編集権限) と"
+                                           "タブ名を確認してください")
+                          for e in cs["errors"]])
         except Exception as e:  # noqa: BLE001
             print(f"[customer_sheet_sync] 全体失敗(本線には影響なし): "
                   f"{type(e).__name__}: {str(e)[:100]}", flush=True)
@@ -1625,7 +1664,14 @@ def reconcile(dry_run: bool = False) -> dict:
     if stuck_failed or len(pending) > 200:
         slack_notify(
             f"🔎 照合スイープ: 要確認 — リトライ上限失敗={len(stuck_failed)}件 / "
-            f"未処理NEW滞留={len(pending)}件 (放置ゼロ点検)", dry_run)
+            f"未処理NEW滞留={len(pending)}件 (放置ゼロ点検)", dry_run,
+            rows=[report_sheet.row(
+                "照合スイープ", "NG", "", f"台帳 {rid[:16]}",
+                f"{ledger.data[rid].get('attempts', 0)}回失敗 "
+                f"(最後 {str(ledger.data[rid].get('updated', ''))[:16]}): "
+                f"{ledger.data[rid].get('last_error', '')}",
+                "理由を見て直すか、直せない応募なら台帳から外してください")
+                for rid in stuck_failed])
     print(f"[reconcile] {report}", flush=True)
     return report
 

@@ -1191,7 +1191,7 @@ def main(argv=None):
     #   通知は「誰が・何を・どこに入れるか」が分かる形にする。
     #   日付は JST。runner は UTC なので、そのままだと現場が見る日付の
     #   **前日**のファイル名になる (cron 40 16 * * * = JST 翌01:40)。
-    csv_paths, sheet_urls, private_tabs = {}, {}, {}
+    csv_paths, sheet_urls, private_tabs, private_urls = {}, {}, {}, {}
     today = _jst_today().strftime("%Y-%m-%d")
     for r in results:
         items = r.get("items") or []
@@ -1223,8 +1223,10 @@ def main(argv=None):
         # ★2026-10-09: 公開の Actions 成果物の代わりに、非公開の集約シート
         #   (JAS_APPLICANT_QUEUE_SHEET_ID) のタブへ全置換で書く。
         tab = private_tab(r["name"])
-        if plog.replace_list(tab, items):
+        purl = plog.replace_list_url(tab, items)
+        if purl:
             private_tabs[r["name"]] = tab
+            private_urls[r["name"]] = purl
             print(f"      非公開シートのタブへ書き出しました ({len(items):,}行)")
     # 今回0件になった一覧は、既存タブを「該当なし」で上書きする (作りはしない)
     for r in results:
@@ -1266,8 +1268,10 @@ def main(argv=None):
             #   (件数だけの停止検知や、母数0で判定できなかった日) にまで
             #   「対象一覧はここ」と出すと、開いても何も無いページへ飛ばす。
             if items and csv_paths.get(r["name"]):
+                # ★2026-10-23: 集約シートのタブは URL で案内する (タブ名だけでは開けない)
                 where = (sheet_urls.get(r["name"])
                          or (f"集約シートのタブ「{private_tabs[r['name']]}」"
+                             f" {private_urls[r['name']]}"
                              if private_tabs.get(r["name"]) else "")
                          or _artifact_hint() or csv_paths[r["name"]])
                 msg.append(f"　▶ 対象一覧: {where}")

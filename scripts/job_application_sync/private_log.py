@@ -253,6 +253,14 @@ def replace_list(title: str, rows: list, create: bool = True) -> bool:
     「まだ要対応」に見えないように)。create=False ならタブが無いときは作らない。
     書けたら True。失敗しても例外は上げない (公開ログには件数だけ)。
     """
+    return bool(replace_list_url(title, rows, create))
+
+
+def replace_list_url(title: str, rows: list, create: bool = True) -> str:
+    """replace_list と同じ。書けたらそのタブの URL を返す (書けなければ "")。
+
+    URL は Slack の通知にだけ載せる (公開ログには出さない)。2026-10-23。
+    """
     title = (title or "要対応")[:90]
     cols: list = []
     for r in rows:
@@ -275,11 +283,13 @@ def replace_list(title: str, rows: list, create: bool = True) -> bool:
         # 書く範囲がグリッドを超えないよう、行数・列数を合わせる (余った古い行も消える)
         al.sheet_retry(ws.resize, rows=len(values), cols=len(values[0]))
         al.sheet_retry(ws.update, values, "A1", value_input_option="RAW")
-        return True
+        sid = (os.environ.get("PRIVATE_LOG_SHEET_ID", "")
+               or os.environ.get("JAS_APPLICANT_QUEUE_SHEET_ID", ""))
+        return f"https://docs.google.com/spreadsheets/d/{sid}/edit#gid={getattr(ws, 'id', '')}"
     except Exception as e:  # noqa: BLE001
         public(f"[private_log] 一覧タブに書けませんでした ({type(e).__name__})。"
                f"{len(rows)}行")
-        return False
+        return ""
 
 
 atexit.register(flush)

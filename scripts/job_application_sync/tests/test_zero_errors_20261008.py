@@ -100,7 +100,7 @@ def harness(monkeypatch, tmp_path):
                 "jobs_fetched": 0, "error": "" if ok else "login_failed", "login_id": ""}
     monkeypatch.setattr(S, "process_aw_account", fake_process)
     monkeypatch.setattr(S, "slack_notify",
-                        lambda message="", dry_run=False: state.slack.append(message))
+                        lambda message="", dry_run=False, rows=None: state.slack.append(message))
     monkeypatch.setattr(S, "SESSION_DIR", tmp_path / "sess")
     return state
 
@@ -270,7 +270,8 @@ def aw_stub(monkeypatch):
     monkeypatch.setattr(S, "_missing_aw_listings",
                         lambda ids, token: [j for j in ids if j in st.hubspot_missing])
 
-    def fake_ensure(bid, pw, missing, out_dir, absent_out=None, listing_ids_out=None):
+    def fake_ensure(bid, pw, missing, out_dir, absent_out=None, listing_ids_out=None,
+                    company=""):
         st.ensure_calls.append(sorted(missing))
         if absent_out is not None:
             absent_out.extend(missing)          # 媒体の一覧にも無かった
