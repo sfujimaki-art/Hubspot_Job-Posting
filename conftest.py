@@ -29,6 +29,10 @@ def _no_real_aw_ledger(monkeypatch, tmp_path):
     from scripts.job_application_sync import end_vanished_listings as ev
 
     monkeypatch.setattr(ev, "AW_LEDGER_PATH", tmp_path / "aw_fetch_ledger.json")
+    # 公開ページで確かめてから公開終了にする台帳 (2026-10-23) も同じく一時ディレクトリへ
+    from scripts.job_application_sync import aw_end_confirm as conf
+
+    monkeypatch.setattr(conf, "LEDGER_PATH", tmp_path / "aw_end_pending.json")
 
 
 @pytest.fixture(autouse=True)

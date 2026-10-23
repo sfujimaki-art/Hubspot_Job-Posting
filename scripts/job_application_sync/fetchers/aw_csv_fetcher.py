@@ -283,6 +283,17 @@ def _login_stop_url(url: str) -> bool:
     return "login_failed=true" in url or "usage_re_agreement" in url
 
 
+def _login_fail_tag(url: str) -> str:
+    """スクリーンショットの名前に入れる短い原因 (英数字だけ)。"""
+    if "login_failed=true" in url:
+        return "idpw"
+    if "usage_re_agreement" in url:
+        return "re_agreement"
+    if url.split("?")[0].rstrip("/").endswith("/interaction"):
+        return "interaction"
+    return "other"
+
+
 def login_fail_reason(url: str) -> str:
     """ログイン後に着いた画面 → 原因の短い言葉 (例外文と Slack の分類に使う)。"""
     if "login_failed=true" in url:
@@ -380,10 +391,20 @@ async def establish_aw_session(
     except Exception as e:  # noqa: BLE001
         err = e
     if not _is_authenticated_url(page.url):
+        reason = login_fail_reason(page.url)
+        # ★2026-10-23: /interaction で止まる社 (毎回 1 社) は画面に「現在ご利用いただけません」と
+        #   出ていた (スクリーンショットで確認)。その文があれば原因に添える。
+        if _login_fail_tag(page.url) == "interaction":
+            try:
+                if "現在ご利用いただけません" in (await page.content()):
+                    reason += " 画面の表示: 現在ご利用いただけません"
+            except Exception:  # noqa: BLE001
+                pass
         if output_dir:
-            await _dump_debug(page, output_dir, "login_failed")
+            # スクリーンショットの名前に原因を入れる (ユーザー「スクリーンショットがほしい」2026-10-23)
+            await _dump_debug(page, output_dir, f"login_failed_{_login_fail_tag(page.url)}")
         raise RuntimeError(
-            f"ログイン後 dashboards に遷移せず: {login_fail_reason(page.url)} "
+            f"ログイン後 dashboards に遷移せず: {reason} "
             f"(login_id={login_id}, last_url={page.url[:80]})"
         ) from err
 

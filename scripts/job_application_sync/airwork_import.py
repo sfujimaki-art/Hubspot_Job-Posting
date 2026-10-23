@@ -542,7 +542,7 @@ def find_published_listings_for_login(login_id: str) -> list[dict]:
         body = {
             "limit": 100,
             "properties": ["id_airwork", PROP_AW_LOGIN_ID, PROP_HS_KYUUJIN_STATUS,
-                           "hs_pipeline_stage"],
+                           "hs_pipeline_stage", "url_airwork"],
             "filterGroups": [{"filters": [
                 {"propertyName": PROP_AW_LOGIN_ID, "operator": "EQ", "value": login_id},
                 {"propertyName": PROP_HS_KYUUJIN_STATUS, "operator": "EQ", "value": "公開中"},
@@ -916,15 +916,18 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
     end_preview: list[dict] = []
     end_skipped_cap = 0
     end_search_failed = False
+    end_confirm: dict = {}
     end_checked = export_is_complete(len(rows), len(valid_rows), skipped_no_id,
                                      limit, login_id)
     if end_checked and (not dry_run or os.environ.get("HUBSPOT_ACCESS_TOKEN")):
         try:
             in_export = {str(j).strip() for j in media_job_ids}
             published = find_published_listings_for_login(login_id)
+            vanished = []
             for lst in published:
                 if str(lst["properties"].get("id_airwork")).strip() in in_export:
                     continue
+                vanished.append(lst)
                 props = build_end_missing_props(lst["properties"], now_iso,
                                                 source_filename)
                 ends.append({"id": lst["id"], "properties": props})
@@ -932,10 +935,32 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
                                     "hubspot_id": lst["id"], "properties": props})
             # 安全弁 (2026-10-15): 公開中の MAX_END_RATIO を超える終了は、壊れた取得の疑いなので見送る
             if _ev.over_cap(len(ends), len(published)):
-                end_skipped_cap = len(ends)
                 print(f"WARN: 終了予定 {len(ends)} 件が公開中 {len(published)} 件の"
-                      f" {int(_ev.MAX_END_RATIO * 100)}% を超えるため、この口座の公開終了は見送り")
-                ends, end_preview = [], []
+                      f" {int(_ev.MAX_END_RATIO * 100)}% を超えるため、公開ページで確かめた分だけ終了")
+                # ★2026-10-23 (ユーザー決定 案A): ネットが生きている回に公開ページが無く、
+                #   次の夜にもう一度見ても無い求人だけを公開終了にする (aw_end_confirm)。
+                keep: set = set()
+                try:
+                    from scripts.job_application_sync import aw_end_confirm as _conf
+                    controls = [l for l in published
+                                if str(l["properties"].get("id_airwork")).strip() in in_export]
+                    checked = _conf.check_pages(vanished, controls, recruit_site_url)
+                    dec = _conf.decide(login_id, [l["id"] for l in vanished], checked,
+                                       dry_run=dry_run)
+                    keep = dec["confirm"]
+                    end_confirm = {"net_ok": checked["net_ok"], "gone": len(checked["gone"]),
+                                   "alive": len(checked["alive"]),
+                                   "unknown": checked["unknown"],
+                                   "first_seen": dec["first"], "confirmed": len(keep)}
+                except Exception as e:  # noqa: BLE001
+                    keep = set()
+                    end_confirm = {"error": type(e).__name__}
+                    print(f"WARN: 公開ページの確認に失敗したため公開終了は見送り: {type(e).__name__}")
+                end_skipped_cap = len(ends) - len([x for x in ends if x["id"] in keep])
+                end_preview = [x for x in end_preview if x["hubspot_id"] in keep]
+                ends = [x for x in ends if x["id"] in keep]
+                print(f"  公開ページの確認: {end_confirm} → 公開終了 {len(ends)} 件 / "
+                      f"見送り {end_skipped_cap} 件")
         except Exception as e:
             ends, end_preview = [], []
             end_search_failed = True
@@ -947,6 +972,7 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         "ends_planned": len(ends),
         "ends_skipped_cap": end_skipped_cap,
         "end_search_failed": end_search_failed,
+        "end_confirm": end_confirm,
         "export_complete": bool(end_checked),
         "csv_total_rows": len(rows),   # キー名は後方互換のため csv_ を維持
         "skipped_no_id": skipped_no_id,
@@ -979,6 +1005,19 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
         u_ok, u_ng, u_err = batch_update(updates)
         c_ok, c_ng, c_err, idmap = batch_create(creates)
         e_ok, e_ng, e_err = batch_update(ends)
+        # ★2026-10-23: 公開ページで確かめて終了にした求人を台帳へ。終了にした求人が
+        #   エクスポートに再び公開中で載ったら (上の更新で公開中に戻る) 数える。
+        reopened = 0
+        try:
+            from scripts.job_application_sync import aw_end_confirm as _conf
+            if end_confirm.get("confirmed") and not e_ng:
+                _conf.mark_ended(login_id, [x["id"] for x in ends])
+            reopened = _conf.note_reopened(
+                [u["id"] for u in updates
+                 if u["properties"].get(PROP_HS_KYUUJIN_STATUS) == "公開中"])
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN: 公開終了の台帳を更新できませんでした: {type(e).__name__}")
+        summary["ends_reopened"] = reopened
         summary.update({
             "ends_ok": e_ok, "ends_ng": e_ng,
             "updates_ok": u_ok, "updates_ng": u_ng,

@@ -246,7 +246,10 @@ LOGIN_STOP_PATH = STATE_DIR / "aw_crawl_login_stop.json"
 
 def _is_login_stop(error: str) -> bool:
     e = str(error or "")
-    return "login_failed=true" in e or "usage_re_agreement" in e
+    # ★2026-10-23 (ユーザー暫定OK): 45 秒待っても /interaction (アカウント登録・ログイン選択、
+    #   「現在ご利用いただけません」) から進まなかった社も、その夜は試し直さない。
+    return ("login_failed=true" in e or "usage_re_agreement" in e
+            or ("/interaction" in e and "遷移せず" in e))
 
 
 def _relink_urgent(results: list, urgent_job_ids: dict) -> dict:
@@ -336,12 +339,34 @@ def _report_rows(results: list, notice: str) -> list:
                 f"更新 {hs_ng['updates_ng']} / 公開終了 {hs_ng['ends_ng']}",
                 "非公開ログ (実行ログ) の airwork_import_*_errors を確認してください"))
         cap = int(res.get("ends_skipped_cap") or 0)
+        conf = res.get("end_confirm") if isinstance(res.get("end_confirm"), dict) else {}
         if cap:
+            # ★2026-10-23 (案A): 公開ページで 2 回 (次の夜) 確かめた求人だけ公開終了にする。
+            if conf.get("error") or (conf and not conf.get("net_ok")):
+                why = ("公開ページの確認に失敗" if conf.get("error")
+                       else "ほかの公開ページも開けず、ネットの不調の可能性")
+                act = "次の巡回でもう一度確かめます (対応不要)"
+            else:
+                why = (f"公開ページが無い {conf.get('gone', 0)}件は次の夜にもう一度確かめて"
+                       f"公開終了にします / ページが開いた {conf.get('alive', 0)}件 /"
+                       f" 確かめられない {conf.get('unknown', 0)}件")
+                act = ("ページが開いた・確かめられない求人は、エアワークで公開を終えていれば"
+                       " HubSpot で公開終了にしてください")
             notes.append(report_sheet.row(
                 notice, "要確認", company, target,
                 f"エアワークの一覧から消えた公開中の求人 {cap}件の公開終了を見送りました"
-                f" (公開中の {int(_ev_ratio() * 100)}% を超えたため)",
-                "エアワークで公開を終えていれば、HubSpot で公開終了にしてください"))
+                f" (公開中の {int(_ev_ratio() * 100)}% を超えたため。{why})", act))
+        if int(conf.get("confirmed") or 0):
+            notes.append(report_sheet.row(
+                notice, "公開終了", company, target,
+                f"公開ページが 2 回 (12 時間以上あけて) 無かった求人 {conf['confirmed']}件を公開終了にしました",
+                "対応不要 (エアワークで再び公開されれば自動で公開中に戻ります)"))
+        if int(res.get("ends_reopened") or 0):
+            notes.append(report_sheet.row(
+                notice, "要確認", company, target,
+                f"公開ページで確かめて公開終了にした求人 {res['ends_reopened']}件が、"
+                "エアワークで再び公開中になったので公開中に戻しました",
+                "対応不要。何度も続くなら教えてください (判定の見直し)"))
         if res.get("end_search_failed"):
             notes.append(report_sheet.row(
                 notice, "要確認", company, target,
