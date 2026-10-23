@@ -14,6 +14,7 @@ job_copy_airwork_image_urls.py と同じ (そこから必要な部分だけ写�
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -152,6 +153,36 @@ def nuxt_images_empty(html_text):
     return value in names and len(names) == len(values) and values[names.index(value)].replace(" ", "") == "[]"
 
 
+def next_images_empty(html_text):
+    """Next.js 版のページで、埋め込みの求人データが「画像 0 件」とはっきり書いているときだけ True。
+
+    ★2026-10-23: 公開ページの一部が Nuxt (window.__NUXT__) から Next.js (__NEXT_DATA__ の JSON) に
+      変わっていた。画像の無い求人をこの形で読めず「画像の並び方を読み取れない」と数えていた
+      (10/23 朝の巡回で 1 件だけの社の公開ページを確かめた: jobOverViewSection.images が [])。
+    """
+    m = re.search(r'<script[^>]*\bid="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, re.S)
+    if not m:
+        return False
+    try:
+        data = json.loads(m.group(1))
+    except ValueError:
+        return False
+    found = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            sec = v.get("jobOverViewSection")
+            if isinstance(sec, dict) and "images" in sec:
+                found.append(sec["images"])
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(data)
+    return bool(found) and all(x == [] for x in found)
+
+
 def parse_gallery(html, page_url):
     gallery = Gallery()
     try:
@@ -162,7 +193,7 @@ def parse_gallery(html, page_url):
     if gallery.canonicals != [page_url]:
         raise CaptureError("page_identity_mismatch")
     if not gallery.has_gallery:
-        if nuxt_images_empty(html_text):
+        if nuxt_images_empty(html_text) or next_images_empty(html_text):
             return []
         raise CaptureError("gallery_layout_unrecognized")
     if len(gallery.images) > MAX_IMAGES:

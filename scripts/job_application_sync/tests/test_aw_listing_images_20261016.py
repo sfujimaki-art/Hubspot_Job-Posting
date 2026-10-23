@@ -118,3 +118,24 @@ def test_巡回の最後に画像の件数と読めなかった理由を合計�
     assert tot == {"targets": 5, "written": 1, "same": 1, "page_failed": 3,
                    "page_failed_reasons": {"public_page_unavailable": 2,
                                            "gallery_layout_unrecognized": 1}}
+
+
+def _next_page(job, images):
+    import json as _json
+    url = f"{SITE}/{job}/"
+    data = {"props": {"pageProps": {"jobOverViewSection": {"title": "t", "images": images}}}}
+    return (f'<html><head><link rel="canonical" href="{url}"></head><body>'
+            f'<script id="__NEXT_DATA__" type="application/json">{_json.dumps(data)}</script>'
+            "</body></html>").encode("utf-8"), url
+
+
+def test_NextJs版のページで画像0件なら読めたことにする_2026_10_23():
+    """10/23: 公開ページの一部が Next.js になり、画像の無い求人を「読み取れない」と数えていた。"""
+    html, url = _next_page("44", [])
+    assert I.parse_gallery(html, url) == []
+    html, url = _next_page("45", [{"src": "https://cdn.arwrk.net/images/rct/x.jpg"}])
+    try:
+        I.parse_gallery(html, url)
+        raise AssertionError("画像があるのに並びが読めないページは、0 件にしない")
+    except I.CaptureError as e:
+        assert str(e) == "gallery_layout_unrecognized"

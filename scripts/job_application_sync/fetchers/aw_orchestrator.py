@@ -249,6 +249,35 @@ def _is_login_stop(error: str) -> bool:
     return "login_failed=true" in e or "usage_re_agreement" in e
 
 
+def _relink_urgent(results: list, urgent_job_ids: dict) -> dict:
+    """至急の取得で求人が取れた社について、その応募の求人IDだけ紐付け直す (2026-10-23)。
+
+    ★ユーザー指示 (2026-10-23「する」): これまでは求人が入っても、紐付くのは次の
+      応募の取り込みの回 (Actions の HR の回、5分ごと) の relink 任せだった。その relink は
+      対象外の応募を全部見て回るので、件数が多いとページの途中で止まり取りこぼす。
+      至急の取得は応募の求人IDが分かっているので、そのIDだけで引き直す (applicant_sync.relink の
+      target_job_ids。応募の取り込みの自己修復と同じ経路)。失敗しても通常の relink が後で拾う。
+    """
+    ids = []
+    for r in results:
+        if r.get("status") == "ok":
+            ids += urgent_job_ids.get(r.get("login_id", ""), [])
+    ids = list(dict.fromkeys(str(j) for j in ids if j))
+    if not ids:
+        return {}
+    try:
+        from scripts.job_application_sync import applicant_sync as _aps  # 循環 import を避ける
+        res = _aps.relink(dry_run=False, target_job_ids=ids)
+        print(f"[orchestrate] 至急の取得の後の紐付け直し: 求人ID {len(ids)}件 → "
+              f"紐付け {res.get('relinked', 0)}件 / まだ求人なし {res.get('still_unlinked', 0)}件",
+              flush=True)
+        return res
+    except Exception as e:  # noqa: BLE001  例外文に ID が入りうるので型名だけ
+        print(f"[orchestrate] 至急の取得の後の紐付け直しに失敗 (次の relink で拾う): "
+              f"{type(e).__name__}", flush=True)
+        return {}
+
+
 def _order_stale_first(accounts: list, last_ok: dict) -> list:
     """最後に取れたのが古い社から並べる (一度も取れていない社が先頭)。同じなら元の順。
 
@@ -725,6 +754,7 @@ async def orchestrate(parallel: int = 5,
     if from_urgent_queue:
         # ★2026-10-16: 応募の求人が HubSpot に無かった社だけを取る (fetchers/aw_urgent_queue.py)。
         pend = _urgent.pending()
+        urgent_job_ids = {lid: list(e.get("job_ids") or []) for lid, e in pend.items()}
         if not pend:
             print("[orchestrate] すぐ取りに行く待ち行列は空です", flush=True)
             return {"ok": 0, "ng": 0, "total": 0, "log": None}
@@ -871,6 +901,8 @@ async def orchestrate(parallel: int = 5,
         f"🔄 AW巡回({phase}) {total}社処理: "
         + " / ".join(f"{k}={v}" for k, v in acct_summary.items()),
         _report_rows(results, notice), dry_run)
+    if from_urgent_queue and not dry_run:
+        _relink_urgent(results, urgent_job_ids)
 
     # --- Phase1(create): 生成トリガー成功社をキューに保存 (Phase2引き継ぎ) ---
     if phase == "create":
@@ -1154,10 +1186,11 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
             accounts = accounts[:limit]
         jobs = [(a, pending_weeks(a.get("login_id", ""))) for a in accounts]
         jobs = [(a, w) for a, w in jobs if w]
-        # ★2026-10-20: 巡回で ID/PW 誤り・規約の再同意と分かった社 (20 時間以内) は、
+        # ★2026-10-20: 巡回で ID/PW 誤り・規約の再同意と分かった社 (AW_LOGIN_STOP_HOURS 時間以内) は、
         #   作成のやり直しでもログインしない。巡回の最後の作成のやり直しが、この 36 社に
         #   誤ったパスワードのログインをもう一度ずつしていた (1 社 60〜90 秒の順番も使う)。
-        stop_h = float(os.environ.get("AW_LOGIN_STOP_HOURS", "20"))
+        #   ★2026-10-23 ユーザー指示: 止める時間は 20 時間 → 10 時間。
+        stop_h = float(os.environ.get("AW_LOGIN_STOP_HOURS", "10"))
         stopped = _load_last_ok(LOGIN_STOP_PATH)
         cutoff = time.time() - stop_h * 3600
         n_before = len(jobs)
