@@ -99,3 +99,16 @@ def finish(login_id: str, ok: bool, path: Path = None) -> None:
                 d["tried"][j] = now
             del d["pending"][login_id]
         _write(p, d)
+
+
+def tried_ids(path: Path = None) -> set:
+    """取りに行き終わった求人ID (TRY_AGAIN_HOURS 時間以内)。取った後も HubSpot に求人が
+    無いなら、媒体の一覧に無い求人と考え、応募を待たせずに作る (applicant_sync の hold)。"""
+    d = _read(_path(path))
+    cutoff = time.time() - TRY_AGAIN_HOURS * 3600
+    return {j for j, t in d["tried"].items() if t >= cutoff}
+
+
+def pending_companies(path: Path = None) -> set:
+    """求人を取りに行く順番を待っている社 (社名)。"""
+    return {str(e.get("company") or "") for e in _read(_path(path))["pending"].values()}

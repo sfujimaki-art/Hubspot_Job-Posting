@@ -148,7 +148,7 @@ def _row(name="山田 太郎", email="a@example.com", phone="09012345678",
 def test_同一run内で同じキーは2件目をスキップする(monkeypatch):
     calls = []
 
-    def fake(row, client, default_login_id=""):
+    def fake(row, client, default_login_id="", hold_job_ids=None):
         calls.append(row.raw_lineno)
         return ai.ProcessResult(status="linked", applicant_key=str(row.raw_lineno),
                                 media=row.media, media_job_id=row.media_job_id)
@@ -162,7 +162,7 @@ def test_同一run内で同じキーは2件目をスキップする(monkeypatch)
 
 def test_同一run内でも求人IDが違えば別扱い(monkeypatch):
     monkeypatch.setattr(ai, "process_applicant",
-                        lambda row, c, default_login_id="": ai.ProcessResult(
+                        lambda row, c, default_login_id="", hold_job_ids=None: ai.ProcessResult(
                             status="linked", applicant_key="x",
                             media=row.media, media_job_id=row.media_job_id))
     res = ai.run_import([_row(job="111", lineno=1), _row(job="222", lineno=2)],
@@ -172,7 +172,7 @@ def test_同一run内でも求人IDが違えば別扱い(monkeypatch):
 
 def test_同一run内でも応募日が違えば別扱い(monkeypatch):
     monkeypatch.setattr(ai, "process_applicant",
-                        lambda row, c, default_login_id="": ai.ProcessResult(
+                        lambda row, c, default_login_id="", hold_job_ids=None: ai.ProcessResult(
                             status="linked", applicant_key="x",
                             media=row.media, media_job_id=row.media_job_id))
     res = ai.run_import([_row(date="2026-08-08", lineno=1),
@@ -183,7 +183,7 @@ def test_同一run内でも応募日が違えば別扱い(monkeypatch):
 def test_メールが違っても電話が同じなら同一run内で弾く(monkeypatch):
     """indeedemail のエイリアス末尾違いはこれで潰れる。"""
     monkeypatch.setattr(ai, "process_applicant",
-                        lambda row, c, default_login_id="": ai.ProcessResult(
+                        lambda row, c, default_login_id="", hold_job_ids=None: ai.ProcessResult(
                             status="linked", applicant_key="x",
                             media=row.media, media_job_id=row.media_job_id))
     res = ai.run_import([_row(email="x_x66@indeedemail.com", lineno=1),
@@ -194,7 +194,7 @@ def test_メールが違っても電話が同じなら同一run内で弾く(monk
 def test_メールも電話も無い行はrun内dedupの対象外(monkeypatch):
     """キーが作れないものを勝手に同一視しない（別人を潰さない）。"""
     monkeypatch.setattr(ai, "process_applicant",
-                        lambda row, c, default_login_id="": ai.ProcessResult(
+                        lambda row, c, default_login_id="", hold_job_ids=None: ai.ProcessResult(
                             status="linked", applicant_key="x",
                             media=row.media, media_job_id=row.media_job_id))
     res = ai.run_import([_row(email="", phone="", lineno=1),

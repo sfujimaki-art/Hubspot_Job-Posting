@@ -130,7 +130,7 @@ def test_応募の回は求人を取りに行かず_無い求人IDを返す(monk
     monkeypatch.setattr(S, "_new_aw_client", lambda token: _Cli())
     monkeypatch.setattr(S, "_ensure_aw_jobs", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("応募の回で求人を取りに行ってはいけない")))
-    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="": [
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="", hold_job_ids=None: [
         ai.ProcessResult(status="unlinked", applicant_key="k", media="AirWork", media_job_id="J2")])
     r = S.process_aw_account("A社", ["bid1"], "pw", Path("."), dry_run=False,
                              allow_acquire=False, known_absent={"J3"})
@@ -236,7 +236,7 @@ def test_枠が0の関数を渡されても_無い求人IDを返す(monkeypatch)
     monkeypatch.setattr(S, "_new_aw_client", lambda token: _Cli())
     monkeypatch.setattr(S, "_ensure_aw_jobs", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("枠 0 なのに求人を取りに行った")))
-    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="": [
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="", hold_job_ids=None: [
         ai.ProcessResult(status="unlinked", applicant_key="k", media="AirWork", media_job_id="J2")])
     r = S.process_aw_account("A社", ["bid1"], "pw", Path("."), dry_run=False,
                              allow_acquire=lambda: False, known_absent=set())

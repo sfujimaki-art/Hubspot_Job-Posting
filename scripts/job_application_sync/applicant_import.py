@@ -304,7 +304,7 @@ class ApplicantRow:
 
 @dataclass
 class ProcessResult:
-    status: str                # 'linked' / 'unlinked' / 'skip_duplicate' / 'error'
+    status: str                # 'linked' / 'unlinked' / 'held' / 'skip_duplicate' / 'error'
     applicant_key: str
     media: str
     media_job_id: str
@@ -1234,9 +1234,13 @@ def build_appointment_properties(
 # 主要処理
 # ============================================================================
 def process_applicant(
-    row: ApplicantRow, client: HubSpotClient, default_login_id: str = ""
+    row: ApplicantRow, client: HubSpotClient, default_login_id: str = "",
+    hold_job_ids: Optional[set] = None,
 ) -> ProcessResult:
-    """1応募行を処理 (本体は _process_applicant)。HR固有の結びつけ情報を結果に付ける。"""
+    """1応募行を処理 (本体は _process_applicant)。HR固有の結びつけ情報を結果に付ける。
+
+    hold_job_ids: 求人を取りに行っている最中の求人ID。HubSpot に求人が無ければ、
+      応募を作らず status='held' で返す (求人ができた後の回で、紐付けて作る)。"""
     dropped: list = []
     if row.extra:
         # 0-421 に無いプロパティを書くとレコードごと拒否されるので、実在するものだけにする
@@ -1244,14 +1248,15 @@ def process_applicant(
                  if hasattr(client, "known_appointment_props") else None)
         kept, dropped = hrf.filter_known_props(row.extra, known)
         row = replace(row, extra=kept)
-    res = _process_applicant(row, client, default_login_id)
+    res = _process_applicant(row, client, default_login_id, hold_job_ids)
     res.hr_applicant_id = row.hr_applicant_id
     res.dropped_props = dropped
     return res
 
 
 def _process_applicant(
-    row: ApplicantRow, client: HubSpotClient, default_login_id: str = ""
+    row: ApplicantRow, client: HubSpotClient, default_login_id: str = "",
+    hold_job_ids: Optional[set] = None,
 ) -> ProcessResult:
     """1応募行を処理。LISTING検索 → 重複検出 → APPOINTMENT 作成 → Association。
 
@@ -1345,6 +1350,16 @@ def _process_applicant(
             message=f"既存APPOINTMENT {existing} と (media, media_job_id, 電話, メール) 一致",
         )
 
+    # ★2026-10-26 ユーザー指示「求人なしで入るのがだめ (基本的には)」:
+    #   求人を取りに行っている最中なら、ここでは作らない。求人ができた後の回で紐付けて作る。
+    #   取りに行っても求人が無い・待ちすぎた場合は、呼び出し側が hold から外すので従来どおり作る。
+    if not listing_id and hold_job_ids and row.media_job_id in hold_job_ids:
+        return ProcessResult(
+            status="held", applicant_key=applicant_key,
+            media=row.media, media_job_id=row.media_job_id,
+            message="求人が HubSpot にまだ無いため、求人の取得を待って作る",
+        )
+
     # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグ + 所有者 + 応募先求人情報を引き継ぐ)
     ichijitaiou = client.get_listing_ichijitaiou(listing_id) if listing_id else None
     owner_id = client.get_listing_owner(listing_id) if listing_id else None
@@ -1401,7 +1416,8 @@ def _dedup_keys_in_run(row: "ApplicantRow") -> list:
 
 
 def run_import(
-    rows: Iterable[ApplicantRow], client: HubSpotClient, default_login_id: str = ""
+    rows: Iterable[ApplicantRow], client: HubSpotClient, default_login_id: str = "",
+    hold_job_ids: Optional[set] = None,
 ) -> list[ProcessResult]:
     results = []
     seen_in_run: set = set()
@@ -1416,7 +1432,7 @@ def run_import(
                     message="同一run内の重複 (HubSpot検索の反映待ちを回避)",
                 ))
                 continue
-            results.append(process_applicant(row, client, default_login_id))
+            results.append(process_applicant(row, client, default_login_id, hold_job_ids))
             seen_in_run.update(keys)
         except Exception as e:
             results.append(ProcessResult(

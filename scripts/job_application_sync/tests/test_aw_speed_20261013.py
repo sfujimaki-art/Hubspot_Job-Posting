@@ -285,7 +285,7 @@ def test_1行でもエラーがあれば_okにしない(monkeypatch):
     def pr(st):
         return ai.ProcessResult(status=st, applicant_key="k", media="AirWork",
                                 media_job_id="J1")
-    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="":
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="", hold_job_ids=None:
                         [pr("skip_duplicate"), pr("linked"), pr("error")])
     r = S._process_aw_account_raw("A社", ["id"], "pw", Path("."), dry_run=False,
                                   allow_acquire=False, known_absent=set())

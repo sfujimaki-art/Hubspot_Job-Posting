@@ -101,6 +101,12 @@ def _report_sheet1_health(ledger, cutoff_iso: str, dry_run: bool) -> None:
 
 
 MAX_ATTEMPTS = 3
+# ★2026-10-26 ユーザー指示「求人なしで入るのがだめ (基本的には)」:
+#   応募の求人が HubSpot に無いときは、至急の取得 (aw_urgent_queue) が求人を作るまで
+#   その応募を作らずに待つ (台帳は WAIT_JOB、試行回数は数えない)。至急の取得は 5 分ごとで、
+#   実測は応募から約 9 分で求人ができた (2026-10-26 14:20 → 14:28)。
+#   取りに行っても求人が無い (終わった求人など)・この時間を超えたら、従来どおり求人なしで作る。
+HOLD_MAX_MIN = float(os.environ.get("JAS_AW_HOLD_MAX_MIN", "60"))
 LOCK_STALE_SEC = 15 * 60
 # 1run あたりに処理する AW アカウント数の上限。
 # ★2026-10-13: 目標は「1社1分以内・10並列・50社5分」(ユーザー指定)。
@@ -235,6 +241,16 @@ class Ledger:
         e["updated"] = datetime.now().isoformat()
         if error:
             e["last_error"] = error[:300]
+
+    def mark_wait(self, row_id: str, company: str, reason: str) -> None:
+        """求人ができるのを待つ (WAIT_JOB)。試行回数は数えない。待ち始めは最初の 1 回だけ記録する。"""
+        e = self.data.setdefault(row_id, {"attempts": 0})
+        if e.get("status") != "WAIT_JOB" or not e.get("wait_since"):
+            e["wait_since"] = datetime.now().isoformat()
+        e["status"] = "WAIT_JOB"
+        e["wait_company"] = company
+        e["last_error"] = reason[:300]
+        e["updated"] = datetime.now().isoformat()
 
     def bump(self, row_id: str, error: str) -> int:
         e = self.data.setdefault(row_id, {"attempts": 0})
@@ -478,15 +494,38 @@ def order_aw_groups(cands: list, failed_before) -> list:
     return sorted(cands, key=lambda c: bool(failed_before(c[0])))
 
 
+def hold_job_ids(missing, hold_since: dict, tried: set, now: Optional[float] = None) -> set:
+    """応募を作らずに待つ求人ID。至急の取得がまだ取りに行っておらず、待ち始めてから
+    HOLD_MAX_MIN 分以内のもの。待ち始めの記録が無ければ今から待つ。"""
+    now = time.time() if now is None else now
+    return {j for j in missing
+            if j not in tried and now - hold_since.get(j, now) < HOLD_MAX_MIN * 60}
+
+
+def wait_job_due(entry: dict, urgent_waiting_companies: set,
+                 now: Optional[datetime] = None) -> bool:
+    """WAIT_JOB の行を取り直してよいか。至急の取得の待ち行列にその社が無い (取り終えた)、
+    または待ち始めから HOLD_MAX_MIN 分を過ぎたら取り直す。"""
+    now = now or datetime.now()
+    try:
+        since = datetime.fromisoformat(entry.get("wait_since") or "")
+    except ValueError:
+        return True
+    if (now - since).total_seconds() >= HOLD_MAX_MIN * 60:
+        return True
+    return (entry.get("wait_company") or "") not in urgent_waiting_companies
+
+
 def process_aw_account(
     company: str, b_ids: list[str], b_pw: str,
     out_dir: Path, dry_run: bool = True,
     allow_acquire: bool = False,
     known_absent: Optional[set] = None,
+    hold_since: Optional[dict] = None,
 ) -> dict:
     """AW 1アカウントの応募を取得→登録し、結果のログインID・パスワードを伏せて返す。"""
     res = _process_aw_account_raw(company, b_ids, b_pw, out_dir, dry_run, allow_acquire,
-                                  known_absent=known_absent)
+                                  known_absent=known_absent, hold_since=hold_since)
     res["error"] = scrub_secrets(res.get("error", ""), list(b_ids or []),
                                  passwords=[b_pw])
     if res.get("missing_job_ids"):
@@ -516,9 +555,13 @@ def _process_aw_account_raw(
     out_dir: Path, dry_run: bool = True,
     allow_acquire: bool = False,
     known_absent: Optional[set] = None,
+    hold_since: Optional[dict] = None,
 ) -> dict:
     """AW 1アカウントの応募を取得→(案2b求人先行)→登録。複数B系IDは順に試行。
     Returns: {ok, linked, unlinked, no_listing_old, dup, jobs_fetched, error, login_id}
+    hold_since: {求人ID: 待ち始めた時刻 (epoch 秒)}。HubSpot に無い求人への応募は、
+      至急の取得がまだその求人を取りに行っておらず、待ち始めから HOLD_MAX_MIN 分以内なら
+      作らずに待つ (戻り値の held_job_ids)。
     known_absent: 媒体の求人一覧に無かった求人ID (台帳に覚えたもの)。
       自己修復で取りに行かず、その求人への応募は unlinked でなく no_listing_old で数える。
       渡された set は書き換えない (社を並列で処理するため)。今回新たに一覧に無かった
@@ -631,12 +674,16 @@ def _process_aw_account_raw(
                 if missing is None:
                     missing = _missing_aw_listings(job_ids, token)
                 result["missing_job_ids"] = [j for j in missing if j not in known]
+                result["held_job_ids"] = sorted(hold_job_ids(
+                    result["missing_job_ids"], hold_since or {},
+                    aw_urgent_queue.tried_ids()))
             except Exception as e:  # noqa: BLE001 — 数えられなくても応募の取り込みは続ける
                 print(f"  求人の有無を数えられませんでした: {type(e).__name__}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)
         cli.prefetch_appointments(
             (getattr(rows[0], "media", "") or "AirWork") if rows else "AirWork", job_ids)
-        results = ai.run_import(rows, cli, default_login_id=bid)
+        results = ai.run_import(rows, cli, default_login_id=bid,
+                                hold_job_ids=set(result.get("held_job_ids") or ()))
         result["hubspot"] = dict(cli.stats)
         from collections import Counter
         st = Counter(r.status for r in results)
@@ -668,6 +715,7 @@ def _process_aw_account_raw(
                       unlinked=st.get("unlinked", 0) - n_old,
                       no_listing_old=n_old,
                       dup=st.get("skip_duplicate", 0),
+                      held=st.get("held", 0),
                       error_rows=n_err, total=len(results))
         if n_err:
             result["error"] = (f"{bid}: 取込エラー {n_err}/{len(results)}行")
@@ -866,7 +914,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
     # no_auth        : 企業AirWorkのID・PWがシートに無く、ログインしなかった応募
     summary = {"accounts": 0, "done": 0, "failed": 0, "reported": 0,
                "unresolved": 0, "out_of_scope": 0, "linked": 0,
-               "unlinked": 0, "no_listing_old": 0, "no_auth": 0}
+               "unlinked": 0, "no_listing_old": 0, "no_auth": 0, "held": 0}
     try:
         if source == "sheet1":
             # GAS queue座礁の迂回: シート1を直読み(F列マーカーで未処理判定)。
@@ -891,10 +939,20 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
         #   FAILED かつ試行上限超過 = 認証欠落/ログイン失敗の恒常エラー。除外しないと
         #   先頭スロットに居座り続け(実測156回リトライ)、後続の正常アカウントが永久に
         #   処理されずAWが詰まる(2026-07-23 発見)。上限超過はSlack報告済=手動対応待ち。
-        def _skip_item(rid: str) -> bool:
+        try:
+            _urgent_waiting = aw_urgent_queue.pending_companies()
+        except Exception:  # noqa: BLE001 — 読めなければ待たずに取り直す
+            _urgent_waiting = set()
+
+        def _skip_item(it) -> bool:
+            rid = it.row_id
             st = ledger.status(rid)
             if st in ("DONE", "SKIP"):
                 return True
+            if st == "WAIT_JOB":
+                # 至急の取得がこの社の求人を取り終えたら (待ち行列から外れたら) 取り直す。
+                # 待ちすぎたら取り直し、process 側が hold から外して求人なしで作る。
+                return not wait_job_due(ledger.data.get(rid) or {}, _urgent_waiting)
             if st == "FAILED" and ledger.attempts(rid) >= MAX_ATTEMPTS:
                 # ★恒久除外にしない (2026-08-07)。
                 #   5分間隔なので3回失敗＝**15分で永久に見放す**設計だった。
@@ -939,7 +997,7 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 _st["SKIP"] += 1
             elif _s == "FAILED" and ledger.attempts(_it.row_id) >= MAX_ATTEMPTS:
                 _st["FAILED_OVER"] += 1
-        items = [it for it in items if not _skip_item(it.row_id)]
+        items = [it for it in items if not _skip_item(it)]
         print(f"[applicant_sync] 台帳による除外: {_before}件 → {len(items)}件 "
               f"(DONE={_st['DONE']} SKIP={_st['SKIP']} "
               f"FAILED上限超={_st['FAILED_OVER']}) / 台帳の総記録数="
@@ -1166,13 +1224,15 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
                 return True
 
         absent_snapshot = frozenset(known_absent)
+        hold_snapshot = {j: float(ledger.meta("aw_hold_job", j).get("since") or 0)
+                         for j in ledger.meta_names("aw_hold_job")}
 
         def _work(company, acc):
             t0 = time.monotonic()
             r = process_aw_account(
                 company, acc.b_ids, acc.b_pw, out_dir, dry_run,
                 allow_acquire=(_claim_acquire if not dry_run else False),
-                known_absent=absent_snapshot)
+                known_absent=absent_snapshot, hold_since=hold_snapshot)
             r["elapsed"] = time.monotonic() - t0
             return r
 
@@ -1199,9 +1259,22 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             if res["ok"]:
                 if ledger.meta("aw_fail", ck).get("failed"):
                     ledger.set_meta("aw_fail", ck, failed=False)
-                for it in group:
-                    ledger.mark(it.row_id, "DONE")
-                summary["done"] += len(group)
+                held = res.get("held", 0)
+                if held and not dry_run:
+                    now_ts = time.time()
+                    for j in res.get("held_job_ids") or []:
+                        if not ledger.meta("aw_hold_job", j).get("since"):
+                            ledger.set_meta("aw_hold_job", j, since=now_ts)
+                    for it in group:
+                        ledger.mark_wait(it.row_id, company,
+                                         f"求人がHubSpotに無い応募{held}件: 求人の取得待ち")
+                    summary["held"] += held
+                    print(f"  ⏸ {plog.mask_name(company)}: 求人が HubSpot にまだ無い応募 {held}件は"
+                          f"作らずに、求人の取得を待ちます (最長 {HOLD_MAX_MIN:.0f}分)", flush=True)
+                else:
+                    for it in group:
+                        ledger.mark(it.row_id, "DONE")
+                    summary["done"] += len(group)
                 summary["linked"] += res.get("linked", 0)
                 summary["unlinked"] += res.get("unlinked", 0)
                 summary["no_listing_old"] += res.get("no_listing_old", 0)

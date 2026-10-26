@@ -93,7 +93,7 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(aq, "AccountResolver", lambda: _FakeResolver(state.accounts))
 
     def fake_process(company, b_ids, b_pw, out_dir, dry_run=True,
-                     allow_acquire=False, known_absent=None):
+                     allow_acquire=False, known_absent=None, hold_since=None):
         state.calls.append(company)
         ok = state.ok.get(company, True)
         return {"ok": ok, "linked": 0, "unlinked": 0, "no_listing_old": 0, "dup": 0,
@@ -266,7 +266,7 @@ def aw_stub(monkeypatch):
     monkeypatch.setattr(ai, "append_apply_time_log", lambda p: 0)
     monkeypatch.setattr(ai, "RealHubSpotClient", lambda token: object())
     monkeypatch.setattr(S, "_new_aw_client", lambda token: _NoPrefetch())
-    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="": list(st.results))
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli, default_login_id="", hold_job_ids=None: list(st.results))
     monkeypatch.setattr(S, "_missing_aw_listings",
                         lambda ids, token: [j for j in ids if j in st.hubspot_missing])
 
@@ -324,7 +324,7 @@ def test_一覧に無い求人IDを台帳に覚える(harness, monkeypatch):
     harness.accounts = {"A社": (["id"], "pw")}
 
     def proc(company, b_ids, b_pw, out_dir, dry_run=True, allow_acquire=False,
-             known_absent=None):
+             known_absent=None, hold_since=None):
         return {"ok": True, "linked": 0, "unlinked": 0, "no_listing_old": 1, "dup": 0,
                 "jobs_fetched": 0, "error": "", "login_id": "", "absent_new": ["J9"]}
     monkeypatch.setattr(S, "process_aw_account", proc)
