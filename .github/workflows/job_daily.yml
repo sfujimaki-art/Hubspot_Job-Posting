@@ -60,7 +60,7 @@ jobs:
     if: >-
       github.event.schedule != '40 16 * * *' &&
       inputs.phase != 'deal-hygiene'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
       group: job-daily
