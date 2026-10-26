@@ -1,12 +1,15 @@
-# HR応募の取りこぼし照合 (毎朝, 2026-10-26)
+# HR応募の取りこぼし照合 (毎時, 2026-10-26)
 #
-# HRハッカーの応募一覧 (直近14日) と HubSpot の応募 (0-421) を突き合わせ、
-# HubSpot に無い応募を通常の取り込み (run_import) で取り込み直す。
+# HRハッカーの応募一覧 (直近3日) と HubSpot の応募 (0-421) を突き合わせ、
+# HubSpot に無い応募を通常の取り込み (run_import) で登録する。通知シートは経由しない。
 # 取り込みと同じ重複判定 (同じ人・同じ求人・同じ日) の既存は正しい重複として除く。
+# 登録したら Slack に「照合で N 件を追加登録」を 1 行 (0 件なら送らない)。
+# 登録し直しても残るものは Issue (ラベル hr-reconcile) を立て、立てたときだけ Slack に知らせる。
 # 詳しくは scripts/job_application_sync/hr_reconcile.py の先頭。
 #
-# 開始日 (cutoff) を指定した Applicant Sync の回収を起動しないのは、回収もシート1の通知を
-# 起点に読み、すでに台帳で DONE の通知は除外するため、取りこぼした応募が読まれないから。
+# なぜ通知シートを経由しないか: 応募同期は通知シートの行をきっかけに読む。通知の行が来ない、
+# または行が来ても台帳で処理済み扱いになると、その応募は二度と読まれない
+# (開始日を指定した回収も同じ台帳で除外する)。2026-10 に 22:30〜23:40 の応募 4 件がこれで抜けた。
 #
 # 公開リポ: ログ・Slack・Issue に出るのは 件数・日付・応募経路の番号・店舗ID・hash の先頭8文字まで。
 # 応募の CSV は一時フォルダに置いて消す (artifact には上げない)。
@@ -18,7 +21,7 @@ name: HR Reconcile
 
 on:
   schedule:
-    - cron: "15 22 * * *"   # JST 07:15 (夜の応募が通常の同期で入ったあと、朝の対応の前)
+    - cron: "35 * * * *"    # 毎時35分 (応募から60分未満のものは通常の同期に任せて数えない)
 
 concurrency:
   group: hr-reconcile
@@ -52,22 +55,26 @@ jobs:
         run: |
           python scripts/job_application_sync/hr_reconcile.py --actual --import-missing --slack \
             --status-file "$RUNNER_TEMP/hr_reconcile.json"
-      - name: 残ったら Issue
+      - name: 残ったら Issue と Slack (開いている Issue が無いときだけ)
         env:
           GH_TOKEN: ${{ github.token }}
           R: ${{ github.repository }}
+          SLACK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
         run: |
           set -euo pipefail
           S="$RUNNER_TEMP/hr_reconcile.json"
           LEFT=$(jq -r '.remaining' "$S")
-          echo "取り込み直したあとも残った件数: $LEFT"
+          echo "登録し直したあとも残った件数: $LEFT"
           [ "$LEFT" -gt 0 ] || exit 0
-          BODY=$(jq -r '"範囲: \(.range[0])〜\(.range[1])\nHRの応募: \(.checked) / 取り込み済み: \(.in_hubspot) / 正しい重複: \(.duplicate)\n取りこぼし: \(.missing) / 取り込み直し: \(.imported|tostring) / まだ無い: \(.remaining)\n\n| 応募日時 | 応募経路 | 店舗ID | key |\n|---|---|---|---|\n" + ([.remaining_items[] | "| \(.applied) | \(.route) | \(.shop_id) | \(.key) |"] | join("\n"))' "$S")
-          BODY=$(printf '%s\n\n実行: %s' "$BODY" "$GITHUB_SERVER_URL/$R/actions/runs/$GITHUB_RUN_ID")
           gh label create hr-reconcile -R "$R" --color FBCA04 --description "HR応募の取りこぼし" 2>/dev/null || true
-          N=$(gh issue list -R "$R" --label hr-reconcile --state open --json number --jq '.[0].number // empty')
-          if [ -n "$N" ]; then
-            gh issue comment "$N" -R "$R" --body "$BODY"
-          else
-            gh issue create -R "$R" --label hr-reconcile --title "HR応募の取りこぼしが取り込み直しても残っています" --body "$BODY"
+          # 毎時くり返さない。開いている Issue があれば何もしない (閉じたらまた知らせる)
+          if [ -n "$(gh issue list -R "$R" --label hr-reconcile --state open --json number --jq '.[0].number // empty')" ]; then
+            echo "開いている Issue があるので知らせない"; exit 0
+          fi
+          BODY=$(jq -r '"範囲: \(.range[0])〜\(.range[1])\nHRの応募: \(.checked) / 取り込み済み: \(.in_hubspot) / 正しい重複: \(.duplicate)\n取りこぼし: \(.missing) / 追加登録: \(.added) / まだ無い: \(.remaining)\n\n| 応募日時 | 応募経路 | 店舗ID | key |\n|---|---|---|---|\n" + ([.remaining_items[] | "| \(.applied) | \(.route) | \(.shop_id) | \(.key) |"] | join("\n"))' "$S")
+          BODY=$(printf '%s\n\n確認したら閉じてください。閉じたあとも残っていれば、次の回でまた知らせます。\n実行: %s' "$BODY" "$GITHUB_SERVER_URL/$R/actions/runs/$GITHUB_RUN_ID")
+          URL=$(gh issue create -R "$R" --label hr-reconcile --title "HR応募の取りこぼしが登録し直しても残っています" --body "$BODY")
+          if [ -n "$SLACK" ]; then
+            MSG="🛑 HR応募の照合: 登録し直しても ${LEFT} 件が HubSpot にありません。人の確認が必要です: $URL"
+            curl -sS -X POST -H 'Content-Type: application/json' --data "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK" >/dev/null || true
           fi

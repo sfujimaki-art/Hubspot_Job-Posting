@@ -16,7 +16,7 @@
 |---|---|---|---|
 | `applicant_sync.yml` | Applicant Sync | 5分おき (外部の GAS が `workflow_dispatch` で起動。cron は残置) | シート1 (応募通知) を起点に HR の応募を HubSpot に登録し、顧客シートへ転記する。AirWork は処理しない |
 | `job_daily.yml` | Job Daily | `job`: JST 1時・12時・20時、`deal_hygiene`: JST 1時40分 | `job` は HR の求人 CSV を HubSpot の求人票に反映 (差分・店舗ID補完・持ち主判定)。`deal_hygiene` は取引まわりの健全性 |
-| `hr_reconcile.yml` | HR Reconcile | 毎朝 JST 7時15分 | HR の応募一覧 (直近14日) と HubSpot を突き合わせ、取りこぼしを取り込み直す。残れば Slack と Issue |
+| `hr_reconcile.yml` | HR Reconcile | 毎時35分 | HR の応募一覧 (直近3日) と HubSpot を突き合わせ、通知シートを経由せずに取りこぼしを登録する。登録したら Slack に 1 行、残れば Slack と Issue |
 | `auto_fix.yml` | Auto Fix | 上の3つが終わるたび | 失敗を Slack に知らせ、続いたら実行環境の設定を直す |
 | `os_canary.yml` | OS Canary | 毎週月曜 | `ubuntu-latest` で Playwright がブラウザを入れられるかを先回りで試す |
 | `sheet_url_copy.yml` | Sheet URL Copy | 毎日 JST 2時10分 | 取引の報告シートURLを求人票へ写す |

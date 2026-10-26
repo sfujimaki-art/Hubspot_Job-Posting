@@ -1,29 +1,31 @@
-"""HRハッカーの応募一覧と HubSpot の応募 (0-421) を突き合わせ、取りこぼしを取り込み直す (2026-10-26).
+"""HRハッカーの応募一覧と HubSpot の応募 (0-421) を突き合わせ、取りこぼしを登録する (2026-10-26).
 
 なぜ要るか:
-  2026-10-12〜10-24 の HR 応募 (CSV) のうち 30 件が HubSpot に無かった。
-  26 件は「同じ人・同じ求人・同じ日」の既存がある正しい重複 (HR 側で応募者idが
-  別に振られただけ) だったが、4 件は本当に取り込まれていなかった (どれも 22:30〜23:40 の応募)。
-  通常の応募同期はシート1の通知を起点に読み、処理した通知は台帳で DONE になる。
-  一度 DONE になった通知の応募は、開始日 (cutoff) を指定した回収でも台帳の除外で読まれない。
-  そのため、HR 側の一覧そのものを正として毎日突き合わせる。
+  通常の応募同期は、通知シート (シート1) の行をきっかけに HR の応募を取り込む。
+  2026-10-12〜10-24 の HR 応募のうち 4 件 (どれも 22:30〜23:40) が HubSpot に入っていなかった。
+  通知の行が来なかった回と、行は来たのに最初から台帳で処理済み扱いになった回があった。
+  通知に頼らず、HR の応募一覧そのものを正として毎時突き合わせる。
+  (同じ期間に HubSpot に応募者idが無かった残り 26 件は、同じ人・同じ求人・同じ日の
+   正しい重複。HRハッカーは 2 回目の応募に別の応募者idを振る。)
 
 流れ:
-  1. HR の応募一覧 CSV を直近 N 日 (既定 14 日) 取る (hr_applicant_fetcher)。
+  1. HR の応募一覧 CSV を直近 N 日 (既定 3 日) 取る (hr_applicant_fetcher)。
   2. 応募者id (hr_oubosha_id) が HubSpot にあれば取り込み済み。
   3. 無いものは、取り込みと同じ重複判定 (find_existing_appointment:
      媒体 + 媒体求人ID + 応募日 + メールか電話) で既存があれば正しい重複として除く。
   4. 応募から MIN_AGE_MIN 分たっていないものは、通常の同期の途中かもしれないので数えない。
-  5. 残りが本当の取りこぼし。--import-missing のとき、通常の取り込みと同じ run_import で取り込む
-     (run_import は作る前にもう一度重複を確かめる)。
-  6. 取り込んだあとも残るものは件数・日付を Slack と状態ファイルに出す (Issue はワークフローが立てる)。
+  5. 残りが本当の取りこぼし。--actual --import-missing のとき、同じログインのまま詳細ページも取り、
+     通常の取り込みと同じ run_import で登録する (通知シートは経由しない。
+     run_import は作る前にもう一度重複を確かめる)。詳細ページの項目も同じように書く。
+  6. 登録した件数を Slack に 1 行。登録したあとも残るものは状態ファイルに出す
+     (ワークフローが Issue を立て、立てたときだけ Slack に知らせる)。
 
 公開リポなので、ログ・Slack・状態ファイルに出すのは 件数・日付・応募経路の番号・店舗ID と、
 応募者idの hash の先頭 8 文字まで。氏名・電話・メール・応募者id そのものは出さない。
 CSV は一時フォルダに置き、終わったら消す。
 
 CLI:
-    python scripts/job_application_sync/hr_reconcile.py [--days 14] [--dry-run | --actual]
+    python scripts/job_application_sync/hr_reconcile.py [--days 3] [--dry-run | --actual]
         [--import-missing] [--slack] [--status-file PATH] [--csv PATH]
 """
 from __future__ import annotations
@@ -183,17 +185,37 @@ def _fmt_items(items: list[dict], limit: int = 20) -> str:
     return "\n".join(lines)
 
 
+def import_missing(missing: list, cli, detail=None) -> dict:
+    """取りこぼしを通常の取り込み (run_import) で登録し、詳細ページの項目も同じように書く。"""
+    from scripts.job_application_sync import applicant_import as ai
+    from scripts.job_application_sync import hr_applicant_fields as hrf
+    results = ai.run_import(missing, cli)
+    out = {"status": dict(Counter(r.status for r in results))}
+    if detail is not None and getattr(detail, "parsed", None):
+        page_fields = hrf.active_page_fields(cli.known_appointment_props())
+        appt_of = {r.hr_applicant_id: r.appointment_id for r in results
+                   if getattr(r, "hr_applicant_id", "") and getattr(r, "appointment_id", None)}
+        page = Counter()
+        for hr_id, parsed in detail.parsed.items():
+            appt = appt_of.get(hr_id)
+            page[hrf.apply_page_fields(cli, appt, parsed, page_fields) if appt and page_fields
+                 else "skipped"] += 1
+        out["detail"] = dict(page)
+    return out
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="HR応募の取りこぼし照合")
-    ap.add_argument("--days", type=int, default=14)
+    ap.add_argument("--days", type=int, default=3,
+                    help="HR の応募一覧を何日さかのぼるか (既定 3。毎時動かす前提)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--dry-run", dest="dry_run", action="store_true", default=True)
     g.add_argument("--actual", dest="dry_run", action="store_false")
     ap.add_argument("--import-missing", action="store_true",
-                    help="取りこぼしを通常の取り込み (run_import) で取り込む。--actual のときだけ書く")
+                    help="取りこぼしを通常の取り込み (run_import) で登録する。--actual のときだけ書く")
     ap.add_argument("--slack", action="store_true")
     ap.add_argument("--status-file", default="")
-    ap.add_argument("--csv", default="", help="取得済みの応募CSV (手元の確認用)")
+    ap.add_argument("--csv", default="", help="取得済みの応募CSV (手元の確認用。詳細ページは取らない)")
     a = ap.parse_args(argv)
 
     from scripts.job_application_sync import applicant_import as ai
@@ -205,26 +227,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     now = datetime.now(JST)
     date_to = now.date().isoformat()
     date_from = (now.date() - timedelta(days=a.days)).isoformat()
+    write = a.import_missing and not a.dry_run
+    cli = ai.RealHubSpotClient(token)
+
+    def find_existing(row):
+        return cli.find_existing_appointment(
+            row.media, row.media_job_id, row.phone, row.email, apply_date=row.apply_date)
+
+    state: dict = {}
+
+    def check(csv_path) -> list:
+        """CSV を突き合わせる。取りこぼしの応募者id (詳細ページを取る対象) を返す。"""
+        rows = [r for r in ai.load_applicants_csv(csv_path) if r.hr_applicant_id]
+        raw_by_id = read_raw_by_id(Path(csv_path))
+        existing = fetch_existing_ids(token, sorted({r.hr_applicant_id for r in rows}))
+        state.update(raw_by_id=raw_by_id,
+                     res=classify(rows, raw_by_id, existing, find_existing, now))
+        return [r.hr_applicant_id for r in state["res"]["missing"]] if write else []
 
     tmp = None
+    detail = None
     try:
         if a.csv:
-            csv_path = Path(a.csv)
+            check(a.csv)
         else:
             from scripts.job_application_sync.fetchers import hr_applicant_fetcher as hf
             tmp = Path(tempfile.mkdtemp(prefix="hr_reconcile_"))
-            csv_path = asyncio.run(hf.fetch_hr_applicants(tmp, date_from, date_to, headless=True))
-        rows = [r for r in ai.load_applicants_csv(csv_path) if r.hr_applicant_id]
-        raw_by_id = read_raw_by_id(csv_path)
-        cli = ai.RealHubSpotClient(token)
-
-        def find_existing(row):
-            return cli.find_existing_appointment(
-                row.media, row.media_job_id, row.phone, row.email, apply_date=row.apply_date)
-
-        ids = sorted({r.hr_applicant_id for r in rows})
-        existing = fetch_existing_ids(token, ids)
-        res = classify(rows, raw_by_id, existing, find_existing, now)
+            # CSV を取った同じログインのまま、取りこぼしの人だけ詳細ページを取る
+            _, detail = asyncio.run(hf.fetch_hr_applicants_with_details(
+                tmp, date_from, date_to, check, headless=True))
+        res, raw_by_id = state["res"], state["raw_by_id"]
         missing = res["missing"]
         status = {
             "checked_at": now.isoformat(timespec="seconds"),
@@ -232,7 +264,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "checked": res["checked"], "in_hubspot": res["in_hubspot"],
             "duplicate": res["duplicate"], "too_new": res["too_new"], "no_id": res["no_id"],
             "missing": len(missing), "missing_items": describe(missing, raw_by_id),
-            "imported": {}, "remaining": len(missing), "remaining_items": [],
+            "imported": {}, "added": 0, "remaining": len(missing), "remaining_items": [],
             "dry_run": a.dry_run,
         }
         print(f"[hr_reconcile] 範囲={date_from}〜{date_to} HR={res['checked']} "
@@ -242,30 +274,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(_fmt_items(status["missing_items"]))
 
         remaining = missing
-        if missing and a.import_missing and not a.dry_run:
-            results = ai.run_import(missing, cli)
-            st = Counter(r.status for r in results)
-            status["imported"] = dict(st)
-            print(f"[hr_reconcile] 取り込み直し: {dict(st)}")
-            # 取り込み直したあとにもう一度確かめる
+        if missing and write:
+            out = import_missing(missing, cli, detail)
+            status["imported"] = out
+            print(f"[hr_reconcile] 追加登録: {out}")
+            # 登録したあとにもう一度確かめる
             again = fetch_existing_ids(token, [r.hr_applicant_id for r in missing])
             remaining = [r for r in missing
                          if r.hr_applicant_id not in again and not find_existing(r)]
+            status["added"] = len(missing) - len(remaining)
         status["remaining"] = len(remaining)
         status["remaining_items"] = describe(remaining, raw_by_id)
 
-        if a.slack and missing:
-            if a.dry_run or not a.import_missing:
-                slack(f"🔎 HR応募の照合: HubSpot に無い応募が {len(missing)} 件あります "
-                      f"(範囲 {date_from}〜{date_to}、取り込み直しはしていません)\n"
-                      + _fmt_items(status["missing_items"]))
-            elif remaining:
-                slack(f"🛑 HR応募の照合: {len(missing)} 件を取り込み直しましたが、"
-                      f"まだ {len(remaining)} 件が HubSpot にありません。人の確認が必要です\n"
-                      + _fmt_items(status["remaining_items"]))
-            else:
-                slack(f"🔧 HR応募の照合: 取りこぼし {len(missing)} 件を取り込み直しました "
-                      f"(範囲 {date_from}〜{date_to})\n" + _fmt_items(status["missing_items"]))
+        # 残ったものの知らせは、毎時くり返さないようワークフローが Issue を立てるときに 1 回だけ送る
+        if a.slack and write and status["added"]:
+            slack(f"照合で {status['added']} 件を追加登録")
         if a.status_file:
             Path(a.status_file).parent.mkdir(parents=True, exist_ok=True)
             Path(a.status_file).write_text(json.dumps(status, ensure_ascii=False, indent=1),

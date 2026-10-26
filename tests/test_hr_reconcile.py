@@ -117,23 +117,61 @@ def _run_main(monkeypatch, tmp_path, argv, imported_ok=True):
     monkeypatch.setattr(ai, "RealHubSpotClient", FakeCli)
     monkeypatch.setattr(ai, "run_import", fake_import)
     monkeypatch.setattr(hr, "fetch_existing_ids", lambda token, ids, post=None: store & set(ids))
+    sent = []
+    monkeypatch.setattr(hr, "slack", sent.append)
     status = tmp_path / "s.json"
-    assert hr.main(argv + ["--csv", str(p), "--status-file", str(status)]) == 0
-    return json.loads(status.read_text(encoding="utf-8")), created
+    assert hr.main(argv + ["--slack", "--csv", str(p), "--status-file", str(status)]) == 0
+    st = json.loads(status.read_text(encoding="utf-8"))
+    st["_slack"] = sent
+    return st, created
 
 
 def test_main_dry_run_reports_but_does_not_import(monkeypatch, tmp_path):
     st, created = _run_main(monkeypatch, tmp_path, ["--dry-run", "--import-missing"])
-    assert (st["missing"], st["remaining"], created) == (1, 1, [])
+    assert (st["missing"], st["remaining"], created, st["_slack"]) == (1, 1, [], [])
     assert st["missing_items"][0]["route"] == "15"
 
 
 def test_main_actual_imports_and_rechecks(monkeypatch, tmp_path):
     st, created = _run_main(monkeypatch, tmp_path, ["--actual", "--import-missing"])
-    assert (st["missing"], st["remaining"], created, st["imported"]) == (1, 0, ["4"], {"linked": 1})
+    assert (st["missing"], st["added"], st["remaining"], created) == (1, 1, 0, ["4"])
+    assert st["imported"] == {"status": {"linked": 1}}
+    assert st["_slack"] == ["照合で 1 件を追加登録"]
 
 
 def test_main_actual_still_missing_is_remaining(monkeypatch, tmp_path):
     st, _ = _run_main(monkeypatch, tmp_path, ["--actual", "--import-missing"], imported_ok=False)
     assert st["remaining"] == 1 and st["remaining_items"][0]["key"] == hr.short_key("4")
     assert "架空" not in json.dumps(st, ensure_ascii=False)
+    assert st["_slack"] == []      # 残りの知らせはワークフローが Issue を立てるときだけ
+
+
+def test_import_missing_writes_detail_page_fields_for_created_only(monkeypatch):
+    from scripts.job_application_sync import applicant_import as ai
+    from scripts.job_application_sync import hr_applicant_fields as hrf
+    res = [type("R", (), {"status": "linked", "hr_applicant_id": "4", "appointment_id": "A4"})(),
+           type("R", (), {"status": "error", "hr_applicant_id": "5", "appointment_id": None})()]
+    monkeypatch.setattr(ai, "run_import", lambda rows, cli: res)
+    monkeypatch.setattr(hrf, "active_page_fields", lambda known: {"memo": "hr_memo"})
+    wrote = []
+    monkeypatch.setattr(hrf, "apply_page_fields",
+                        lambda cli, appt, parsed, fields: wrote.append(appt) or "written")
+    cli = type("C", (), {"known_appointment_props": lambda self: {"hr_memo"}})()
+    detail = type("D", (), {"parsed": {"4": {"memo": "x"}, "5": {"memo": "y"}}})()
+    out = hr.import_missing([row("4"), row("5")], cli, detail)
+    assert wrote == ["A4"]
+    assert out == {"status": {"linked": 1, "error": 1}, "detail": {"written": 1, "skipped": 1}}
+
+
+def test_zero_added_sends_no_slack(monkeypatch, tmp_path):
+    from scripts.job_application_sync import applicant_import as ai
+    p = tmp_path / "a.csv"
+    p.write_bytes("応募者id,応募日時,応募経路,店舗ID\n1,2026-10-24 10:00:00,4,S1\n".encode("cp932"))
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "t")
+    monkeypatch.setattr(ai, "load_applicants_csv", lambda path: [row("1")])
+    monkeypatch.setattr(ai, "RealHubSpotClient", lambda token: None)
+    monkeypatch.setattr(hr, "fetch_existing_ids", lambda token, ids, post=None: {"1"})
+    sent = []
+    monkeypatch.setattr(hr, "slack", sent.append)
+    assert hr.main(["--actual", "--import-missing", "--slack", "--csv", str(p)]) == 0
+    assert sent == []
