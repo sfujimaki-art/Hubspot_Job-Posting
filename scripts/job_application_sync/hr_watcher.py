@@ -55,11 +55,11 @@ if _REPO_ROOT not in _sys.path:
     _sys.path.insert(0, _REPO_ROOT)
 
 from scripts.job_application_sync import private_log as plog  # noqa: E402
+from scripts.job_application_sync.hr_offers_csv import copy_fingerprint  # noqa: E402
 
 import argparse
 import asyncio
 import gzip
-import hashlib
 import json
 import os
 import sys
@@ -125,12 +125,20 @@ def detect_diff(prev: dict, curr: dict) -> dict:
     def _job_changed(jid: str) -> bool:
         p = prev.get(jid) or {}
         c = curr.get(jid) or {}
+        # 移行前の控えだけ、旧デコードで同じになる指紋を許す。
+        # cp932 の控えには適用しないため、その後の本当の変更は隠さない。
+        migrating = p.get("csv_encoding") != "cp932"
+        same_title = p.get("job_name") == c.get("job_name") or (
+            migrating and p.get("job_name") in c.get("legacy_job_names", []))
+        same_copy = p.get("copy_hash") == c.get("copy_hash") or (
+            migrating and p.get("copy_hash") is not None
+            and p.get("copy_hash") in c.get("legacy_copy_hashes", []))
         return (p.get("status") != c.get("status")
-                or p.get("job_name") != c.get("job_name")
+                or not same_title
                 # 求人票の本文・画像 (2026-10-08): 変わった日に取込を動かし、HubSpot の
                 # 履歴に残す。前回の控えに無い (導入直後) ときも 1 度だけ変化として扱い、
                 # 最初の版を書く。
-                or p.get("copy_hash") != c.get("copy_hash"))
+                or not same_copy)
 
     changed = sorted(jid for jid in (prev_ids & curr_ids) if _job_changed(jid))
     return {"new": new, "removed": removed, "changed": changed}
@@ -183,9 +191,25 @@ def copy_hash(row: dict) -> Optional[str]:
     """求人票の本文・画像の指紋 (控えを小さく保つため値そのものは持たない)。
     CSV に該当列が無ければ None."""
     body, images = row.get("copy_body"), row.get("copy_images")
-    if body is None and images is None:
+    return copy_fingerprint(body, images)
+
+
+def legacy_text(value: Optional[str], question_marks: bool = False) -> Optional[str]:
+    """移行比較専用。新しい文字を旧Shift_JIS読込結果へ投影する。
+
+    ? を任意文字のワイルドカードにはしない。Windows拡張文字だけが対象。
+    None は列の欠落として維持する。
+    """
+    if value is None:
         return None
-    return hashlib.sha256(f"{body}\x00{images}".encode("utf-8")).hexdigest()
+    try:
+        raw = value.encode("cp932")
+    except UnicodeEncodeError:
+        # 不正bytesの置換文字やCSV以外の入力は移行例外にしない。
+        return value
+    if question_marks:
+        return value.encode("shift_jis", errors="replace").decode("shift_jis")
+    return raw.decode("shift_jis", errors="replace")
 
 
 def csv_rows_to_snapshot(rows: list[dict], source_csv: str) -> dict:
@@ -208,6 +232,16 @@ def csv_rows_to_snapshot(rows: list[dict], source_csv: str) -> dict:
             "shop_id": (r.get("shop_id") or "").strip(),
             "job_name": (r.get("job_name") or "").strip(),
             "copy_hash": copy_hash(r),
+            "csv_encoding": "cp932",
+            "legacy_job_names": [r.get("_legacy_job_name", legacy_text(r.get("job_name"))),
+                                 legacy_text(r.get("job_name"), True)],
+            "legacy_copy_hashes": [r.get("_legacy_copy_hash", copy_hash({
+                "copy_body": legacy_text(r.get("copy_body")),
+                "copy_images": legacy_text(r.get("copy_images")),
+            })), copy_hash({
+                "copy_body": legacy_text(r.get("copy_body"), True),
+                "copy_images": legacy_text(r.get("copy_images"), True),
+            })],
         }
     return {
         "fetched_at": datetime.now().isoformat(),

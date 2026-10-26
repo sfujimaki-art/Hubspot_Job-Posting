@@ -33,8 +33,10 @@ from dotenv import load_dotenv
 
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
     from scripts.job_application_sync import private_log as plog
+    from scripts.job_application_sync.hr_offers_csv import HR_CSV_ENCODING
 except ImportError:  # pragma: no cover
     import private_log as plog  # type: ignore
+    from hr_offers_csv import HR_CSV_ENCODING
 
 # 標準出力を差し替えない (テストから import すると出力処理が壊れる)。他の処理と同じ作法。
 for _s in (sys.stdout, sys.stderr):
@@ -76,7 +78,7 @@ def split_ids(raw):
 
 def load_hr_mail_to_shops(hr_csv: Path) -> dict[str, set]:
     rows = list(csv.reader(io.StringIO(
-        hr_csv.read_bytes().decode("shift_jis", errors="replace"))))
+        hr_csv.read_bytes().decode(HR_CSV_ENCODING, errors="replace"))))
     hdr = rows[0]
     ci_shop, ci_mail = hdr.index("店舗id"), hdr.index("連絡先メールアドレス")
     m2s = defaultdict(set)
