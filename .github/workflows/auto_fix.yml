@@ -1,25 +1,28 @@
-# 応募同期・求人同期が止まったときの自動修正 (2026-10-26)
+# 応募同期・求人同期・応募の照合が止まったときの自動修正 (2026-10-26)
 #
 # なぜ: 2026-10-25 21:11 から、ubuntu-latest が 26.04 に切り替わり Playwright が
-#   入らなくなって、応募の取り込みが約12時間止まった。失敗はスクリプトより前
+#   入らなくなって、応募の取り込みが約13時間止まった。失敗はスクリプトより前
 #   (ブラウザの導入) で起きたので、スクリプト内の Slack 報告も飛ばなかった。
 #   取り込みが止まり続けるほうが、修正を自動で入れるより危ない (ユーザー判断)。
 #
 # 流れ:
-#   1. Applicant Sync / Job Daily の main の実行が終わるたびに起動する。
-#   2. 失敗に変わった最初の回で Slack に知らせる。失敗のあと成功に戻ったら「復旧」を知らせる。
-#   3. 続けて失敗した回数がしきい値 (応募 3 回 = 約15分 / 求人 1 回) に達したら、
-#      Claude が失敗のログを読み、実行環境の設定だけを直す。
-#   4. 差分が「実行環境の行」だけなら、PR を作ってそのままマージする。
-#      次の 5 分おきの自動実行が直った設定で動く (手動の再実行はしない)。
-#   5. 処理のコードや実行の引数に触る必要があるときは、PR (自動マージしない) か Issue にして Slack で知らせる。
+#   1. 対象のワークフローの main の実行が終わるたびに起動する。
+#   2. ジョブごとに結果を見る (Job Daily は求人取込 job と取引の健全性 deal_hygiene が
+#      別の時刻に動き、動かなかった側は skipped になる。skipped は数えない)。
+#      ジョブが失敗に変わった最初の回と、失敗のあと成功に戻った回を Slack に知らせる。
+#   3. 同じジョブが続けて失敗した回数がしきい値 (応募同期 3 回 = 約15分 / ほか 1 回) に達したら、
+#      Claude がリポ直下の CLAUDE.md と失敗のログを読み、実行環境の行だけを直す。
+#   4. 差分が許可したファイル・許可した行だけなら、PR を作ってそのままマージする。
+#      次の自動実行が直った設定で動く (手動の再実行はしない)。
+#   5. それ以外 (処理のコード・実行の引数・環境変数・secret・cache の段に触る) は、
+#      PR (自動マージしない) か Issue にして Slack で知らせる。
 #
 # 自動マージの条件 (機械的に確かめる。Claude の判断だけに任せない):
 #   - 変えたファイルが ALLOWED_FILES だけ。
-#   - 変えた行がすべて ALLOWED_LINE (runs-on / python-version / uses / pip install /
-#     playwright install / requirements の行) に当てはまる。
-#     → --actual / --dry-run・環境変数・secret・台帳の保存の段は変えられない。
-#   - 開いている自動修正の PR が無い。直近24時間の自動マージが 3 本未満。
+#   - 変えた行 (足した行・消した行の両方) がすべて ALLOWED_LINE に当てはまり、
+#     DENY_LINE (コマンドのつなぎ・取得・dry-run の切り替え・secret) を含まない。
+#   - 開いている自動修正の PR が無い。直近24時間の自動マージが 3 本未満
+#     (3 本に達したら Issue を 1 つ立てて Slack で 1 回だけ知らせ、それ以上は直さない)。
 #
 # 必要な Secrets:
 #   AUTOFIX_TOKEN : fine-grained PAT (このリポだけ。Contents / Pull requests / Workflows /
@@ -32,7 +35,7 @@ name: Auto Fix
 
 on:
   workflow_run:
-    workflows: ["Applicant Sync", "Job Daily"]
+    workflows: ["Applicant Sync", "Job Daily", "HR Reconcile"]
     types: [completed]
 
 concurrency:
@@ -42,13 +45,17 @@ concurrency:
 permissions:
   contents: read
   actions: read
+  issues: write
 
 jobs:
   gate:
-    if: github.event.workflow_run.head_branch == 'main'
+    if: >-
+      github.event.workflow_run.head_branch == 'main' &&
+      (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
     runs-on: ubuntu-24.04
     outputs:
       fix: ${{ steps.check.outputs.fix }}
+      job: ${{ steps.check.outputs.job }}
     steps:
       - id: check
         env:
@@ -56,55 +63,84 @@ jobs:
           R: ${{ github.repository }}
           WF_ID: ${{ github.event.workflow_run.workflow_id }}
           WF_NAME: ${{ github.event.workflow_run.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           SLACK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
         run: |
           set -euo pipefail
           notify() { [ -n "$SLACK" ] && curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -n --arg t "$1" '{text:$t}')" "$SLACK" >/dev/null || true; }
-          # 直近の完了した実行 (新しい順) の結果。スキップ・取り消しは数えない。
-          gh api "repos/$R/actions/workflows/$WF_ID/runs?branch=main&status=completed&per_page=20" \
-            --jq '[.workflow_runs[] | select(.conclusion=="success" or .conclusion=="failure") | .conclusion]' > runs.json
-          LATEST=$(jq -r '.[0]' runs.json)
-          PREV=$(jq -r '.[1] // "none"' runs.json)
-          STREAK=$(jq '[foreach .[] as $c ({s:0,stop:false}; if .stop or $c!="failure" then .stop=true else .s+=1 end; .s)] | max // 0' runs.json)
-          if [ "$LATEST" = "success" ]; then
-            [ "$PREV" = "failure" ] && notify "✅ $WF_NAME が復旧しました: $RUN_URL"
-            echo "fix=false" >> "$GITHUB_OUTPUT"; exit 0
+          # 直近10回の完了した実行 (新しい順。取り消しは除く) のジョブごとの結果
+          : > jobs.jsonl
+          for id in $(gh api "repos/$R/actions/workflows/$WF_ID/runs?branch=main&status=completed&per_page=10" \
+                --jq '.workflow_runs[] | select(.conclusion=="success" or .conclusion=="failure") | .id'); do
+            gh api "repos/$R/actions/runs/$id/jobs" --jq ".jobs[] | {run: $id, name, conclusion}" -c >> jobs.jsonl
+          done
+          # あるジョブの結果の並び (新しい順。skipped / cancelled / 未完了は数えない)
+          hist() { jq -s -c --arg n "$1" '[.[] | select(.name==$n and (.conclusion=="success" or .conclusion=="failure")) | .conclusion]' jobs.jsonl; }
+          # 先頭から続く failure の数
+          streak() { jq '[foreach .[] as $c ({s:0,stop:false}; if .stop or $c!="failure" then .stop=true else .s+=1 end; .s)] | max // 0'; }
+          THRESHOLD=1; [ "$WF_NAME" = "Applicant Sync" ] && THRESHOLD=3
+          FIX=false; FIX_JOB=""
+          while read -r line; do
+            NAME=$(jq -r .name <<< "$line"); C=$(jq -r .conclusion <<< "$line")
+            H=$(hist "$NAME"); PREV=$(jq -r '.[1] // "none"' <<< "$H")
+            if [ "$C" = "success" ]; then
+              [ "$PREV" = "failure" ] && notify "✅ $WF_NAME / $NAME が復旧しました: $RUN_URL"
+              continue
+            fi
+            [ "$C" = "failure" ] || continue
+            S=$(streak <<< "$H")
+            [ "$PREV" != "failure" ] && notify "⚠️ $WF_NAME / $NAME が失敗しました。続いたら自動修正を試します: $RUN_URL"
+            echo "$NAME: 連続失敗 $S 回 (しきい値 $THRESHOLD)"
+            if [ "$S" -ge "$THRESHOLD" ] && [ -z "$FIX_JOB" ]; then FIX=true; FIX_JOB="$NAME"; fi
+          done < <(jq -c --argjson r "$RUN_ID" 'select(.run==$r)' jobs.jsonl)
+          if [ "$FIX" = true ]; then
+            OPEN=$(gh pr list -R "$R" --label auto-fix --state open --json number --jq length 2>/dev/null || echo 0)
+            SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+            MERGED=$(gh pr list -R "$R" --label auto-fix --state merged --search "merged:>=$SINCE" --json number --jq length 2>/dev/null || echo 0)
+            if [ "$OPEN" -gt 0 ]; then
+              echo "自動修正の PR が開いているので待つ"; FIX=false
+            elif [ "$MERGED" -ge 3 ]; then
+              FIX=false
+              # 打ち止めの知らせは開いている Issue が無いときに 1 回だけ
+              gh label create auto-fix-stop -R "$R" --color B60205 --description "自動修正の打ち止め" 2>/dev/null || true
+              if [ -z "$(gh issue list -R "$R" --label auto-fix-stop --state open --json number --jq '.[0].number // empty')" ]; then
+                URL=$(gh issue create -R "$R" --label auto-fix-stop \
+                  --title "自動修正を3回入れても直りません: $WF_NAME / $FIX_JOB" \
+                  --body "直近24時間に自動修正を 3 回マージしましたが、まだ失敗しています。人の確認が必要です。この Issue を閉じると自動修正の打ち止めの知らせが再び出るようになります。最後に失敗した回: $RUN_URL")
+                notify "🛑 $WF_NAME / $FIX_JOB: 直近24時間に自動修正を3回入れても直りません。人の確認が必要です: $URL"
+              fi
+            fi
           fi
-          [ "$PREV" != "failure" ] && notify "⚠️ $WF_NAME が失敗しました。続いたら自動修正を試します: $RUN_URL"
-          THRESHOLD=3; [ "$WF_NAME" = "Job Daily" ] && THRESHOLD=1
-          echo "連続失敗 $STREAK 回 (しきい値 $THRESHOLD)"
-          if [ "$STREAK" -lt "$THRESHOLD" ]; then echo "fix=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          OPEN=$(gh pr list -R "$R" --label auto-fix --state open --json number --jq length)
-          SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-          MERGED=$(gh pr list -R "$R" --label auto-fix --state merged --search "merged:>=$SINCE" --json number --jq length)
-          if [ "$OPEN" -gt 0 ]; then echo "自動修正の PR が開いているので待つ"; echo "fix=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [ "$MERGED" -ge 3 ]; then
-            # 失敗が続く間は毎回は送らず、しきい値ちょうどの回だけ知らせる
-            [ "$STREAK" -eq "$THRESHOLD" ] && notify "🛑 $WF_NAME: 直近24時間に自動修正を3回入れても直りません。人の確認が必要です: $RUN_URL"
-            echo "fix=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "fix=true" >> "$GITHUB_OUTPUT"
+          echo "fix=$FIX" >> "$GITHUB_OUTPUT"
+          echo "job=$FIX_JOB" >> "$GITHUB_OUTPUT"
 
   fix:
     needs: gate
     if: needs.gate.outputs.fix == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
     env:
       GH_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
       R: ${{ github.repository }}
       FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
       WF_NAME: ${{ github.event.workflow_run.name }}
+      FAILED_JOB: ${{ needs.gate.outputs.job }}
       RUN_URL: ${{ github.event.workflow_run.html_url }}
       SLACK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
       ALLOWED_FILES: |
         .github/workflows/applicant_sync.yml
         .github/workflows/job_daily.yml
+        .github/workflows/hr_reconcile.yml
         requirements.txt
       # 自動マージしてよい変更行 (先頭の +/- を除いて照合)
-      ALLOWED_LINE: '^\s*(runs-on:|python-version:|-?\s*uses:|pip install |python -m pip install|python -m playwright install|[A-Za-z0-9_.-]+\s*(==|>=|~=)\s*[0-9])'
+      ALLOWED_LINE: '^\s*(runs-on:\s*[A-Za-z0-9._-]+\s*$|python-version:|-?\s*uses:\s*[A-Za-z0-9._/-]+@[A-Za-z0-9._-]+\s*$|pip install |python -m pip install --upgrade pip\s*$|python -m playwright install |[A-Za-z0-9_.-]+\s*(==|>=|~=)\s*[0-9][A-Za-z0-9.*]*\s*$)'
+      # 許可行に当てはまっても止めるもの
+      DENY_LINE: '(;|&&|\||\$\(|`| >|>>|curl|wget|--dry-run|--actual|secrets\.|--index-url|--extra-index-url|git\+|https?://)'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,7 +148,9 @@ jobs:
           token: ${{ secrets.AUTOFIX_TOKEN }}
           fetch-depth: 0
       - name: 失敗のログを取る
-        run: gh run view "$FAILED_RUN_ID" -R "$R" --log-failed | tail -n 400 > /tmp/failed.log || true
+        run: |
+          mkdir -p .autofix
+          gh run view "$FAILED_RUN_ID" -R "$R" --log-failed | tail -n 400 > .autofix/failed.log || true
       - name: Claude が原因を調べて直す
         uses: anthropics/claude-code-action@v1
         with:
@@ -123,34 +161,38 @@ jobs:
             --max-turns 40
             --allowedTools Read,Edit,Write,Grep,Glob,Bash(cat:*),Bash(grep:*),Bash(tail:*),Bash(head:*),Bash(ls:*),Bash(git diff:*),Bash(git log:*),Bash(pip index:*),Bash(pip download:*)
           prompt: |
-            GitHub Actions のワークフロー「${{ github.event.workflow_run.name }}」が main で続けて失敗しています。
+            GitHub Actions のワークフロー「${{ github.event.workflow_run.name }}」のジョブ「${{ needs.gate.outputs.job }}」が main で続けて失敗しています。
             失敗した回: ${{ github.event.workflow_run.html_url }}
-            失敗した段のログの末尾は /tmp/failed.log にあります。
+            失敗した段のログの末尾は .autofix/failed.log にあります。
+
+            最初にリポ直下の CLAUDE.md (運用手順書) を読み、そこに書いた決まりに従ってください。
 
             やること:
             1. ログとワークフローのファイル (.github/workflows/) を読み、失敗の原因を特定する。
+               CLAUDE.md の「よくある失敗の型」に当てはまるかを先に確かめる。
             2. 原因が実行環境 (runner の OS、Python や Playwright などの版、action の版、パッケージの導入) なら、
                次のファイルの、その種類の行だけを最小限に直す:
-               .github/workflows/applicant_sync.yml / .github/workflows/job_daily.yml / requirements.txt
+               .github/workflows/applicant_sync.yml / .github/workflows/job_daily.yml /
+               .github/workflows/hr_reconcile.yml / requirements.txt
                直してよい行: runs-on / python-version / uses の版 / pip install と playwright install の行 / requirements の版。
                前に成功していた環境に戻す (例: OS を固定する) ほうを、版を上げるより優先する。
             3. 次のものは変えない: 実行の引数 (--actual / --dry-run など)、環境変数、secret、cache の保存・復元の段、
                concurrency、スクリプト (scripts/ 以下) の中身。原因がそこにあるなら直さずに報告だけする。
-            4. 最後に必ず /tmp/autofix_report.md を日本語で書く: 原因 (ログの該当行を1〜3行引用)、直したこと、
-               直さなかった場合はその理由と人がすべきこと。secret の値・顧客名・URL は書かない。
+            4. 最後に必ず .autofix/report.md を日本語で書く: 原因 (ログの該当行を1〜3行引用)、直したこと、
+               直さなかった場合はその理由と人がすべきこと。secret の値・氏名・電話・メール・応募者id・顧客名・URL は書かない。
             git commit・push・PR の作成はしないこと (後の段が行う)。
       - name: 差分を確かめて PR を作り、条件を満たせばマージする
         run: |
           set -euo pipefail
           notify() { [ -n "$SLACK" ] && curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -n --arg t "$1" '{text:$t}')" "$SLACK" >/dev/null || true; }
-          REPORT=$( [ -s /tmp/autofix_report.md ] && cat /tmp/autofix_report.md || echo "（報告が書かれませんでした）" )
+          REPORT=$( [ -s .autofix/report.md ] && cat .autofix/report.md || echo "（報告が書かれませんでした）" )
           git config user.name "auto-fix"
           git config user.email "auto-fix@users.noreply.github.com"
           if git diff --quiet; then
-            URL=$(gh issue create -R "$R" --title "自動修正できない失敗: $WF_NAME" \
+            URL=$(gh issue create -R "$R" --title "自動修正できない失敗: $WF_NAME / $FAILED_JOB" \
               --body "$(printf '失敗した回: %s\n\n%s\n' "$RUN_URL" "$REPORT")")
-            notify "🛑 $WF_NAME の失敗は自動では直せませんでした。人の確認が必要です: $URL"
+            notify "🛑 $WF_NAME / $FAILED_JOB の失敗は自動では直せませんでした。人の確認が必要です: $URL"
             exit 0
           fi
           OK=true
@@ -158,20 +200,22 @@ jobs:
             grep -qxF "$f" <<< "$ALLOWED_FILES" || { echo "許可外のファイル: $f"; OK=false; }
           done < <(git diff --name-only)
           while read -r l; do
-            grep -Eq "$ALLOWED_LINE" <<< "$l" || { echo "許可外の行: $l"; OK=false; }
+            if ! grep -Eq "$ALLOWED_LINE" <<< "$l" || grep -Eq "$DENY_LINE" <<< "$l"; then
+              echo "許可外の行: $l"; OK=false
+            fi
           done < <(git diff -U0 | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | sed -E 's/^[+-]//' | grep -vE '^\s*(#.*)?$')
           BR="auto-fix/$FAILED_RUN_ID"
           git checkout -q -b "$BR"
           git add $(git diff --name-only)
-          git commit -q -m "fix(ci): 自動修正 ($WF_NAME の失敗 $FAILED_RUN_ID)"
+          git commit -q -m "fix(ci): 自動修正 ($WF_NAME / $FAILED_JOB の失敗 $FAILED_RUN_ID)"
           git push -q origin "$BR"
           gh label create auto-fix -R "$R" --color B60205 --description "自動修正" 2>/dev/null || true
           PR=$(gh pr create -R "$R" --base main --head "$BR" --label auto-fix \
-            --title "fix(ci): 自動修正 ($WF_NAME)" \
+            --title "fix(ci): 自動修正 ($WF_NAME / $FAILED_JOB)" \
             --body "$(printf '失敗した回: %s\n\n%s\n\n自動マージの条件: %s\n' "$RUN_URL" "$REPORT" "$OK")")
           if [ "$OK" = true ]; then
             gh pr merge "$PR" -R "$R" --squash --delete-branch
-            notify "🔧 $WF_NAME を自動で直してマージしました。次の自動実行で確かめます: $PR"
+            notify "🔧 $WF_NAME / $FAILED_JOB を自動で直してマージしました。次の自動実行で確かめます: $PR"
           else
-            notify "🛑 $WF_NAME の修正案は実行環境の設定以外に触るため、自動マージしていません。確認してください: $PR"
+            notify "🛑 $WF_NAME / $FAILED_JOB の修正案は実行環境の設定以外に触るため、自動マージしていません。確認してください: $PR"
           fi
