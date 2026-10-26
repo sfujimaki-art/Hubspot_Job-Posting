@@ -1,0 +1,80 @@
+# HR応募の取りこぼし照合 (毎時, 2026-10-26)
+#
+# HRハッカーの応募一覧 (直近3日) と HubSpot の応募 (0-421) を突き合わせ、
+# HubSpot に無い応募を通常の取り込み (run_import) で登録する。通知シートは経由しない。
+# 取り込みと同じ重複判定 (同じ人・同じ求人・同じ日) の既存は正しい重複として除く。
+# 登録したら Slack に「照合で N 件を追加登録」を 1 行 (0 件なら送らない)。
+# 登録し直しても残るものは Issue (ラベル hr-reconcile) を立て、立てたときだけ Slack に知らせる。
+# 詳しくは scripts/job_application_sync/hr_reconcile.py の先頭。
+#
+# なぜ通知シートを経由しないか: 応募同期は通知シートの行をきっかけに読む。通知の行が来ない、
+# または行が来ても台帳で処理済み扱いになると、その応募は二度と読まれない
+# (開始日を指定した回収も同じ台帳で除外する)。2026-10 に 22:30〜23:40 の応募 4 件がこれで抜けた。
+#
+# 公開リポ: ログ・Slack・Issue に出るのは 件数・日付・応募経路の番号・店舗ID・hash の先頭8文字まで。
+# 応募の CSV は一時フォルダに置いて消す (artifact には上げない)。
+#
+# 必要 Secrets (応募連携と共通): HUBSPOT_ACCESS_TOKEN / HRHACKER_USER / HRHACKER_PASS /
+#   SLACK_APPLICANT_ALERT_WEBHOOK
+
+name: HR Reconcile
+
+on:
+  schedule:
+    - cron: "35 * * * *"    # 毎時35分 (応募から60分未満のものは通常の同期に任せて数えない)
+
+concurrency:
+  group: hr-reconcile
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install deps + Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.50.0 requests python-dotenv
+          python -m playwright install --with-deps chromium chromium-headless-shell
+      - name: Reconcile
+        env:
+          HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
+          HRHACKER_USER: ${{ secrets.HRHACKER_USER }}
+          HRHACKER_PASS: ${{ secrets.HRHACKER_PASS }}
+          SLACK_APPLICANT_ALERT_WEBHOOK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python scripts/job_application_sync/hr_reconcile.py --actual --import-missing --slack \
+            --status-file "$RUNNER_TEMP/hr_reconcile.json"
+      - name: 残ったら Issue と Slack (開いている Issue が無いときだけ)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
+          SLACK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+        run: |
+          set -euo pipefail
+          S="$RUNNER_TEMP/hr_reconcile.json"
+          LEFT=$(jq -r '.remaining' "$S")
+          echo "登録し直したあとも残った件数: $LEFT"
+          [ "$LEFT" -gt 0 ] || exit 0
+          gh label create hr-reconcile -R "$R" --color FBCA04 --description "HR応募の取りこぼし" 2>/dev/null || true
+          # 毎時くり返さない。開いている Issue があれば何もしない (閉じたらまた知らせる)
+          if [ -n "$(gh issue list -R "$R" --label hr-reconcile --state open --json number --jq '.[0].number // empty')" ]; then
+            echo "開いている Issue があるので知らせない"; exit 0
+          fi
+          BODY=$(jq -r '"範囲: \(.range[0])〜\(.range[1])\nHRの応募: \(.checked) / 取り込み済み: \(.in_hubspot) / 正しい重複: \(.duplicate)\n取りこぼし: \(.missing) / 追加登録: \(.added) / まだ無い: \(.remaining)\n\n| 応募日時 | 応募経路 | 店舗ID | key |\n|---|---|---|---|\n" + ([.remaining_items[] | "| \(.applied) | \(.route) | \(.shop_id) | \(.key) |"] | join("\n"))' "$S")
+          BODY=$(printf '%s\n\n確認したら閉じてください。閉じたあとも残っていれば、次の回でまた知らせます。\n実行: %s' "$BODY" "$GITHUB_SERVER_URL/$R/actions/runs/$GITHUB_RUN_ID")
+          URL=$(gh issue create -R "$R" --label hr-reconcile --title "HR応募の取りこぼしが登録し直しても残っています" --body "$BODY")
+          if [ -n "$SLACK" ]; then
+            MSG="🛑 HR応募の照合: 登録し直しても ${LEFT} 件が HubSpot にありません。人の確認が必要です: $URL"
+            curl -sS -X POST -H 'Content-Type: application/json' --data "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK" >/dev/null || true
+          fi
