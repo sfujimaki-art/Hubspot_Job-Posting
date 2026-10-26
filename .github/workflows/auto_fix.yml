@@ -12,22 +12,15 @@
 #      ジョブが失敗に変わった最初の回と、失敗のあと成功に戻った回を Slack に知らせる。
 #   3. 同じジョブが続けて失敗した回数がしきい値 (応募同期 3 回 = 約15分 / ほか 1 回) に達したら、
 #      Claude がリポ直下の CLAUDE.md と失敗のログを読み、実行環境の行だけを直す。
-#   4. 差分が許可したファイル・許可した行だけなら、PR を作ってそのままマージする。
-#      次の自動実行が直った設定で動く (手動の再実行はしない)。
-#   5. それ以外 (処理のコード・実行の引数・環境変数・secret・cache の段に触る) は、
-#      PR (自動マージしない) か Issue にして Slack で知らせる。
+#   4. 直した差分と原因を Issue (ラベル auto-fix) に書き、Slack で知らせる。
+#      マージは人が行う (Issue の差分を PR にしてマージする。手元の Claude Code に頼めばよい)。
+#      ワークフローのファイルは Actions の標準の鍵 (GITHUB_TOKEN) では push できず、
+#      このリポだけに絞った鍵も持ち主のアカウントでしか作れないため、push・マージはしない。
+#   5. 開いている auto-fix の Issue があるあいだは、同じ失敗で Claude を何度も動かさない。
 #
-# 自動マージの条件 (機械的に確かめる。Claude の判断だけに任せない):
-#   - 変えたファイルが ALLOWED_FILES だけ。
-#   - 変えた行 (足した行・消した行の両方) がすべて ALLOWED_LINE に当てはまり、
-#     DENY_LINE (コマンドのつなぎ・取得・dry-run の切り替え・secret) を含まない。
-#   - 開いている自動修正の PR が無い。直近24時間の自動マージが 3 本未満
-#     (3 本に達したら Issue を 1 つ立てて Slack で 1 回だけ知らせ、それ以上は直さない)。
+# Issue には「差分が実行環境の行だけか」の機械的な判定も書く (ALLOWED_FILES / ALLOWED_LINE / DENY_LINE)。
 #
 # 必要な Secrets:
-#   AUTOFIX_TOKEN : fine-grained PAT (このリポだけ。Contents / Pull requests / Workflows /
-#                   Issues = Read and write、Actions = Read)。ワークフローのファイルを
-#                   書き換えて push・マージするには GITHUB_TOKEN では足りないため。
 #   ANTHROPIC_API_KEY または CLAUDE_CODE_OAUTH_TOKEN : Claude を動かす鍵 (どちらか一方)。
 #   SLACK_APPLICANT_ALERT_WEBHOOK : 既存 (応募同期の失敗報告と同じ先)。
 
@@ -96,22 +89,8 @@ jobs:
             if [ "$S" -ge "$THRESHOLD" ] && [ -z "$FIX_JOB" ]; then FIX=true; FIX_JOB="$NAME"; fi
           done < <(jq -c --argjson r "$RUN_ID" 'select(.run==$r)' jobs.jsonl)
           if [ "$FIX" = true ]; then
-            OPEN=$(gh pr list -R "$R" --label auto-fix --state open --json number --jq length 2>/dev/null || echo 0)
-            SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-            MERGED=$(gh pr list -R "$R" --label auto-fix --state merged --search "merged:>=$SINCE" --json number --jq length 2>/dev/null || echo 0)
-            if [ "$OPEN" -gt 0 ]; then
-              echo "自動修正の PR が開いているので待つ"; FIX=false
-            elif [ "$MERGED" -ge 3 ]; then
-              FIX=false
-              # 打ち止めの知らせは開いている Issue が無いときに 1 回だけ
-              gh label create auto-fix-stop -R "$R" --color B60205 --description "自動修正の打ち止め" 2>/dev/null || true
-              if [ -z "$(gh issue list -R "$R" --label auto-fix-stop --state open --json number --jq '.[0].number // empty')" ]; then
-                URL=$(gh issue create -R "$R" --label auto-fix-stop \
-                  --title "自動修正を3回入れても直りません: $WF_NAME / $FIX_JOB" \
-                  --body "直近24時間に自動修正を 3 回マージしましたが、まだ失敗しています。人の確認が必要です。この Issue を閉じると自動修正の打ち止めの知らせが再び出るようになります。最後に失敗した回: $RUN_URL")
-                notify "🛑 $WF_NAME / $FIX_JOB: 直近24時間に自動修正を3回入れても直りません。人の確認が必要です: $URL"
-              fi
-            fi
+            OPEN=$(gh issue list -R "$R" --label auto-fix --state open --json number --jq length 2>/dev/null || echo 0)
+            if [ "$OPEN" -gt 0 ]; then echo "自動修正の Issue が開いているので待つ"; FIX=false; fi
           fi
           echo "fix=$FIX" >> "$GITHUB_OUTPUT"
           echo "job=$FIX_JOB" >> "$GITHUB_OUTPUT"
@@ -123,9 +102,11 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
+      issues: write
       id-token: write
     env:
-      GH_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
       R: ${{ github.repository }}
       FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
       WF_NAME: ${{ github.event.workflow_run.name }}
@@ -137,7 +118,7 @@ jobs:
         .github/workflows/job_daily.yml
         .github/workflows/hr_reconcile.yml
         requirements.txt
-      # 自動マージしてよい変更行 (先頭の +/- を除いて照合)
+      # 実行環境の行とみなす変更行 (先頭の +/- を除いて照合)
       ALLOWED_LINE: '^\s*(runs-on:\s*[A-Za-z0-9._-]+\s*$|python-version:|-?\s*uses:\s*[A-Za-z0-9._/-]+@[A-Za-z0-9._-]+\s*$|pip install |python -m pip install --upgrade pip\s*$|python -m playwright install |[A-Za-z0-9_.-]+\s*(==|>=|~=)\s*[0-9][A-Za-z0-9.*]*\s*$)'
       # 許可行に当てはまっても止めるもの
       DENY_LINE: '(;|&&|\||\$\(|`| >|>>|curl|wget|--dry-run|--actual|secrets\.|--index-url|--extra-index-url|git\+|https?://)'
@@ -145,7 +126,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          token: ${{ secrets.AUTOFIX_TOKEN }}
           fetch-depth: 0
       - name: 失敗のログを取る
         run: |
@@ -156,7 +136,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.AUTOFIX_TOKEN }}
+          github_token: ${{ github.token }}
           claude_args: |
             --max-turns 40
             --allowedTools Read,Edit,Write,Grep,Glob,Bash(cat:*),Bash(grep:*),Bash(tail:*),Bash(head:*),Bash(ls:*),Bash(git diff:*),Bash(git log:*),Bash(pip index:*),Bash(pip download:*)
@@ -181,41 +161,31 @@ jobs:
             4. 最後に必ず .autofix/report.md を日本語で書く: 原因 (ログの該当行を1〜3行引用)、直したこと、
                直さなかった場合はその理由と人がすべきこと。secret の値・氏名・電話・メール・応募者id・顧客名・URL は書かない。
             git commit・push・PR の作成はしないこと (後の段が行う)。
-      - name: 差分を確かめて PR を作り、条件を満たせばマージする
+      - name: 差分と原因を Issue にして知らせる
         run: |
           set -euo pipefail
           notify() { [ -n "$SLACK" ] && curl -sS -X POST -H 'Content-Type: application/json' \
             --data "$(jq -n --arg t "$1" '{text:$t}')" "$SLACK" >/dev/null || true; }
           REPORT=$( [ -s .autofix/report.md ] && cat .autofix/report.md || echo "（報告が書かれませんでした）" )
-          git config user.name "auto-fix"
-          git config user.email "auto-fix@users.noreply.github.com"
+          gh label create auto-fix -R "$R" --color B60205 --description "自動修正" 2>/dev/null || true
           if git diff --quiet; then
-            URL=$(gh issue create -R "$R" --title "自動修正できない失敗: $WF_NAME / $FAILED_JOB" \
+            URL=$(gh issue create -R "$R" --label auto-fix --title "自動修正できない失敗: $WF_NAME / $FAILED_JOB" \
               --body "$(printf '失敗した回: %s\n\n%s\n' "$RUN_URL" "$REPORT")")
             notify "🛑 $WF_NAME / $FAILED_JOB の失敗は自動では直せませんでした。人の確認が必要です: $URL"
             exit 0
           fi
-          OK=true
+          OK=true; NG=""
           while read -r f; do
-            grep -qxF "$f" <<< "$ALLOWED_FILES" || { echo "許可外のファイル: $f"; OK=false; }
+            grep -qxF "$f" <<< "$ALLOWED_FILES" || { OK=false; NG+="- 許可外のファイル: $f"$'\n'; }
           done < <(git diff --name-only)
           while read -r l; do
             if ! grep -Eq "$ALLOWED_LINE" <<< "$l" || grep -Eq "$DENY_LINE" <<< "$l"; then
-              echo "許可外の行: $l"; OK=false
+              OK=false; NG+="- 許可外の行: \`$l\`"$'\n'
             fi
           done < <(git diff -U0 | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | sed -E 's/^[+-]//' | grep -vE '^\s*(#.*)?$')
-          BR="auto-fix/$FAILED_RUN_ID"
-          git checkout -q -b "$BR"
-          git add $(git diff --name-only)
-          git commit -q -m "fix(ci): 自動修正 ($WF_NAME / $FAILED_JOB の失敗 $FAILED_RUN_ID)"
-          git push -q origin "$BR"
-          gh label create auto-fix -R "$R" --color B60205 --description "自動修正" 2>/dev/null || true
-          PR=$(gh pr create -R "$R" --base main --head "$BR" --label auto-fix \
-            --title "fix(ci): 自動修正 ($WF_NAME / $FAILED_JOB)" \
-            --body "$(printf '失敗した回: %s\n\n%s\n\n自動マージの条件: %s\n' "$RUN_URL" "$REPORT" "$OK")")
-          if [ "$OK" = true ]; then
-            gh pr merge "$PR" -R "$R" --squash --delete-branch
-            notify "🔧 $WF_NAME / $FAILED_JOB を自動で直してマージしました。次の自動実行で確かめます: $PR"
-          else
-            notify "🛑 $WF_NAME / $FAILED_JOB の修正案は実行環境の設定以外に触るため、自動マージしていません。確認してください: $PR"
-          fi
+          if [ "$OK" = true ]; then JUDGE="実行環境の行だけの変更です。"; else JUDGE=$(printf '実行環境の設定以外にも触っています。よく確かめてください。\n%s' "$NG"); fi
+          DIFF=$(git diff | head -c 50000)
+          BODY=$(printf '失敗した回: %s\n\n%s\n\n## 判定\n%s\n\n## 差分\n```diff\n%s\n```\n\n## 入れ方\n手元の Claude Code に「Hubspot_Job-Posting の自動修正 Issue #番号 を入れて」と頼むと、この差分で PR を作ります。マージは人が行います。入れたらこの Issue を閉じてください (開いているあいだは次の自動修正を動かしません)。\n' \
+            "$RUN_URL" "$REPORT" "$JUDGE" "$DIFF")
+          URL=$(gh issue create -R "$R" --label auto-fix --title "自動修正の案: $WF_NAME / $FAILED_JOB" --body "$BODY")
+          notify "🔧 $WF_NAME / $FAILED_JOB の直し方を Claude が作りました。確かめて入れてください: $URL"
