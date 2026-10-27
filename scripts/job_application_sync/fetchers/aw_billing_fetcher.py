@@ -366,14 +366,31 @@ async def _body_text(page) -> str:
 async def _pick_download_link(page) -> bool:
     """「ダウンロード」リンクを 1 つ押す。複数あれば集計単位=求人の行を優先。
 
-    ★未検証: 行の構造は推定。リンクが 1 つだけならそれを押す。
+    行の data-la-file-type=03 (求人) を見る (2026-10-27 実画面で確認)。属性が無い古い画面だけ、
+    リンクが 1 つならそれを押す。
     """
     return bool(await page.evaluate(
         """() => {
             const links = Array.from(document.querySelectorAll('a, button'))
                 .filter(e => (e.textContent || '').trim() === 'ダウンロード');
             if (!links.length) return false;
-            let pick = links.length === 1 ? links[0] : null;
+            // ★2026-10-27: 作成データの行は data-la-file-type (01=配信日 / 02=有料広告 / 03=求人) を持つ。
+            //   以前の「親をたどって行の文字を見る」は、リンクのすぐ外の div で止まり「ダウンロード」しか
+            //   読めず、人が配信日・有料広告の単位でも作っていた社 (3 行並ぶ) で毎回押せなかった。
+            let pick = links.find(l => {
+                const row = l.closest('[data-la-file-type]');
+                return row && row.getAttribute('data-la-file-type') === '03';
+            }) || null;
+            if (!pick) {
+                pick = links.find(l => {
+                    const row = l.closest('[data-la-file-type]');
+                    const t = row ? (row.textContent || '') : '';
+                    return t.includes('求人単位') || t.includes('Job_');
+                }) || null;
+            }
+            // 行に種類が付いている画面で求人単位が無ければ、別の単位のファイルは押さない
+            if (!pick && links.some(l => l.closest('[data-la-file-type]'))) return false;
+            if (!pick && links.length === 1) pick = links[0];
             if (!pick) {
                 for (const l of links) {
                     let row = l;
