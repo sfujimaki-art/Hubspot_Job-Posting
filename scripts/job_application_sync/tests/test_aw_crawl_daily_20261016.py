@@ -102,8 +102,14 @@ def test_待ち行列の社だけを取り_取れたら外す(monkeypatch, tmp_p
     monkeypatch.setattr(orch, "process_one", fake_one)
     monkeypatch.setattr(orch, "_write_account_results", lambda *a, **k: {})
     monkeypatch.setattr(orch, "_slack_notify", lambda m: None)
+    # 取引・担当者を付ける間は、まだ待ち行列に残っている (応募が先に作られないように 2026-10-27)
+    linked = []
+    monkeypatch.setattr(orch, "_deal_link_urgent",
+                        lambda res, ids: linked.append("q1" in U.pending()) or {})
+    monkeypatch.setattr(orch, "_relink_urgent", lambda res, ids: {})
     asyncio.run(orch.orchestrate(parallel=1, dry_run=False, out_dir=tmp_path, log_dir=tmp_path,
                                  from_urgent_queue=True))
+    assert linked == [True]
     assert seen == ["q1"]
     assert U.pending()["gone"]["attempts"] == 1    # シートに無い社は失敗として数える
     assert "q1" not in U.pending()

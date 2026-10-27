@@ -173,15 +173,21 @@ def build_login_to_mail() -> dict:
     return m
 
 
-def run(dry_run: bool = True, limit: int | None = None) -> dict:
+LISTING_PROPS = ["ichijitaiounoumu_deforuto", "airwork_account_login_id",
+                 "id_shop_hrhakkaa", DM.LISTING_OWNER]
+
+
+def run(dry_run: bool = True, limit: int | None = None,
+        listings: list | None = None) -> dict:
+    """listings を渡すと、その求人だけを処理する (至急の取得の直後、2026-10-27)。"""
     # 1) 全LISTING (現状値 + AW判定用 login_id)
     # Search API は10,000件で HTTP 400 になり、素朴な実装だと「もう次が無い」と
     # 区別できず静かに完走扱いになる。実測では対象34,666件のうち10,000件
     # (28.8%)しか処理していなかった (2026-08-06 発見)。上限の無い list API へ。
-    listings = list_all(
-        "0-420", ["ichijitaiounoumu_deforuto", "airwork_account_login_id",
-                  "id_shop_hrhakkaa", DM.LISTING_OWNER],
-        limit=limit)
+    if listings is None:
+        listings = list_all("0-420", LISTING_PROPS, limit=limit)
+    if not listings:
+        return {"listings": 0, "to_update": 0, "applied": 0}
     lids = [o["id"] for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
     # 2) HR経路: LISTING→Deal 関連(HubSpotの関連付け)

@@ -417,13 +417,22 @@ def _write_review(rows: list, out_dir: Path) -> Path | None:
     return path
 
 
+LISTING_PROPS = ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
+                 "hubspot_owner_id", DM.LISTING_OWNER]
+
+
 def run(dry_run: bool = True, limit=None,
-        out_dir: Path = _REPO / "data" / "job_application_sync") -> dict:
-    _props = ["id_shop_hrhakkaa", "airwork_account_login_id", "id_hrhakkaa",
-              "hubspot_owner_id", DM.LISTING_OWNER]
+        out_dir: Path = _REPO / "data" / "job_application_sync",
+        listings: list | None = None) -> dict:
+    """listings を渡すと、その求人だけを処理する (至急の取得の直後、2026-10-27)。
+    そのときは全件の結果で置き換える「要対応」タブは触らない。"""
+    targeted = listings is not None
     # Search API は10,000件で HTTP 400 になり、素朴な実装では「もう次が無い」と
     # 区別できず静かに完走扱いになる。上限の無い list API を使う(2026-08-06)。
-    listings = list_all("0-420", _props, limit=limit)
+    if not targeted:
+        listings = list_all("0-420", LISTING_PROPS, limit=limit)
+    if not listings:
+        return {"listings": 0, "associations": 0, "owner_set": 0, "associate_failed": 0}
     lids = [str(o["id"]) for o in listings]
     print(f"[listing] 対象 {len(lids)}件", flush=True)
     has = _existing_deal_assoc(lids)
@@ -446,7 +455,8 @@ def run(dry_run: bool = True, limit=None,
     if rp:
         print(f"[review] 別会社にまたがる求人 {len(review)}件 → {rp}", flush=True)
     # 旧: CI 成果物 (public)。非公開シートのタブを毎回全置換する。0件なら既存タブだけ空にする
-    plog.replace_list(REVIEW_TAB, review, create=bool(review))
+    if not targeted:
+        plog.replace_list(REVIEW_TAB, review, create=bool(review))
 
     created = {}
     fail = 0

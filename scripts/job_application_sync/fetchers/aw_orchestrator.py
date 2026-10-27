@@ -252,6 +252,55 @@ def _is_login_stop(error: str) -> bool:
             or ("/interaction" in e and "遷移せず" in e))
 
 
+def _urgent_ok_job_ids(results: list, urgent_job_ids: dict) -> dict:
+    """至急の取得で取れた社の {login_id: [求人ID]}。"""
+    out = {}
+    for r in results:
+        lid = r.get("login_id", "")
+        if r.get("status") == "ok" and urgent_job_ids.get(lid):
+            out[lid] = list(dict.fromkeys(str(j) for j in urgent_job_ids[lid] if j))
+    return out
+
+
+def _deal_link_urgent(results: list, urgent_job_ids: dict) -> dict:
+    """至急の取得で入った求人を、その場で取引に紐付け、担当者と一次対応をそろえる (2026-10-27)。
+
+    ★ユーザー指示 (2026-10-27「つける」): これまで取引・担当者・一次対応は夜 1:40 の
+      deal_hygiene (Actions) だけが付けていた。応募の担当者は応募を作る・紐付ける瞬間に
+      求人から写すだけなので、新しい求人への応募は担当者が空のまま残っていた
+      (10/15〜22 の 40 件中 19 件)。夜と同じ処理 (sync_deal_association / sync_ichijitaiou) を、
+      その求人だけに対して走らせる。失敗しても夜の処理が後で拾う。
+    """
+    by_login = _urgent_ok_job_ids(results, urgent_job_ids)
+    if not by_login:
+        return {}
+    try:
+        from scripts.job_application_sync import sync_deal_association as _sda
+        from scripts.job_application_sync import sync_ichijitaiou as _si
+        from scripts.job_application_sync.hs_paging import search_all_by_id
+        props = list(dict.fromkeys(_sda.LISTING_PROPS + _si.LISTING_PROPS))
+        listings = []
+        for login, ids in by_login.items():
+            for i in range(0, len(ids), 100):
+                listings += search_all_by_id("0-420", props, [
+                    {"propertyName": "id_airwork", "operator": "IN", "values": ids[i:i + 100]},
+                    {"propertyName": "airwork_account_login_id", "operator": "EQ", "value": login}])
+        if not listings:
+            print("[orchestrate] 至急の取得の後の取引の紐付け: 対象の求人なし", flush=True)
+            return {}
+        a = _sda.run(dry_run=False, listings=listings)
+        # 担当者・一次対応は書いた後の値で判断させるため、読み直さずに同じ求人で回す
+        b = _si.run(dry_run=False, listings=listings)
+        print(f"[orchestrate] 至急の取得の後の取引の紐付け: 求人 {len(listings)}件 → "
+              f"紐付け {a.get('associations', 0)}本 / 担当者 {a.get('owner_set', 0)}件 / "
+              f"一次対応 {b.get('applied', 0)}件", flush=True)
+        return {"listings": len(listings), "assoc": a, "ichiji": b}
+    except (Exception, SystemExit) as e:  # noqa: BLE001  hs_paging・owners の異常は SystemExit で来る
+        print(f"[orchestrate] 至急の取得の後の取引の紐付けに失敗 (夜の処理で拾う): "
+              f"{type(e).__name__}", flush=True)
+        return {}
+
+
 def _relink_urgent(results: list, urgent_job_ids: dict) -> dict:
     """至急の取得で求人が取れた社について、その応募の求人IDだけ紐付け直す (2026-10-23)。
 
@@ -903,8 +952,8 @@ async def orchestrate(parallel: int = 5,
         elif (r["status"] == "error" and phase == "full" and not dry_run
               and _is_login_stop(r.get("error", ""))):
             _record_last_ok(r.get("login_id", ""), path=LOGIN_STOP_PATH)
-        if from_urgent_queue and not dry_run:
-            _urgent.finish(r.get("login_id", ""), ok=r["status"] == "ok")
+        if from_urgent_queue and not dry_run and r["status"] != "ok":
+            _urgent.finish(r.get("login_id", ""), ok=False)
         marker = {"ok": "OK ", "queued": "QUEUED ",
                   "error": "NG "}.get(r["status"], r["status"] + " ")
         print(
@@ -927,6 +976,12 @@ async def orchestrate(parallel: int = 5,
         + " / ".join(f"{k}={v}" for k, v in acct_summary.items()),
         _report_rows(results, notice), dry_run)
     if from_urgent_queue and not dry_run:
+        _deal_link_urgent(results, urgent_job_ids)
+        # ★2026-10-27: 取れた社を待ち行列から外すのは、取引・担当者を付けた後。応募の取り込みは
+        #   待ち行列から外れた社の応募を作るので、先に外すと担当者が付く前に応募ができてしまう。
+        for r in results:
+            if r["status"] == "ok":
+                _urgent.finish(r.get("login_id", ""), ok=True)
         _relink_urgent(results, urgent_job_ids)
 
     # --- Phase1(create): 生成トリガー成功社をキューに保存 (Phase2引き継ぎ) ---
