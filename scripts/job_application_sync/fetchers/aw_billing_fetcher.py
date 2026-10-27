@@ -410,11 +410,26 @@ async def _pick_download_link(page) -> bool:
         }"""))
 
 
+async def _job_unit_ready(page) -> bool:
+    """求人単位 (03) の完成した行があれば True。行に種類が無い古い画面も True (従来どおり押してみる)。"""
+    return bool(await page.evaluate(
+        """() => {
+            const rows = Array.from(document.querySelectorAll('[data-la-file-type]'));
+            if (!rows.length) return true;
+            return rows.some(r => r.getAttribute('data-la-file-type') === '03'
+                                  && r.getAttribute('data-la-file-status') === '01');
+        }"""))
+
+
 async def _download_ready(page, out_dir: Path, login_id: str):
     """完成済みファイルを保存。返り値 (保存パス, 期間開始)。"""
     async with page.expect_download(timeout=60_000) as info:
         if not await _pick_download_link(page):
-            # ★2026-10-27: 1 社 (岡安***) で 04:28 から毎回この失敗。画面が分からないので残す
+            # ★2026-10-27: 人が別の単位 (配信日・有料広告) で作ったファイルだけが並び、
+            #   求人単位はまだ作成中・未作成のときは、失敗ではなく完成待ちとして扱う。
+            if not await _job_unit_ready(page):
+                raise AWNotReadyError("求人単位のファイルがまだ無い (別の単位のファイルのみ)")
+            # 1 社 (岡安***) で 04:28 から毎回この失敗だった。画面が分からないので残す
             await _dump_debug(page, out_dir, "billing_download_pick")
             raise RuntimeError("ダウンロードリンクの押下に失敗")
     dl = await info.value
@@ -476,7 +491,7 @@ async def _collect_week(page, out_dir: Path, login_id: str, start: date,
             await _click_button_by_text(page, BTN_REFRESH)
         first = False
         await asyncio.sleep(1.5)
-        if await _button_visible(page, BTN_DOWNLOAD):
+        if await _button_visible(page, BTN_DOWNLOAD) and await _job_unit_ready(page):
             path, got = await _download_ready(page, out_dir, login_id)
             if got == start:
                 return path
