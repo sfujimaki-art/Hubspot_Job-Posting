@@ -397,6 +397,8 @@ async def _download_ready(page, out_dir: Path, login_id: str):
     """完成済みファイルを保存。返り値 (保存パス, 期間開始)。"""
     async with page.expect_download(timeout=60_000) as info:
         if not await _pick_download_link(page):
+            # ★2026-10-27: 1 社 (岡安***) で 04:28 から毎回この失敗。画面が分からないので残す
+            await _dump_debug(page, out_dir, "billing_download_pick")
             raise RuntimeError("ダウンロードリンクの押下に失敗")
     dl = await info.value
     period = parse_zip_period(dl.suggested_filename)

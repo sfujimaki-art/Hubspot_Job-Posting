@@ -34,7 +34,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1033,6 +1033,26 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+BILLING_COLLECT_MAX_ERRORS = 3
+BILLING_COLLECT_BACKOFF_MIN = 30
+
+
+def _billing_retry_wait(meta: dict, now: datetime) -> bool:
+    """受け取りの失敗のあと、次に試すまでの待ちの間なら True。"""
+    try:
+        return now < datetime.fromisoformat(meta.get("retry_after", ""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _billing_mark_error(meta: dict, now: datetime) -> bool:
+    """受け取りの失敗を数え、次に試す時刻を 30 分・60 分と延ばす。上限に達したら True (外す)。"""
+    n = int(meta.get("errors", 0)) + 1
+    meta["errors"] = n
+    meta["retry_after"] = (now + timedelta(minutes=BILLING_COLLECT_BACKOFF_MIN * n)).isoformat()
+    return n >= BILLING_COLLECT_MAX_ERRORS
+
+
 async def _billing_create_if_due(login_id: str, password: str, company: str,
                                  headless: bool = True) -> str:
     """直近の完了週の有料広告実績を、まだ取っていなければ作成だけする。結果の種類を返す。
@@ -1193,6 +1213,9 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
                     cur.pop(lid, None)
                 _save_json(BILLING_QUEUE_PATH, cur)
         q_slice = [kv for kv in q_slice if kv[0] in queue]
+        # ★2026-10-27: 同じ失敗を 5 分ごとに繰り返さない (岡安*** が 02:14 の作成から
+        #   20 時間、5 分ごとにログインして失敗し、そのたびに Slack に出ていた)。
+        q_slice = [kv for kv in q_slice if not _billing_retry_wait(kv[1], now)]
         for lid, meta in q_slice:
             try:
                 wk = date.fromisoformat(meta.get("week_start", ""))
@@ -1268,6 +1291,12 @@ async def orchestrate_billing(phase: str, weeks: list, parallel: int = 5,
             elif phase == "billing-collect":
                 if r["status"] == "ok":
                     queue.pop(lid, None)
+                elif r["status"] == "error" and lid in queue:
+                    if _billing_mark_error(queue[lid], datetime.now()):
+                        queue.pop(lid, None)
+                        print(f"[orchestrate] {plog.mask_name(r.get('company', ''))}: 受け取りに"
+                              f"{BILLING_COLLECT_MAX_ERRORS}回続けて失敗したので待ち行列から外します"
+                              f" (次の巡回で作り直す)", flush=True)
             elif phase == "billing-full":
                 queue.pop(lid, None) if r["status"] == "ok" else None
         _save_json(BILLING_EMPTY_PATH, empty)
