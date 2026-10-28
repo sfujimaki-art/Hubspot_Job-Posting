@@ -51,6 +51,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 from scripts.job_application_sync import private_log as plog  # noqa: E402
+from scripts.job_application_sync import deal_stages as DS  # noqa: E402
 from scripts.job_application_sync.hs_paging import post_retry, search_all  # noqa: E402
 from scripts.job_application_sync.listing_stage import (  # noqa: E402
     PROTECTED_STAGES, STATUS_TO_STAGE)
@@ -602,7 +603,52 @@ _LISTING_PROPS = ["hs_name", "kyuujin_status", "id_hrhakkaa", "id_airwork",
                   #   人は求人を開いて顧客を特定できる。
                   "url_hrhakkaa", "url_airwork"]
 
-_DEAL_PROPS = ["dealname", "pipeline", "dealstage", "hubspot_owner_id"]
+_DEAL_PROPS = ["dealname", "pipeline", "dealstage", "hubspot_owner_id",
+               DS.PROP_CODE]
+
+
+def _split_live_deals(codes: set) -> dict:
+    """{取引先コード: [(生きている取引ID, 取引名, [計上のコード])]}。計上のコードが割れている取引だけ。
+
+    ★2026-10-28 実測 (ある顧客): 終わった取引①の店舗IDを生きている取引②へ
+      移しても、求人は①のまま残った。②に別契約の計上 (別の取引先コード) が
+      紐付いていて、relink_to_latest_deal が②を「コードが割れている」として
+      系列から外し、求人を運ばなかったため。要対応リストは「鍵を入れ替える」
+      と指示し続け、担当者は直した後も同じ行を見続けた。
+      取引に鍵を入れても直らないので、本当にやること (計上の紐付けを直す) を出す。
+
+    best-effort: 読めなかったら空を返し、従来の指示のままにする。
+    """
+    out: dict = {}
+    if not codes:
+        return out
+    try:
+        live: dict = {}
+        for code in sorted(codes):
+            for o in search_all("0-3", ["dealname", "dealstage", DS.PROP_CODE], [
+                    {"propertyName": "pipeline", "operator": "EQ",
+                     "value": PIPELINE_NOUHIN},
+                    {"propertyName": DS.PROP_CODE, "operator": "EQ",
+                     "value": code}]):
+                pr = o.get("properties") or {}
+                if DS.is_writable(pr.get("dealstage")):
+                    live[str(o["id"])] = (code, pr.get("dealname") or "")
+        if not live:
+            return out
+        d2d = _assoc("0-3", "0-3", sorted(live))
+        others = sorted({x for v in d2d.values() for x in v})
+        kp = _batch_props("0-3", others, ["pipeline", DS.PROP_CODE]) if others else {}
+        for did, (code, name) in live.items():
+            kc = sorted({(kp[x].get(DS.PROP_CODE) or "").strip()
+                         for x in d2d.get(did, [])
+                         if x in kp and kp[x].get("pipeline") in DS.PIPELINES_KEIJO}
+                        - {""})
+            if len(kc) > 1:
+                out.setdefault(code, []).append((did, name, kc))
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] 計上コードの割れの確認に失敗 ({type(e).__name__})。従来の指示のまま")
+        return {}
+    return out
 
 
 def _is_dead_deal(props: dict) -> bool:
@@ -754,6 +800,9 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
 
     hint = _company_hint()
     mails = _manage_mail_hint()
+    split_of = _split_live_deals({
+        ((dprops.get(d) or {}).get(DS.PROP_CODE) or "").strip()
+        for ds in dead_of.values() for d in ds} - {""})
     owners = _owner_names()
 
     # ── 鍵(HR店舗ID / AWログインID)単位に集約 ──────────────────────────
@@ -853,6 +902,20 @@ def collect_unlinked_customers(days: int = UNLINKED_DAYS) -> dict:
                         if kind == "hr" else
                         "管理用メールアドレス に同じアドレスを追記")
                      + "してください")
+            dead_codes = {((dprops.get(d) or {}).get(DS.PROP_CODE) or "").strip()
+                          for d in g["死"]} - {""}
+            blk = [b for c in sorted(dead_codes) for b in split_of.get(c, [])]
+            if blk:
+                # 鍵は生きている取引に入っていても、夜間の付け替えがこの取引を
+                # 飛ばすので求人は移らない。直す場所は取引の鍵ではなく計上の紐付け。
+                kubun = "生きている取引に別契約の計上が紐付いている（計上の紐付けを直す）"
+                place = ("生きている取引 " + " / ".join(
+                    f"{n}(ID {d}) の計上の取引先コードが {' / '.join(kc)} に割れている"
+                    for d, n, kc in blk[:2])
+                    + "ため、夜間の付け替えがこの取引を対象外にし、求人が終わった取引に"
+                    "残っています。取引の鍵を入れ直しても直りません。生きている取引を開き、"
+                    "関連する計上の取引のうち別契約のものの関連付けを外してください。"
+                    "現在の紐付け先: " + " / ".join(dead_desc[:2]))
         if kind == "aw":
             # ★ID・メールは伏せて出すので、正しい値の引き方を添える
             place += ("（ログインID・メールは公開ログに出さないため先頭2文字のみ。"
