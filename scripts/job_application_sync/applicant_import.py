@@ -57,6 +57,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -123,6 +124,24 @@ def deal_current_props(deal_ids: list, deals: dict) -> dict:
     elif it == "false":
         out["ichijitaiounoumu"] = "不要"
     return out
+
+
+def consultant_owner_id(deal_ids: list, deals: dict) -> Optional[str]:
+    """「今の契約」(deal_current_props と同じ latest_live) の取引のコンサル担当 (owner ID)。
+    応募者の「担当コンサルタント」に名前を写すのに使う (2026-11-02 ユーザー指示:
+    応募者の担当者=取引担当者は残しつつ、コンサル担当も応募者に入れる)。純関数。"""
+    did = DM.latest_live(deal_ids, deals)
+    if not did:
+        return None
+    return str(deals[did].get("consultant") or "").strip() or None
+
+
+def owner_display_name(owner: dict) -> Optional[str]:
+    """owners API の1件 → 「姓名」(空白なし・NFKC)。部首の文字で入っている名前があるため NFKC。"""
+    name = (str(owner.get("lastName") or "").strip()
+            + str(owner.get("firstName") or "").strip())
+    name = unicodedata.normalize("NFKC", name).replace(" ", "").replace("　", "")
+    return name or None
 
 
 def anmokuchi_transfer_props(deal_ids: list, deals: dict,
@@ -856,6 +875,10 @@ class RealHubSpotClient:
         ids, deals = self._listing_deal_group(lp, listing_id, media, login_id)
         props.update(deal_current_props(ids, deals))
         props.update(anmokuchi_transfer_props(ids, deals))
+        # 担当コンサルタント (文字項目) = 今の契約のコンサル担当の名前。決まらなければ入れない
+        cname = self.get_owner_full_name(consultant_owner_id(ids, deals) or "")
+        if cname:
+            props["dandangkonsarutanto"] = cname
         return props
 
     def _listing_deal_group(self, lp: dict, listing_id: str, media: str,
@@ -893,9 +916,9 @@ class RealHubSpotClient:
         did = DM.latest_live(ids, deals)
         return (str(deals[did].get("consultant") or "").strip() or None) if did else None
 
-    def get_owner_last_name(self, owner_id: str) -> Optional[str]:
-        """owner の姓。同じ owner は1実行1回だけ引く。無効化されたユーザーも引く。取れなければ None。"""
-        cache = self.__dict__.setdefault("_owner_last", {})
+    def _owner_record(self, owner_id: str) -> Optional[dict]:
+        """owners API の1件。同じ owner は1実行1回だけ引く。無効化されたユーザーも引く。取れなければ None。"""
+        cache = self.__dict__.setdefault("_owner_rec", {})
         oid = str(owner_id or "").strip()
         if not oid:
             return None
@@ -909,11 +932,21 @@ class RealHubSpotClient:
                 except Exception:  # noqa: BLE001
                     break
                 if r.status_code == 200:
-                    cache[oid] = str(r.json().get("lastName") or "").strip() or None
+                    cache[oid] = r.json()
                     break
                 if r.status_code != 404:
                     break
         return cache[oid]
+
+    def get_owner_full_name(self, owner_id: str) -> Optional[str]:
+        """owner の「姓名」。取れなければ None。"""
+        rec = self._owner_record(owner_id)
+        return owner_display_name(rec) if rec else None
+
+    def get_owner_last_name(self, owner_id: str) -> Optional[str]:
+        """owner の姓。取れなければ None (取得とキャッシュは _owner_record)。"""
+        rec = self._owner_record(owner_id)
+        return (str(rec.get("lastName") or "").strip() or None) if rec else None
 
     # ---- リクロジの求人を作って取引に付けるための読み書き (2026-10-20) ----
     def read_listing(self, listing_id: str, properties: list) -> dict:
