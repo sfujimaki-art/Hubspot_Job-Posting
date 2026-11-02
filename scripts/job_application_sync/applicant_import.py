@@ -346,6 +346,8 @@ class HubSpotClient(Protocol):
     def search_listing_reclogi(self, reclogi_job_id: str) -> Optional[str]: ...
     def search_listing_aw(self, media_job_id: str, airwork_login_id: str) -> Optional[str]: ...
     def search_listing_aw_by_id(self, media_job_id: str) -> list[str]: ...
+    def find_prepared_reclogi_listings(self, hr_job_id: str) -> list[str]: ...
+    def update_listing(self, listing_id: str, properties: dict) -> None: ...
     def find_existing_appointment(
         self, media: str, media_job_id: str, phone: str, email: str, apply_date: str = ""
     ) -> Optional[str]: ...
@@ -402,6 +404,17 @@ class DryRunClient:
         self.search_log.append({"op": "search_listing_reclogi",
                                 "key": {"id_reclogi": reclogi_job_id}})
         return self.listings_reclogi.get(reclogi_job_id)
+
+    def find_prepared_reclogi_listings(self, hr_job_id: str) -> list[str]:
+        """HR_HR が先に作った「id_reclogi が空のリクロジ求人」 (テストで prepared_reclogi に差し込む)。"""
+        self.search_log.append({"op": "find_prepared_reclogi_listings",
+                                "key": {"reclogi_moto_hr_kyuujin_id": hr_job_id}})
+        return list(getattr(self, "prepared_reclogi", {}).get(hr_job_id, []))
+
+    def update_listing(self, listing_id: str, properties: dict) -> None:
+        if not hasattr(self, "updated_listings"):
+            self.updated_listings = []
+        self.updated_listings.append({"id": listing_id, "properties": dict(properties)})
 
     def search_listing_aw(self, media_job_id: str, airwork_login_id: str) -> Optional[str]:
         # 必ず id_airwork + airwork_account_login_id の両方を使う (v0.2 AW LISTING 複合ユニーク)
@@ -547,6 +560,29 @@ class RealHubSpotClient:
             return None
         results = r.json().get("results", [])
         return results[0]["id"] if len(results) == 1 else None
+
+    def find_prepared_reclogi_listings(self, hr_job_id: str) -> list[str]:
+        """元 HRハッカー求人ID が同じで id_reclogi が空のリクロジ求人 (HR_HR が先に作ったもの)。
+
+        失敗は例外 (「0件」と見て二重に作らないため)。"""
+        body = {
+            "filterGroups": [{"filters": [
+                {"propertyName": "reclogi_moto_hr_kyuujin_id", "operator": "EQ",
+                 "value": str(hr_job_id)},
+                {"propertyName": "id_reclogi", "operator": "NOT_HAS_PROPERTY"},
+            ]}],
+            "properties": ["hs_object_id"],
+            "limit": 100,
+        }
+        r = self._post("/crm/v3/objects/0-420/search", body)
+        r.raise_for_status()
+        return sorted(str(x["id"]) for x in r.json().get("results", []))
+
+    def update_listing(self, listing_id: str, properties: dict) -> None:
+        r = self._requests.patch(f"{self.BASE}/crm/v3/objects/0-420/{listing_id}",
+                                 headers=self.headers, json={"properties": properties},
+                                 timeout=30)
+        r.raise_for_status()
 
     def search_listing_aw(self, media_job_id: str, airwork_login_id: str) -> Optional[str]:
         body = {

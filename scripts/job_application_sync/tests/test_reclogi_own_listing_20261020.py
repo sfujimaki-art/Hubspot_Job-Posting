@@ -349,3 +349,116 @@ def test_作った求人を取引に付けられなければ止める():
     stat = M.apply(appts[:1], rows, recs, cli, fetch_page=lambda u: PAGE,
                    make_listing=rl.create_listing)
     assert stat["stopped_at"] == "A1" and cli.associations == [] and cli.removed == []
+
+
+# ---------------------------------------------------------------- 用意済みの求人 (HR_HR が先に作った)
+class PreparedClient(FakeClient):
+    """用意済み求人の検索と更新を記録する。"""
+
+    def __init__(self, prepared=None, fail_search=False, **kw):
+        super().__init__(**kw)
+        self.prepared_reclogi = prepared or {}
+        self.fail_search = fail_search
+        self.updated_listings: list = []
+
+    def find_prepared_reclogi_listings(self, hr_job_id):
+        if self.fail_search:
+            raise RuntimeError("search failed")
+        return super().find_prepared_reclogi_listings(hr_job_id)
+
+    def associate_listing_deals(self, listing_id, deal_ids):
+        self.deal_links.append((listing_id, list(deal_ids)))
+        return len(deal_ids)
+
+
+def _hr_cli(prepared, **kw):
+    return PreparedClient(prepared=prepared, listings_hr={"11694710": "L-HR"},
+                          listing_deals={"L-HR": ["D1", "D2"], "L-P1": ["D1"], "L-P2": ["D2"],
+                                         "L-OTHER": ["D9"]},
+                          listing_props={"L-HR": {"hubspot_owner_id": "O-1"},
+                                         "L-P1": {"hubspot_owner_id": ""}}, **kw)
+
+
+def _prep(cli, dry_run=False):
+    return rl.prepare_listing(cli, "10756", URL, "11694710", "1154643", dry_run=dry_run,
+                              fetch_page=lambda u: PAGE, make_listing=rl.create_listing)
+
+
+def test_用意済みが1件ならIDを書いて使い_作らず_足りない取引だけ付ける():
+    cli = _hr_cli({"11694710": ["L-P1"]})
+    r = _prep(cli)
+    assert r["action"] == "既存" and r["listing_id"] == "L-P1" and r["adopted"]
+    assert cli.created_listings == []
+    upd = cli.updated_listings
+    assert len(upd) == 1 and upd[0]["id"] == "L-P1"
+    # id_reclogi / url_reclogi と、空だった担当者だけ。hs_name・本文は書かない
+    assert upd[0]["properties"] == {"id_reclogi": "10756", "url_reclogi": URL,
+                                    "hubspot_owner_id": "O-1"}
+    assert cli.deal_links == [("L-P1", ["D2"])] and r["linked_deals"] == 1
+
+
+def test_用意済みの担当者が入っていれば上書きしない():
+    cli = _hr_cli({"11694710": ["L-P1"]})
+    cli.listing_props["L-P1"] = {"hubspot_owner_id": "O-9"}
+    _prep(cli)
+    assert "hubspot_owner_id" not in cli.updated_listings[0]["properties"]
+
+
+def test_用意済みが2件以上なら結び付けず作らず確認待ち():
+    cli = _hr_cli({"11694710": ["L-P1", "L-P2"]})
+    r = _prep(cli)
+    assert r["action"] == "確認待ち" and r["listing_id"] is None
+    assert cli.created_listings == [] and cli.updated_listings == [] and cli.deal_links == []
+
+
+def test_用意済みが0件なら従来どおり作る():
+    cli = _hr_cli({})
+    r = _prep(cli)
+    assert r["action"] == "作成" and r["listing_id"] == "L-NEW1"
+    assert cli.updated_listings == []
+
+
+def test_取引が違う用意済みは使わない():
+    cli = _hr_cli({"11694710": ["L-OTHER"]})
+    r = _prep(cli)
+    assert r["action"] == "作成" and cli.updated_listings == []
+
+
+def test_予定の取引が決まらないときは用意済みを探さず従来どおり():
+    cli = PreparedClient(prepared={"11694710": ["L-P1"]})
+    r = _prep(cli)
+    assert r["action"] == "作成" and cli.updated_listings == []
+    assert not [x for x in cli.search_log if x["op"] == "find_prepared_reclogi_listings"]
+
+
+def test_用意済みの検索に失敗したら二重に作らず次回やり直す():
+    cli = _hr_cli({"11694710": ["L-P1"]}, fail_search=True)
+    r = _prep(cli)
+    assert r["action"] == "用意済み確認失敗" and cli.created_listings == []
+
+
+def test_用意済みへの書き込みdry_runは何も書かない():
+    cli = _hr_cli({"11694710": ["L-P1"]})
+    r = _prep(cli, dry_run=True)
+    assert r["action"] == "用意済み使用予定" and r["listing_id"] == "L-P1"
+    assert cli.updated_listings == [] and cli.deal_links == [] and cli.created_listings == []
+
+
+def test_取込で2件以上なら応募者を作らず次回に回す(tmp_path):
+    from scripts.job_application_sync import applicant_sync as S
+    ws = FakeWs(_values([_row()]))
+    cli = _hr_cli({"11694710": ["L-P1", "L-P2"]})
+    s = rl.run(dry_run=False, ledger=S.Ledger(tmp_path / "l.json"), ws=ws, client=cli,
+               fetch_page=lambda u: PAGE)
+    assert s["listing_needs_review"] == 1 and s["deferred"] == 1 and s["linked"] == 0
+    assert cli.created_listings == [] and cli.created_appts == []
+
+
+def test_取込で用意済み1件ならその求人に応募者を付ける(tmp_path):
+    from scripts.job_application_sync import applicant_sync as S
+    ws = FakeWs(_values([_row()]))
+    cli = _hr_cli({"11694710": ["L-P1"]})
+    s = rl.run(dry_run=False, ledger=S.Ledger(tmp_path / "l.json"), ws=ws, client=cli,
+               fetch_page=lambda u: PAGE)
+    assert s["listing_adopted"] == 1 and s["linked"] == 1 and cli.created_listings == []
+    assert cli.associations[0]["listing_id"] == "L-P1"

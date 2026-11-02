@@ -144,7 +144,8 @@ def build_plan(appts: list, recs_by_appt: dict, client,
                    deals=prep["deals"], deal_how=prep["deal_how"])
         if prep["action"] == "既存":
             row["deals"] = client.get_listing_deals(prep["listing_id"])
-        if row["listing_id"] and row["current_listings"] == [row["listing_id"]]:
+        if (row["listing_id"] and row["current_listings"] == [row["listing_id"]]
+                and prep["action"] != "用意済み使用予定"):     # 用意済みはまだ id_reclogi が空
             row["action"] = "付け替え済み"
         rows.append(row)
     return rows
@@ -191,7 +192,7 @@ def apply(appts: list, plan_rows: list, recs_by_appt: dict, client,
         rec = recs_by_appt[aid]
         try:
             if rid not in lid_of:
-                if row["action"] == "作成予定":
+                if row["action"] in ("作成予定", "用意済み使用予定"):
                     prep = rl.prepare_listing(client, rid, rec.get(rl.C_JOB_URL),
                                               rec.get(rl.C_HR_JOB_ID), rec.get(rl.C_SHOP_ID),
                                               dry_run=False, fetch_page=fetch_page,
