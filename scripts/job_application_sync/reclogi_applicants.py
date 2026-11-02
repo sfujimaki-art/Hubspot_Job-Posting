@@ -567,7 +567,8 @@ def prepare_listing(client, rid: str, page_url: str, hr_job_id: str = "", shop_i
                     make_listing: Callable = None, job_name: str = "") -> dict:
     """リクロジ求人ID の LISTING を用意する。run と付け替えスクリプトで共用。
 
-    Returns: {"action": 既存/作成/作成予定/ページなし/ページ取得失敗/食い違い/作成失敗,
+    Returns: {"action": 既存/作成/作成予定/ページなし/ページ取得失敗/食い違い/作成失敗/
+                        用意済み使用予定/確認待ち/用意済み確認失敗,   (用意済み = HR_HR が先に作った求人。_adopt_prepared)
               "kind": 掲載中/掲載終了 (作るとき), "listing_id", "deals", "deal_how",
               "linked_deals", "props"}
     hr_job_id / shop_id / job_name: タブ (メール) に書かれた値。
@@ -622,8 +623,68 @@ def _prepare_ended(out: dict, client, rid, page_url, hr_job_id, shop_id, job_nam
     return _create_and_link(out, client, props, plan, dry_run, make_listing)
 
 
+def _adopt_prepared(out: dict, client, props: dict, plan: dict, dry_run: bool) -> bool:
+    """HR_HR が先に作った「用意済みの求人」があれば、それを使う (新しく作らない)。
+
+    用意済み = reclogi_moto_hr_kyuujin_id が今回の元 HR 求人ID と同じ・id_reclogi が空・
+    今回付ける予定の取引のどれかに関連している求人。
+    - 1件: id_reclogi / url_reclogi を書いて使う (action=既存、dry-run は 用意済み使用予定)。
+      足りない取引は付け足す。担当者など plan["copy"] は空のときだけ書く。
+      hs_name・本文など HR_HR が入れた値は触らない
+    - 2件以上: 結び付けず作らない (action=確認待ち)。呼び出し側が応募者を次回に回し、
+      HR_HR の画面で人が id_reclogi を入れれば次回は通常の検索で見つかる
+    - 検索に失敗: 二重に作らないよう作らない (action=用意済み確認失敗、次回やり直し)
+    - 取引が決まっていない / 元 HR 求人ID が無い / 0件: False (従来どおり作る)
+    Returns: out を確定させたら True。
+    """
+    hr_job_id = str(props.get("reclogi_moto_hr_kyuujin_id") or "").strip()
+    want_deals = [str(d) for d in plan["deals"]]
+    if client is None or not hr_job_id or not want_deals:
+        return False
+    try:
+        cands = client.find_prepared_reclogi_listings(hr_job_id)
+        matched = [(c, [str(d) for d in client.get_listing_deals(c)]) for c in cands]
+    except Exception as e:  # noqa: BLE001
+        plog.public(f"[reclogi] 用意済み求人の検索失敗: {type(e).__name__} → 作らず次回やり直す")
+        out["action"] = "用意済み確認失敗"
+        return True
+    matched = [(c, ds) for c, ds in matched if set(ds) & set(want_deals)]
+    if not matched:
+        return False
+    if len(matched) > 1:
+        plog.public(f"[reclogi] ⚠️ 用意済みの求人が{len(matched)}件ある → 結び付けず作らない "
+                    f"(人の確認が必要。HR_HR の画面で id_reclogi を入れる)")
+        out.update(action="確認待ち", deals=want_deals, deal_how=plan["how"])
+        return True
+    lid, have = matched[0]
+    missing = [d for d in want_deals if d not in set(have)]
+    out.update(listing_id=lid, deals=want_deals, deal_how=plan["how"], adopted=True)
+    if dry_run:
+        out.update(action="用意済み使用予定", props={})
+        return True
+    keys = list(plan["copy"])
+    cur = client.read_listing(lid, keys) if keys else {}
+    upd = {"id_reclogi": props["id_reclogi"], "url_reclogi": props.get("url_reclogi", "")}
+    upd.update({k: v for k, v in plan["copy"].items() if not str(cur.get(k) or "").strip()})
+    upd = {k: v for k, v in upd.items() if str(v or "").strip()}
+    out["props"] = upd
+    try:
+        client.update_listing(lid, upd)
+    except Exception as e:  # noqa: BLE001
+        plog.public(f"[reclogi] 用意済み求人への書き込み失敗: {type(e).__name__}")
+        out.update(action="作成失敗", listing_id=None)
+        return True
+    out["action"] = "既存"
+    if missing:
+        out["linked_deals"] = client.associate_listing_deals(lid, missing)
+    plog.public(f"[reclogi] 用意済みの求人を使った (取引の付け足し {len(missing)}件)")
+    return True
+
+
 def _create_and_link(out: dict, client, props: dict, plan: dict, dry_run: bool,
                      make_listing) -> dict:
+    if _adopt_prepared(out, client, props, plan, dry_run):
+        return out
     props.update(plan["copy"])
     out.update(deals=plan["deals"], deal_how=plan["how"], props=props)
     if dry_run:
@@ -1046,8 +1107,16 @@ def run(dry_run: bool = True, ledger=None, max_attempts: int = 3,
         a = r["action"]
         if a == "既存":
             s["listing_found"] += 1
-        elif a == "ページ取得失敗":
+            if r.get("adopted"):
+                s["listing_adopted"] = s.get("listing_adopted", 0) + 1
+        elif a in ("ページ取得失敗", "確認待ち", "用意済み確認失敗"):
             deferred.add(rid)                 # 今は分からない。応募者ごと次の回にやり直す
+            if a == "確認待ち":
+                s["listing_needs_review"] = s.get("listing_needs_review", 0) + 1
+            elif a == "用意済み確認失敗":
+                s["listing_prepared_check_failed"] = s.get("listing_prepared_check_failed", 0) + 1
+        elif a == "用意済み使用予定":
+            s["listing_adopted"] = s.get("listing_adopted", 0) + 1     # dry-run
         elif a in ("作成", "作成予定"):
             s["listing_created"] += 1
             if r["kind"] == UNLISTED:
