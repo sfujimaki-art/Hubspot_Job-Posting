@@ -69,6 +69,7 @@ from scripts.job_application_sync.fetchers.account_loader import (  # type: igno
 # A-2 を関数呼出で再利用
 from scripts.job_application_sync import airwork_import as awi  # noqa: E402
 from scripts.job_application_sync import aw_listing_images as _images  # noqa: E402
+from scripts.job_application_sync import aw_applicant_check as _appcheck  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_pace as _aw_pace  # noqa: E402
 from scripts.job_application_sync.fetchers import aw_urgent_queue as _urgent  # noqa: E402
 
@@ -601,6 +602,19 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
                 except Exception as e:  # noqa: BLE001
                     out["billing"] = f"error:{type(e).__name__}"
                 print(f"  課金 ({plog.mask_name(company)}): {out['billing']}", flush=True)
+            # ★2026-11-05 (ユーザー承認): 応募一覧も読み、直近の応募が HubSpot にあるかを確かめる。
+            #   シート1 に通知が入らなかった応募は取り込みにも通知にも現れないため。
+            #   夜の巡回だけ (run_dev_crawl.ps1 の nightly が JAS_AW_APPLICANT_CHECK=1 を付ける)。
+            if not dry_run and os.environ.get("JAS_AW_APPLICANT_CHECK", "0") == "1":
+                try:
+                    out["applicants"] = await asyncio.to_thread(
+                        _appcheck.check_company, login_id, acc.get("password", ""),
+                        company, out_dir, os.environ.get("HUBSPOT_ACCESS_TOKEN", ""),
+                        headless)
+                except Exception as e:  # noqa: BLE001
+                    out["applicants"] = {"error": type(e).__name__}
+                print(f"  応募の突き合わせ ({plog.mask_name(company)}): {out['applicants']}",
+                      flush=True)
             return out
         except AWNotReadyError as e:
             # Phase2で生成物未完 → 再キュー
