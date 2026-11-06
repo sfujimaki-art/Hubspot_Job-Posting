@@ -42,8 +42,18 @@ from job_application_sync.fetchers import aw_csv_fetcher as awf  # noqa: E402
 URL_ENTRIES = "https://ats.rct.airwork.net/entries"
 BTN_DOWNLOAD_PARTIAL = "応募者一覧をダウンロード"  # 部分一致 (「…する（上限1000件）」)
 
+# 応募が 0 件の社では DL ボタンが出ず、一覧にこの文言だけが出る (2026-11-06 実測: 夜の巡回で 31 社)
+TEXT_NO_ENTRIES = "応募者が見つかりませんでした"
+
 # CSV 検証: 1行目に含まれるべきヘッダ列名
 CSV_HEADER_TOKEN = "応募ID"
+
+
+class NoApplicantsError(RuntimeError):
+    """応募者一覧が 0 件 (DL ボタンが無い)。失敗ではない。
+
+    RuntimeError の子なので、従来どおり RuntimeError で受けている呼び出し側の動きは変わらない。
+    """
 
 # 既定保存先 (repo_root/scratchpad/csv_fetched/aw_applicants)
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -192,11 +202,16 @@ async def fetch_aw_applicants(
                         page, BTN_DOWNLOAD_PARTIAL
                     )
                     if not ok:
+                        if TEXT_NO_ENTRIES in await page.content():
+                            raise NoApplicantsError(
+                                f"応募者 0 件 (login_id={login_id})")
                         raise RuntimeError(
                             f"「{BTN_DOWNLOAD_PARTIAL}」ボタン未検出 "
                             f"(login_id={login_id})"
                         )
                 dl = await dl_info.value
+            except NoApplicantsError:
+                raise
             except RuntimeError:
                 await awf._dump_debug(page, output_dir, "entries_btn_missing")
                 raise

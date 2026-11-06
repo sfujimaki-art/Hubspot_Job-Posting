@@ -54,3 +54,17 @@ def test_failed_send_is_retried(tmp_path, monkeypatch):
     ck.record("L1", "会社A", [_row("2026-11-04")], now)
     assert ck.report(now=now) == 1
     assert ck.report(now=now) == 1    # 届かなかった分は次の回にもう一度
+
+
+def test_zero_applicants_is_not_error(tmp_path, monkeypatch):
+    """応募 0 件の社は DL ボタンが無い。エラーにせず 0 件として返す (2026-11-06)。"""
+    from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af
+
+    async def _fetch(*a, **k):
+        raise af.NoApplicantsError("0件")
+    monkeypatch.setattr(af, "fetch_aw_applicants", _fetch)
+    monkeypatch.setattr(ck, "STATE_PATH", tmp_path / "s.json")
+    out = ck.check_company("id", "pw", "社", tmp_path, "tok")
+    assert out == {"checked": 0, "missing": 0, "new": 0, "empty": True}
+    assert issubclass(af.NoApplicantsError, RuntimeError)  # 取り込み側の受け方は変わらない
+    assert not (tmp_path / "s.json").exists()

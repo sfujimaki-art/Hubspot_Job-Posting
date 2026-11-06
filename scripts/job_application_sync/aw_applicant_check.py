@@ -119,9 +119,12 @@ def check_company(login_id: str, password: str, company: str,
     from scripts.job_application_sync import applicant_import as ai
     from scripts.job_application_sync import applicant_sync as asy
     from scripts.job_application_sync.fetchers import aw_applicant_fetcher as af
-    csv_path = asyncio.run(af.fetch_aw_applicants(
-        login_id, password, out_dir, headless=headless,
-        storage_state_path=asy._session_path(login_id)))
+    try:
+        csv_path = asyncio.run(af.fetch_aw_applicants(
+            login_id, password, out_dir, headless=headless,
+            storage_state_path=asy._session_path(login_id)))
+    except af.NoApplicantsError:
+        return {"checked": 0, "missing": 0, "new": 0, "empty": True}
     rows = ai.load_applicants_csv(str(csv_path))
     frm, to = window()
     checked, missing = find_missing(rows, ai.RealHubSpotClient(token), frm, to)
