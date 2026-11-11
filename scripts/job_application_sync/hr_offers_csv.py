@@ -32,11 +32,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import re
 import statistics
 from datetime import date, datetime
 from pathlib import Path
+
+HR_CSV_ENCODING = "cp932"
 
 GLOB = "hr_offers_all_*.csv"
 #: 直近世代のサイズ中央値に対して、これを下回るファイルは「取得途中」とみなす
@@ -116,12 +119,12 @@ def pick(dirpath: Path, today: date | None = None) -> dict:
 def load_shop_to_mail(path: Path) -> dict:
     """店舗id → [連絡先メールアドレス(小文字)] を返す。
 
-    ★encoding は shift_jis + errors="replace" に固定する。監視や補完が
+    ★encoding は cp932 + errors="replace" に固定する。監視や補完が
       1バイトのデコード失敗で部分索引になるのは、静かに間違えるという意味で
       落ちるより悪い。列はヘッダ名で引く (位置ハードコード禁止)。
     """
     raw = Path(path).read_bytes()
-    txt = raw.decode("shift_jis", errors="replace")
+    txt = raw.decode(HR_CSV_ENCODING, errors="replace")
     rd = csv.reader(io.StringIO(txt))
     try:
         hdr = next(rd)
@@ -142,3 +145,10 @@ def load_shop_to_mail(path: Path) -> dict:
         if mail not in lst:
             lst.append(mail)
     return out
+
+
+def copy_fingerprint(body: str | None, images: str | None) -> str | None:
+    """本文・画像の共通指紋。両列が欠けている場合はNone。"""
+    if body is None and images is None:
+        return None
+    return hashlib.sha256(f"{body}\x00{images}".encode("utf-8")).hexdigest()
