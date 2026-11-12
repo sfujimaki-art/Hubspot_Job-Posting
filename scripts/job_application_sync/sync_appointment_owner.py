@@ -97,6 +97,31 @@ def plan_for_appt(appt: dict, group_ids: list, deals: dict,
     return out, ("change" if out else "same")
 
 
+def _get_retry(url: str, retries: int = 4) -> dict:
+    """GET。通信断・429・5xx は待ってやり直す (post_retry と同じ考え方)。"""
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, headers=_h(), timeout=30)
+        except requests.RequestException:
+            if i < retries:
+                time.sleep(2 ** i)
+                continue
+            raise
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (429, 500, 502, 503, 504) and i < retries:
+            time.sleep(2 ** i * 2)
+            continue
+        raise RuntimeError(f"HTTP {r.status_code}")
+    raise RuntimeError("retry exhausted")
+
+
+def _why(e: Exception) -> str:
+    """ログ用の失敗理由。HTTP の状態コードだけ (本文は値を含み得るので出さない)。"""
+    head = str(e).split(":", 1)[0]
+    return head if head.startswith("HTTP ") else type(e).__name__
+
+
 def active_owners() -> dict:
     """有効なユーザー {owner_id: 姓名}。owners API (archived=false) を全ページ読む。"""
     out: dict = {}
@@ -105,9 +130,7 @@ def active_owners() -> dict:
         url = f"{BASE}/crm/v3/owners?limit=500&archived=false"
         if after:
             url += f"&after={after}"
-        r = requests.get(url, headers=_h(), timeout=30)
-        r.raise_for_status()
-        j = r.json()
+        j = _get_retry(url)
         for o in j.get("results") or []:
             out[str(o["id"])] = AI.owner_display_name(o)
         after = ((j.get("paging") or {}).get("next") or {}).get("after")
@@ -138,7 +161,7 @@ def _update(items: list) -> tuple:
             done = {str(x["id"]) for x in r.get("results", [])}
         except Exception as e:  # noqa: BLE001
             print(f"  [warn] バッチ更新失敗 {len(chunk)}件 → 1件ずつやり直す: "
-                  f"{type(e).__name__}", flush=True)
+                  f"{_why(e)}", flush=True)
             done = set()
             for k, v in chunk:
                 try:
@@ -146,7 +169,7 @@ def _update(items: list) -> tuple:
                                {"inputs": [{"id": k, "properties": v}]})
                     done.add(k)
                 except Exception as e2:  # noqa: BLE001
-                    print(f"  [warn] 更新できず 応募={k}: {type(e2).__name__}", flush=True)
+                    print(f"  [warn] 更新できず 応募={k}: {_why(e2)}", flush=True)
         ok += sum(1 for k, _ in chunk if k in done)
         failed += sum(1 for k, _ in chunk if k not in done)
         time.sleep(0.2)
@@ -182,7 +205,9 @@ def main(argv=None) -> int:
           f"担当コンサルタント {stat['name_change']:,})", flush=True)
     print(f"  触らない: コンサル担当が決まらない {stat['no_consultant']:,}"
           f" (求人未紐付け {stat['no_listing']} / 求人に取引なし {stat['no_deal']}"
-          f" / 別会社とまたがる {stat['shared_shop']})"
+          f" / 別会社とまたがる {stat['shared_shop']}"
+          f" / 取引はあるがコンサル担当が空など"
+          f" {stat['no_consultant'] - stat['no_listing'] - stat['no_deal'] - stat['shared_shop']})"
           f" / コンサル担当が無効なユーザー {stat['inactive']:,}", flush=True)
     if not a.actual:
         for appt_id, pl in list(plans.items())[:20]:

@@ -1232,8 +1232,12 @@ def relink(dry_run: bool = False, limit: int = 1000,
             #   入った過去分が大量に含まれる。ここを塞がないと、求人を習得した
             #   瞬間に何ヶ月も前の応募が「必要」でBPOの未対応キューへ流れ込む。
             ai.strip_ichijitaiou_if_stale(props, apply_date)
-            if l_owner:
-                props["hubspot_owner_id"] = l_owner       # 担当者も求人から継承
+            # 担当者: HR は取引のコンサル担当 (作成時と同じ applicant_owner_id、
+            # 2026-11-12)。他媒体は従来どおり求人から継承
+            own = (ai.applicant_owner_id(cli, lid, media) if media == ai.HR_MEDIA
+                   else l_owner)
+            if own:
+                props["hubspot_owner_id"] = own
             # 応募先求人情報11項目も引き継ぐ (AWのlogin_idは対象外appt側に無いため
             # LISTING直読み+HR関連付けのみ。best-effort)
             try:
@@ -1328,7 +1332,8 @@ def propagate_from_listing(dry_run: bool = False, days: int = 0,
                                "operator": "NOT_HAS_PROPERTY"}]},
         {"filters": common + [{"propertyName": "hubspot_owner_id",
                                "operator": "NOT_HAS_PROPERTY"}]}],
-        "properties": ["ichijitaiounoumu", "hubspot_owner_id", "yingmuri"],
+        "properties": ["ichijitaiounoumu", "hubspot_owner_id", "yingmuri",
+                       "oubobaitaimei"],
         "limit": 100}
     targets, after = [], None
     while len(targets) < limit:
@@ -1357,12 +1362,22 @@ def propagate_from_listing(dry_run: bool = False, days: int = 0,
             lp[str(res["id"])] = res.get("properties", {})
     # 3) 空いている項目だけ埋める
     n_i = n_o = 0
+    cli = None
     for o in targets:
         p = o.get("properties") or {}
         L = [lp.get(x, {}) for x in (assoc.get(o["id"]) or [])]
         props = _propagate_props(p, L)
         if not props:
             continue
+        # 担当者: HR は取引のコンサル担当 (作成時と同じ applicant_owner_id、2026-11-12)。
+        # 求人が1件に決まるときだけ。決まらなければ従来どおり求人の Owner
+        own_l = assoc.get(o["id"]) or []
+        if ("hubspot_owner_id" in props and p.get("oubobaitaimei") == ai.HR_MEDIA
+                and len(own_l) == 1):
+            cli = cli or ai.RealHubSpotClient(token)
+            own = ai.applicant_owner_id(cli, own_l[0], ai.HR_MEDIA)
+            if own:
+                props["hubspot_owner_id"] = own
         if "ichijitaiounoumu" in props:
             n_i += 1
         if "hubspot_owner_id" in props:

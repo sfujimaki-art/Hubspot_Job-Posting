@@ -250,3 +250,184 @@ def test_取引群の決め方は一次対応8項目の転記と共用してい�
     src = inspect.getsource(so.collect)
     assert "BA.deal_groups" in src
     assert "deal_groups(list(need))" in inspect.getsource(ba.collect)
+
+
+# ---------------------------------------------------------------- レビュー後に追加
+def test_HRの追加項目つき重複行でも担当者は空のときだけ埋める(hr_row):
+    row = dataclasses.replace(hr_row, extra={"seibetsu": "女"})
+    key = ("HRハッカー", row.apply_date, "email", ai.normalize_email(row.email))
+    client = _hr_client(existing_appts={key: "APPT-1"})
+    client.existing_appt_props = {"APPT-1": {"hubspot_owner_id": "O-OTHER"}}
+    ai.process_applicant(row, client)
+    assert all("hubspot_owner_id" not in u["properties"]
+               for u in getattr(client, "updated_appts", []))
+    client2 = _hr_client(existing_appts={key: "APPT-1"})
+    client2.existing_appt_props = {"APPT-1": {}}
+    ai.process_applicant(row, client2)
+    assert client2.updated_appts[0]["properties"]["hubspot_owner_id"] == "O-CONSULT"
+
+
+def test_リクロジ応募は従来どおり求人のOwner():
+    client = ai.DryRunClient()
+    client.listing_owners = {"L-3": "O-DEAL-OWNER"}
+    client.listing_consultants = {"L-3": "O-CONSULT"}
+    assert ai.applicant_owner_id(client, "L-3", ai.RECLOGI_MEDIA) == "O-DEAL-OWNER"
+
+
+def test_生きている取引が無い群は契約期間が最も新しい取引のコンサル担当():
+    d = {"D1": {"dealstage": ENDED, "contract_start_date": "2025-01-01", "consultant": "O-OLD"},
+         "D2": {"dealstage": ENDED, "contract_start_date": "2026-04-01", "consultant": "O-NEW"}}
+    pl, why = so.plan_for_appt({"hubspot_owner_id": "O-OLD"}, ["D1", "D2"], d, ACTIVE)
+    assert (pl.get("hubspot_owner_id"), why) == ("O-NEW", "change")
+
+
+def _fake_hubspot(monkeypatch, a2l, l2d, deals, listings, pipeline):
+    """deal_groups が読む HubSpot を差し替える (通信しない)。"""
+    def assoc(frm, to, ids):
+        src = a2l if frm == "0-421" else l2d
+        return {i: src[i] for i in ids if i in src}
+
+    def read(obj, ids, props):
+        src = deals if obj == "0-3" else listings
+        return {i: src[i] for i in ids if i in src}
+    monkeypatch.setattr(ba, "_batch_assoc", assoc)
+    monkeypatch.setattr(ba, "_batch_read", read)
+    monkeypatch.setattr(ba, "search_all_by_id", lambda *a, **k: [
+        {"id": i, "properties": p} for i, p in pipeline.items()])
+
+
+def _d(code, stage=LIVE, start="2025-01-01", consultant="", shops=""):
+    return {"code_of_customer": code, "dealstage": stage, "contract_start_date": start,
+            "consultant": consultant, "pipeline": ai.DELIVERY_PIPELINE,
+            "hrhacker_shop_ids": shops}
+
+
+def test_deal_groups_取引群の決め方(monkeypatch):
+    pipeline = {"P1": _d("C1", consultant="O-NEW", shops="S1"),
+                "P2": _d("C2", consultant="O-X", shops="S2"),
+                "P3": _d("C3", consultant="O-Y", shops="S9"),
+                "P4": _d("C4", consultant="O-Z", shops="S9")}
+    deals = {"D1": _d("C1", stage=ENDED, consultant="O-OLD", shops="S1"),
+             "D2": _d("C2", shops="S2"), "D3": _d("C3", shops="S3")}
+    a2l = {"A-code": ["L1"], "A-owner": ["L2"], "A-shared": ["L3"],
+           "A-span": ["L4", "L5"], "A-none": [], "A-nodeal": ["L6"]}
+    l2d = {"L1": ["D1"], "L2": ["D3"], "L4": ["D1"], "L5": ["D2"]}
+    listings = {"L1": {"id_shop_hrhakkaa": "S1"}, "L2": {"hr_owner_code": "C2"},
+                "L3": {"id_shop_hrhakkaa": "S9"}, "L4": {}, "L5": {}, "L6": {}}
+    _fake_hubspot(monkeypatch, a2l, l2d, deals, listings, pipeline)
+    groups, got, stat = ba.deal_groups(list(a2l))
+    # 直接の取引 (終了) + 同じ取引先コードの納品管理の取引 → 今の契約は生きている P1
+    assert sorted(groups["A-code"]) == ["D1", "P1"]
+    assert ai.consultant_owner_id(groups["A-code"], got) == "O-NEW"
+    # 持ち主コードが判定済み → 直接の取引 (C3) ではなく持ち主コード C2 の取引群
+    assert groups["A-owner"] == ["P2"]
+    assert ai.consultant_owner_id(groups["A-owner"], got) == "O-X"
+    # 店舗IDを別会社と共有・別会社の取引にまたがる → 決めない
+    assert groups["A-shared"] == [] and groups["A-span"] == []
+    assert groups["A-none"] == [] and groups["A-nodeal"] == []
+    assert (stat["shared_shop"], stat["no_listing"], stat["no_deal"]) == (2, 1, 1)
+
+
+def test_担当者一覧は全ページ読み一時的な失敗はやり直す(monkeypatch):
+    pages = [
+        (503, {}),
+        (200, {"results": [{"id": "1", "lastName": "見本", "firstName": "太郎"}],
+               "paging": {"next": {"after": "x"}}}),
+        (200, {"results": [{"id": "2", "lastName": "", "firstName": ""}]}),
+    ]
+    urls: list = []
+
+    class R:
+        def __init__(self, code, body):
+            self.status_code, self._b = code, body
+
+        def json(self):
+            return self._b
+
+    def get(url, **k):
+        urls.append(url)
+        return R(*pages.pop(0))
+    monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "dummy")
+    monkeypatch.setattr(so.requests, "get", get)
+    monkeypatch.setattr(so.time, "sleep", lambda s: None)
+    assert so.active_owners() == {"1": "見本太郎", "2": None}
+    assert all("archived=false" in u for u in urls)
+    assert urls[-1].endswith("&after=x")
+
+
+def test_一部しか返らなかった更新は失敗に数える(monkeypatch):
+    monkeypatch.setattr(so.time, "sleep", lambda s: None)
+    monkeypatch.setattr(so, "post_retry", lambda url, body: {"results": [{"id": "1"}]})
+    assert so._update([("1", {"x": "y"}), ("2", {"x": "y"})]) == (1, 1)
+
+
+def test_失敗のログは状態コードだけで本文を出さない():
+    assert so._why(RuntimeError("HTTP 400: 氏名入りの本文")) == "HTTP 400"
+    assert so._why(ValueError("x")) == "ValueError"
+
+
+# ---------------------------------------------------------------- 再紐付け・空欄埋め
+class _Resp:
+    def __init__(self, body, code=200):
+        self._b, self.status_code = body, code
+
+    def json(self):
+        return self._b
+
+
+def _patch_client(monkeypatch, consultant="O-CONSULT"):
+    C = ai.RealHubSpotClient
+    monkeypatch.setattr(C, "get_listing_consultant", lambda self, l, m="", lo="": consultant)
+    monkeypatch.setattr(C, "owner_is_active", lambda self, o: True)
+    monkeypatch.setattr(C, "get_listing_owner", lambda self, l: "O-LISTING")
+    monkeypatch.setattr(C, "get_oubosaki_props", lambda self, *a: {})
+    monkeypatch.setattr(C, "copy_listing_note", lambda self, *a: None)
+    monkeypatch.setattr(C, "associate_appointment_to_listing", lambda self, *a: None)
+
+
+@pytest.mark.parametrize("media,expected", [("HRハッカー", "O-CONSULT"),
+                                             ("AirWork", "O-LISTING")])
+def test_再紐付けでもHRはコンサル担当_他は求人のOwner(monkeypatch, media, expected):
+    from scripts.job_application_sync import applicant_sync as asy
+    _patch_client(monkeypatch)
+    prop = "id_hrhakkaa" if media == "HRハッカー" else "id_airwork"
+
+    def post(url, **k):
+        if "/0-421/search" in url:
+            return _Resp({"results": [{"id": "A1", "properties": {
+                "oubokyuujinmemo": "J1", "oubobaitaimei": media,
+                "yingmuri": "2026-01-01"}}]})
+        return _Resp({"results": [{"id": "L1", "properties": {
+            prop: "J1", "hubspot_owner_id": "O-LISTING"}}]})
+    patched: list = []
+    monkeypatch.setattr(asy.requests, "post", post)
+    monkeypatch.setattr(asy.requests, "patch",
+                        lambda url, **k: patched.append(k["json"]["properties"]))
+    monkeypatch.setattr(asy, "slack_notify", lambda *a, **k: True)
+    monkeypatch.setattr(asy.time, "sleep", lambda s: None)
+    assert asy.relink(dry_run=False)["relinked"] == 1
+    assert patched[0]["hubspot_owner_id"] == expected
+
+
+@pytest.mark.parametrize("media,expected", [("HRハッカー", "O-CONSULT"),
+                                             ("AirWork", "O-LISTING")])
+def test_空欄埋めでもHRはコンサル担当_他は求人のOwner(monkeypatch, media, expected):
+    from scripts.job_application_sync import applicant_sync as asy
+    _patch_client(monkeypatch)
+
+    def post(url, **k):
+        if "/0-421/search" in url:
+            return _Resp({"results": [{"id": "A1", "properties": {
+                "oubobaitaimei": media, "yingmuri": "2026-01-01"}}]})
+        if "/associations/" in url:
+            return _Resp({"results": [{"from": {"id": "A1"},
+                                       "to": [{"toObjectId": "L1"}]}]})
+        return _Resp({"results": [{"id": "L1", "properties": {
+            "hubspot_owner_id": "O-LISTING"}}]})
+    patched: list = []
+    monkeypatch.setattr(asy.requests, "post", post)
+    monkeypatch.setattr(asy.requests, "patch",
+                        lambda url, **k: patched.append(k["json"]["properties"]))
+    out = asy.propagate_from_listing(dry_run=False, days=30, limit=10)
+    assert out["filled_owner"] == 1
+    assert patched == [{"hubspot_owner_id": expected}]
