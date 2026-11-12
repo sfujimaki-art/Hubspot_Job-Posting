@@ -133,19 +133,19 @@ def _batch_read(obj: str, ids: list, props: list) -> dict:
     return out
 
 
-def collect(since: str) -> tuple:
-    """(対象応募{id: props}, 応募→取引群{id: [deal]}, 取引{id: props}, 内訳)。"""
-    apps = {str(r["id"]): r.get("properties") or {} for r in search_all_by_id(
-        APPOINTMENT, APPT_PROPS,
-        [{"propertyName": "hs_createdate", "operator": "GTE", "value": since}])}
-    stat = Counter(window=len(apps))
-    need = {a: p for a, p in apps.items()
-            if not str(p.get(DM.APPT_TRANSFERRED_AT) or "").strip()
-            or str(p.get("ichijitaiounoumu") or "").strip() in ("", "unset")}
-    stat["already_done"] = len(apps) - len(need)
-    if not need:
-        return need, {}, {}, stat
-    a2l = _batch_assoc(APPOINTMENT, LISTING, sorted(need))
+def deal_groups(appt_ids: list) -> tuple:
+    """応募ID群 → (応募→取引群{id: [deal]}, 取引{id: props}, 内訳)。
+
+    応募作成時 (applicant_import._listing_deal_group) と同じ規則で取引群を決める:
+    求人の持ち主コードが判定済みならそのコードの取引群、店舗IDを別会社と共有する
+    求人・別会社の取引にまたがる応募は [] (決めない)。それ以外は求人に紐付く取引に
+    同じ取引先コードの納品管理PL取引を加える。
+    sync_appointment_owner (2026-11-12) と共用する。
+    """
+    stat = Counter()
+    if not appt_ids:
+        return {}, {}, stat
+    a2l = _batch_assoc(APPOINTMENT, LISTING, sorted(appt_ids))
     lids = sorted({l for v in a2l.values() for l in v})
     l2d = _batch_assoc(LISTING, DEAL, lids) if lids else {}
     direct = sorted({d for v in l2d.values() for d in v})
@@ -168,7 +168,7 @@ def collect(since: str) -> tuple:
     by_code_all = DM.group_by_code(pipeline)
     by_code = DM.group_by_code(deals)
     groups: dict = {}
-    for a in need:
+    for a in appt_ids:
         # ★求人に持ち主コードが判定済み (2026-10-05) なら、その取引群をそのまま使う
         owners = {lowner.get(l) for l in a2l.get(a, [])} - {"", None}
         if len(owners) == 1:
@@ -198,6 +198,23 @@ def collect(since: str) -> tuple:
                   for d in ids} - {""}:
             ids += by_code.get(c, [])
         groups[a] = list(dict.fromkeys(ids))
+    return groups, deals, stat
+
+
+def collect(since: str) -> tuple:
+    """(対象応募{id: props}, 応募→取引群{id: [deal]}, 取引{id: props}, 内訳)。"""
+    apps = {str(r["id"]): r.get("properties") or {} for r in search_all_by_id(
+        APPOINTMENT, APPT_PROPS,
+        [{"propertyName": "hs_createdate", "operator": "GTE", "value": since}])}
+    stat = Counter(window=len(apps))
+    need = {a: p for a, p in apps.items()
+            if not str(p.get(DM.APPT_TRANSFERRED_AT) or "").strip()
+            or str(p.get("ichijitaiounoumu") or "").strip() in ("", "unset")}
+    stat["already_done"] = len(apps) - len(need)
+    if not need:
+        return need, {}, {}, stat
+    groups, deals, gstat = deal_groups(list(need))
+    stat.update(gstat)
     return need, groups, deals, stat
 
 

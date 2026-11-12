@@ -129,11 +129,37 @@ def deal_current_props(deal_ids: list, deals: dict) -> dict:
 def consultant_owner_id(deal_ids: list, deals: dict) -> Optional[str]:
     """「今の契約」(deal_current_props と同じ latest_live) の取引のコンサル担当 (owner ID)。
     応募者の「担当コンサルタント」に名前を写すのに使う (2026-11-02 ユーザー指示:
-    応募者の担当者=取引担当者は残しつつ、コンサル担当も応募者に入れる)。純関数。"""
+    応募者の担当者=取引担当者は残しつつ、コンサル担当も応募者に入れる)。純関数。
+    2026-11-12 から HR 応募の担当者 (hubspot_owner_id) もこの人にする
+    (applicant_owner_id・sync_appointment_owner)。"""
     did = DM.latest_live(deal_ids, deals)
     if not did:
         return None
     return str(deals[did].get("consultant") or "").strip() or None
+
+
+HR_MEDIA = "HRハッカー"
+
+
+def applicant_owner_id(client, listing_id: Optional[str], media: str,
+                       login_id: str = "") -> Optional[str]:
+    """応募の Owner (hubspot_owner_id) に入れる人。求人が決まらなければ None。
+
+    HRハッカー (2026-11-12 ユーザー指示): 求人 → 取引群の「今の契約」(latest_live) の
+      **コンサル担当** (consultant) を直接入れる。担当の変更は取引で行っており、
+      求人の Owner は夜間に取引担当者へ合わせるだけなので今の担当ではないため。
+      コンサル担当が決まらない・無効なユーザーなら、従来どおり求人の Owner。
+    その他の媒体: 従来どおり求人の Owner。
+    """
+    if not listing_id:
+        return None
+    if media == HR_MEDIA:
+        get_c = getattr(client, "get_listing_consultant", None)
+        cid = get_c(listing_id, media, login_id) if get_c else None
+        active = getattr(client, "owner_is_active", None)
+        if cid and (active is None or active(cid)):
+            return cid
+    return client.get_listing_owner(listing_id)
 
 
 def owner_display_name(owner: dict) -> Optional[str]:
@@ -472,6 +498,15 @@ class DryRunClient:
     def get_listing_owner(self, listing_id: str) -> Optional[str]:
         # ドライランでは注入辞書(listing_owners)から返す (テスト用)。既定None
         return getattr(self, "listing_owners", {}).get(listing_id)
+
+    def get_listing_consultant(self, listing_id: str, media: str = "",
+                               login_id: str = "") -> Optional[str]:
+        # ドライランでは注入辞書(listing_consultants)から返す (テスト用)。既定None
+        return getattr(self, "listing_consultants", {}).get(listing_id)
+
+    def owner_is_active(self, owner_id: str) -> bool:
+        # テストで inactive_owners に入れた owner だけ無効扱い
+        return owner_id not in getattr(self, "inactive_owners", set())
 
     def update_appointment(self, appointment_id: str, properties: dict) -> None:
         # dup時の欠損補完 (記録のみ)
@@ -1429,7 +1464,7 @@ def build_appointment_properties(
         "hs_appointment_start": (f"{row.apply_date}T00:00:00Z"
                                  if len(row.apply_date) == 10 else ""),
     }
-    # 担当者 = 紐付いた求人の所有者 (親取引から継承されたもの)。未特定時は未設定
+    # 担当者 = applicant_owner_id の結果 (HR は取引のコンサル担当、他は求人の所有者)。未特定時は未設定
     if owner_id:
         props["hubspot_owner_id"] = owner_id
     # 求人側の一次対応フラグ(必要/不要)を応募者に引き継ぐ。unset/None は入れない。
@@ -1535,7 +1570,8 @@ def _process_applicant(
             "yingmujinglu": _yingmujinglu(row.media),
         }.items() if v}
         if listing_id:
-            own = client.get_listing_owner(listing_id)
+            own = applicant_owner_id(client, listing_id, row.media,
+                                     row.airwork_login_id or default_login_id)
             if own:
                 cand["hubspot_owner_id"] = own
         fill = {}
@@ -1569,7 +1605,8 @@ def _process_applicant(
 
     # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグ + 所有者 + 応募先求人情報を引き継ぐ)
     ichijitaiou = client.get_listing_ichijitaiou(listing_id) if listing_id else None
-    owner_id = client.get_listing_owner(listing_id) if listing_id else None
+    owner_id = applicant_owner_id(client, listing_id, row.media,
+                                  row.airwork_login_id or default_login_id)
     props = build_appointment_properties(
         row, linked=listing_id is not None, ichijitaiou=ichijitaiou,
         owner_id=owner_id)

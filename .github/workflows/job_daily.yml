@@ -291,7 +291,7 @@ jobs:
           else
             FLAG="--dry-run"; SLACKFLAG=""   # 試し実行でSlackを撃たない
           fi
-          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_ANMOKU=0; RC_MEMO=0; RC_APPT=0; RC_DRIFT=0; RC_HEALTH=0
+          RC_CODE=0; RC_ROLLUP=0; RC_INHERIT=0; RC_RPO=0; RC_ASSOC=0; RC_RELINK=0; RC_ICHIJI=0; RC_ANMOKU=0; RC_MEMO=0; RC_APPT=0; RC_OWNER=0; RC_DRIFT=0; RC_HEALTH=0
           # 実行順序は依存関係で決まる:
           #   取引へ紐付け → 最新取引へ付け替え → 一次対応の転記
           #   → メモの転記 → 検知
@@ -316,6 +316,10 @@ jobs:
           #   (親の条件が後で変わっても上書きしない)。要否は空の応募だけ補う。
           #   紐付け・付け替え・要否の後に置く (正しい取引群が揃ってから)。
           python scripts/job_application_sync/backfill_appointment_anmokuchi.py $FLAG || RC_ANMOKU=$?
+          # ★HR応募の担当者を取引の「コンサル担当」に毎晩合わせる (2026-11-12 ユーザー指示)。
+          #   担当の変更は取引で行うため、作成時の値のままだと今の担当とずれる。
+          #   紐付け・付け替えの後に置く (正しい取引群が揃ってから)。直近90日の応募が対象。
+          python scripts/job_application_sync/sync_appointment_owner.py $FLAG || RC_OWNER=$?
           # 取引の暗黙知メモを配下の求人へ転記する。
           # メモの正は取引に置いてある(求人は出し直しで作り替えられるため)。
           # ここが無いと、取引でメモを直しても現場が見る求人には届かない。
@@ -348,7 +352,7 @@ jobs:
           # health_check.py は「チェック自体が失敗したら1を返す」設計なので
           # `|| true` で捨てない (監視の無音故障を作らないため)。
           python scripts/job_application_sync/health_check.py $SLACKFLAG || RC_HEALTH=$?
-          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI anmokuchi=$RC_ANMOKU memo=$RC_MEMO appt=$RC_APPT drift=$RC_DRIFT health=$RC_HEALTH"
+          echo "[deal_hygiene] rc: code=$RC_CODE rollup=$RC_ROLLUP inherit=$RC_INHERIT rpo=$RC_RPO assoc=$RC_ASSOC relink=$RC_RELINK ichijitaiou=$RC_ICHIJI anmokuchi=$RC_ANMOKU memo=$RC_MEMO appt=$RC_APPT owner=$RC_OWNER drift=$RC_DRIFT health=$RC_HEALTH"
           # 検知系(drift/health)も失敗判定に入れる。**監視が死んでいるのに緑**が
           # いちばん危険 (見本テックの誤転記55件はdriftでしか気づけない)。
           NG=""
@@ -361,6 +365,7 @@ jobs:
           [ $RC_ANMOKU -ne 0 ] && NG="$NG 応募への一次対応8項目の転記"
           [ $RC_MEMO   -ne 0 ] && NG="$NG 暗黙知メモの転記"
           [ $RC_APPT   -ne 0 ] && NG="$NG 応募メモの穴埋め"
+          [ $RC_OWNER  -ne 0 ] && NG="$NG 応募の担当者をコンサル担当に合わせる"
           [ $RC_DRIFT  -ne 0 ] && NG="$NG 顧客シートURL乖離の検知"
           [ $RC_HEALTH -ne 0 ] && NG="$NG 健全性チェック"
           if [ -n "$NG" ]; then
