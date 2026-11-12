@@ -248,7 +248,7 @@ def test_duplicate_backfills_existing(aw_row):
         existing_appts={("AirWork", row.apply_date, "email",
                          ai.normalize_email(row.email)): "APPT-1"},
     )
-    client.listing_owners = {"L-9002": "777"}
+    client.deal_owners = {"L-9002": "777"}
     res = ai.process_applicant(row, client)
     assert res.status == "skip_duplicate"
     up = client.updated_appts[0]
@@ -275,7 +275,7 @@ def test_duplicate_backfill_protects_existing_values(aw_row):
     # 既存レコードには良い分割の市区町村と担当者が入っている
     client.existing_appt_props = {"APPT-1": {
         "shikuchouson": "千代田区", "hubspot_owner_id": "111"}}
-    client.listing_owners = {"L-9002": "777"}
+    client.deal_owners = {"L-9002": "777"}
     res = ai.process_applicant(row, client)
     assert res.status == "skip_duplicate"
     up = client.updated_appts[0]["properties"]

@@ -550,9 +550,11 @@ async def process_one(sem: asyncio.Semaphore, acc: dict, out_dir: Path,
 
             # --- Phase2(collect) / full: DL→A-2 ---
             mode = "collect" if phase == "collect" else "full"
+            xkw_age = ({"max_age_min": acc["export_max_age_min"]}
+                       if acc.get("export_max_age_min") is not None else {})
             zip_or_xlsx = await fetch_aw_xlsx(
                 login_id, acc.get("password", ""), out_dir,
-                headless=headless, mode=mode,
+                headless=headless, mode=mode, **xkw_age,
             )
             xlsx_path = _extract_xlsx_from_zip(zip_or_xlsx)
             # LISTINGのlogin表現は bid(顧客管理シートのログインID)に統一(2026-07-27)。
@@ -944,6 +946,10 @@ async def orchestrate(parallel: int = 5,
                   f"{len(accounts)}社を処理", flush=True)
     if limit:
         accounts = accounts[:limit]
+    if from_urgent_queue:
+        # ★至急の取得は、新しく出た求人を取るためのもの。古いファイルを使わず作り直す (2026-11-12)
+        accounts = [{**a, "export_max_age_min": getattr(_awf, "URGENT_EXPORT_MAX_AGE_MIN", 10)}
+                    for a in accounts]
     total = len(accounts)
     print(
         f"[orchestrate] target={total} accounts, "

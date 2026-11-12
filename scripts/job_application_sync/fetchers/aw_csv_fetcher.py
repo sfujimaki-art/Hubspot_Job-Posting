@@ -31,7 +31,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -261,6 +261,43 @@ async def _dump_debug(page, output_dir: Path, tag: str) -> None:
 
 
 CREATE_DONE = "__create_done__"  # mode="create" 完了マーカー (生成トリガーのみ)
+
+# ★求人一覧ファイルの古さの上限 (2026-11-12)。
+#   AirWork は作ったファイルを 24 時間残し、その間は「ダウンロードする」がすぐ出る。
+#   以前はそれをそのまま落としていたため、前日に作られたファイルの求人しか取れず、
+#   新しい求人への応募が求人なしで入った (実測 11/10: 至急の取得が 15 時間前の
+#   ファイルを落とし、その後に出した求人が無かった)。
+#   上限より古ければ「データを作成する」を押して作り直し、新しいファイルを待つ。
+EXPORT_MAX_AGE_MIN = int(os.environ.get("AW_EXPORT_MAX_AGE_MIN", "360"))
+# 至急の取得 (応募の求人が HubSpot に無い社) はほぼ毎回作り直す
+URGENT_EXPORT_MAX_AGE_MIN = int(os.environ.get("AW_URGENT_EXPORT_MAX_AGE_MIN", "10"))
+_EXPORT_TS = re.compile(r"_(\d{14})\.xlsx$", re.I)
+
+
+def export_created_at(path) -> Optional[datetime]:
+    """求人一覧 ZIP の中のファイル名 (Joblist_<番号>_<YYYYMMDDhhmmss>.xlsx) から作成日時。
+    読めなければ None (古さが分からない = 作り直さない)。"""
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(path)) as z:
+            names = z.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return None
+    for n in names:
+        m = _EXPORT_TS.search(n)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+            except ValueError:
+                return None
+    return None
+
+
+def export_is_stale(created: Optional[datetime], max_age_min: Optional[int],
+                    now: Optional[datetime] = None) -> bool:
+    if created is None or max_age_min is None:
+        return False
+    return (now or datetime.now()) - created > timedelta(minutes=max_age_min)
 
 URL_DASHBOARD = "https://ats.rct.airwork.net/dashboards"
 
@@ -511,6 +548,7 @@ async def fetch_aw_xlsx(
     poll_interval_sec: int = 30,
     mode: str = "full",
     storage_state_path: Optional[Path] = None,
+    max_age_min: Optional[int] = None,
 ):
     """mode:
       - "full"    : login→生成→DL (従来動作, Path返却)
@@ -595,6 +633,11 @@ async def fetch_aw_xlsx(
             #   → ポーリング毎にフルリロードして BTN_DOWNLOAD を再判定する (timeout大幅短縮)。
             deadline = time.time() + timeout_min * 60
             first_iter = True
+            # 作り直し (mode=full だけ)。fresh_after が入ったら、それ以降に作られたファイルを待つ
+            if mode == "full" and max_age_min is None:
+                max_age_min = EXPORT_MAX_AGE_MIN
+            fresh_after: Optional[datetime] = None
+            stale_path: Optional[Path] = None
             while time.time() < deadline:
                 if not first_iter:
                     # フルリロードで生成完了状態を反映させる (BTN_REFRESHより確実)
@@ -620,6 +663,33 @@ async def fetch_aw_xlsx(
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     out_path = output_dir / f"aw_{login_file_tag(login_id)}_{ts}.zip"
                     await dl.save_as(str(out_path))
+                    if mode != "full":
+                        return out_path
+                    created = export_created_at(out_path)
+                    if fresh_after is None:
+                        if not export_is_stale(created, max_age_min):
+                            return out_path
+                        # 古い → 作り直す
+                        if not await _click_button_by_text(page, BTN_CREATE):
+                            await _dump_debug(page, output_dir, "recreate_btn_missing")
+                            print(f"  [aw_export] 作り直しのボタンが無いため、"
+                                  f"{created:%m/%d %H:%M} に作られたファイルを使う", flush=True)
+                            return out_path
+                        print(f"  [aw_export] {created:%m/%d %H:%M} に作られたファイルなので"
+                              f"作り直す", flush=True)
+                        stale_path = out_path
+                        # AirWork と PC の時計のずれを 2 分見込む
+                        fresh_after = datetime.now() - timedelta(minutes=2)
+                        deadline = time.time() + timeout_min * 60
+                        await asyncio.sleep(max(poll_interval_sec, 60))
+                        continue
+                    if created is not None and created < fresh_after:
+                        # まだ前のファイルが出ている (新しいファイルの作成中)
+                        out_path.unlink(missing_ok=True)
+                        await asyncio.sleep(max(poll_interval_sec, 60))
+                        continue
+                    if stale_path is not None:
+                        stale_path.unlink(missing_ok=True)
                     return out_path
 
                 # 求人ゼロ検知: 「データがありません」が出ていれば即 empty で返す
@@ -635,6 +705,11 @@ async def fetch_aw_xlsx(
                 # collect は待たない (生成済み前提)。短間隔で数回だけ確認
                 await asyncio.sleep(5 if mode == "collect" else poll_interval_sec)
 
+            if stale_path is not None:
+                # 作り直しが時間内に終わらなかった: 前のファイルで続ける (従来と同じ結果)
+                print(f"  [aw_export] 作り直しが {timeout_min} 分で終わらず、"
+                      f"前のファイルを使う", flush=True)
+                return stale_path
             if mode == "collect":
                 # Phase2で生成物が未完 = Phase1未実行/生成中 → 再キュー対象
                 raise AWNotReadyError(

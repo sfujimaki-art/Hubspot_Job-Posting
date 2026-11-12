@@ -92,7 +92,8 @@ DELIVERY_PIPELINE = "21596025"   # 納品管理PL
 # 取引から読む項目: 今の契約の属性 + 並べ替えの根拠 + 一次対応8項目(暗黙知)
 DEAL_READ_PROPS = (["dealname", "contract_plan", "service1", "itijitaiou",
                     "dealstage", "pipeline", "contract_start_date", "createdate",
-                    DM.PROP_CODE, "hrhacker_shop_ids"] + list(DM.ANMOKUCHI_PROPS))
+                    DM.PROP_CODE, "hrhacker_shop_ids", "hubspot_owner_id"]
+                   + list(DM.ANMOKUCHI_PROPS))
 
 
 def deal_current_props(deal_ids: list, deals: dict) -> dict:
@@ -334,6 +335,9 @@ class HubSpotClient(Protocol):
     def associate_appointment_to_listing(self, appointment_id: str, listing_id: str) -> None: ...
     def get_listing_ichijitaiou(self, listing_id: str) -> Optional[str]: ...
     def get_listing_owner(self, listing_id: str) -> Optional[str]: ...
+    # 応募の担当者 = 求人に紐付く取引 (今の契約) の担当者。2026-11-12 ユーザー指示:
+    #   求人レコードの担当者ではなく、取引レコードをその都度読む
+    def get_deal_owner(self, listing_id: str, media: str, login_id: str) -> Optional[str]: ...
     def update_appointment(self, appointment_id: str, properties: dict) -> None: ...
     def get_appointment_props(self, appointment_id: str,
                               properties: list) -> dict: ...
@@ -434,6 +438,10 @@ class DryRunClient:
     def get_listing_owner(self, listing_id: str) -> Optional[str]:
         # ドライランでは注入辞書(listing_owners)から返す (テスト用)。既定None
         return getattr(self, "listing_owners", {}).get(listing_id)
+
+    def get_deal_owner(self, listing_id: str, media: str, login_id: str) -> Optional[str]:
+        # ドライランでは注入辞書(deal_owners)から返す (テスト用)。既定None
+        return getattr(self, "deal_owners", {}).get(listing_id)
 
     def update_appointment(self, appointment_id: str, properties: dict) -> None:
         # dup時の欠損補完 (記録のみ)
@@ -837,25 +845,92 @@ class RealHubSpotClient:
             props["oubosaki_kyuujin_url"] = lp["url_airwork"]
         # Deal経由3 + 1次対応(Deal直読み=sync_ichijitaiouの実行順序に依存しない)
         # + 一次対応8項目(暗黙知)。取引群は1回だけ解決して両方に使う。
+        grp = self._current_deal_group(listing_id, media, login_id, lp)
+        if grp:
+            ids, deals = grp
+            props.update(deal_current_props(ids, deals))
+            props.update(anmokuchi_transfer_props(ids, deals))
+        return props
+
+    def _current_deal_group(self, listing_id: str, media: str, login_id: str,
+                            lp: Optional[dict] = None) -> Optional[tuple]:
+        """求人の「今の契約」を選ぶ取引群 (取引ID一覧, {id: props})。決まらなければ None。
+
+        応募先求人情報と担当者で同じ取引群を使う。同じクライアントの中では
+        求人ごとに 1 回だけ解決する (応募 1 件で 2 回読まない)。
+        """
+        cache = self.__dict__.setdefault("_deal_group_cache", {})
+        key = (str(listing_id), media or "", login_id or "")
+        if key in cache:
+            return cache[key]
+        if lp is None:
+            try:
+                lp = self._requests.get(
+                    f"{self.BASE}/crm/v3/objects/0-420/{listing_id}?properties="
+                    f"id_shop_hrhakkaa,{DM.LISTING_OWNER}",
+                    headers=self.headers, timeout=20).json().get("properties") or {}
+            except Exception:  # noqa: BLE001
+                return None    # 読めなかったときは覚えない
         # ★求人に持ち主コードが判定済み (resolve_listing_owner・2026-10-05) なら、
         #   そのコードの取引群を使う。店舗IDの共有は関係ない。
         owner = (lp.get(DM.LISTING_OWNER) or "").strip()
         if owner:
             deals = self._deals_by_code(owner)
-            props.update(deal_current_props(list(deals), deals))
-            props.update(anmokuchi_transfer_props(list(deals), deals))
-            return props
+            grp = (list(deals), deals) if deals else None
         # ★店舗IDを別会社と共有している求人は、どの会社の契約か決まらない。
-        #   別会社の取引名・要否・一次対応の条件を入れるより、空で人に回す。
-        if self._shop_is_shared(lp.get("id_shop_hrhakkaa")):
-            return props
-        ids, deals = self._resolve_deal_group(listing_id, media, login_id)
-        if DM.spans_codes(ids, deals):
+        #   別会社の取引名・要否・一次対応の条件・担当者を入れるより、空で人に回す。
+        elif self._shop_is_shared(lp.get("id_shop_hrhakkaa")):
+            grp = None
+        else:
+            ids, deals = self._resolve_deal_group(listing_id, media, login_id)
             # 別会社の取引に同時に紐付いている / 管理用メールを別会社と共有
-            return props
-        props.update(deal_current_props(ids, deals))
-        props.update(anmokuchi_transfer_props(ids, deals))
-        return props
+            grp = None if (not ids or DM.spans_codes(ids, deals)) else (ids, deals)
+        cache[key] = grp
+        return grp
+
+    def _active_owners(self) -> Optional[set]:
+        """有効なユーザーの ID (owners API が既定で返すもの)。取れなければ None。"""
+        if "_active_owner_ids" in self.__dict__:
+            return self._active_owner_ids
+        out: set = set()
+        params: dict = {"limit": 100}
+        try:
+            while True:
+                r = self._requests.get(f"{self.BASE}/crm/v3/owners",
+                                       headers=self.headers, params=params, timeout=30)
+                r.raise_for_status()
+                d = r.json()
+                out |= {str(o.get("id")) for o in d.get("results", []) if o.get("id")}
+                after = (d.get("paging") or {}).get("next", {}).get("after")
+                if not after:
+                    break
+                params["after"] = after
+        except Exception:  # noqa: BLE001
+            return None        # 次の呼び出しで取り直す
+        self._active_owner_ids = out
+        return out
+
+    def get_deal_owner(self, listing_id: str, media: str, login_id: str) -> Optional[str]:
+        """応募の担当者 = 求人に紐付く取引群の「今の契約」(latest_live) の担当者。
+
+        2026-11-12 ユーザー指示: 求人レコードの担当者ではなく、取引をその都度読む。
+        求人の担当者は夜の同期でしか取引に追いつかないため、新しい求人では空、
+        取引の担当替えの直後は古い人になっていた。
+        決まらない (取引群が決まらない・担当者が空・無効なユーザー・一覧が取れない) ときは None
+        (無効なユーザーを書くと作成ごと失敗しうるので書かない)。
+        """
+        if not listing_id:
+            return None
+        grp = self._current_deal_group(listing_id, media, login_id)
+        if not grp:
+            return None
+        ids, deals = grp
+        did = DM.latest_live(ids, deals)
+        ow = str((deals.get(did) or {}).get("hubspot_owner_id") or "").strip() if did else ""
+        if not ow:
+            return None
+        active = self._active_owners()
+        return ow if active and ow in active else None
 
     def copy_listing_note(self, listing_id: str,
                           appointment_id: str) -> Optional[str]:
@@ -1209,7 +1284,7 @@ def build_appointment_properties(
         "hs_appointment_start": (f"{row.apply_date}T00:00:00Z"
                                  if len(row.apply_date) == 10 else ""),
     }
-    # 担当者 = 紐付いた求人の所有者 (親取引から継承されたもの)。未特定時は未設定
+    # 担当者 = 紐付いた求人の取引 (今の契約) の担当者。未特定時は未設定
     if owner_id:
         props["hubspot_owner_id"] = owner_id
     # 求人側の一次対応フラグ(必要/不要)を応募者に引き継ぐ。unset/None は入れない。
@@ -1316,7 +1391,8 @@ def _process_applicant(
             "yingmujinglu": "job_board",
         }.items() if v}
         if listing_id:
-            own = client.get_listing_owner(listing_id)
+            own = client.get_deal_owner(listing_id, row.media,
+                                        row.airwork_login_id or default_login_id)
             if own:
                 cand["hubspot_owner_id"] = own
         fill = {}
@@ -1362,7 +1438,10 @@ def _process_applicant(
 
     # 3. APPOINTMENT 作成 (紐付く求人の一次対応フラグ + 所有者 + 応募先求人情報を引き継ぐ)
     ichijitaiou = client.get_listing_ichijitaiou(listing_id) if listing_id else None
-    owner_id = client.get_listing_owner(listing_id) if listing_id else None
+    # 担当者は取引から都度読む (2026-11-12 ユーザー指示。求人の担当者は使わない)
+    owner_id = (client.get_deal_owner(listing_id, row.media,
+                                      row.airwork_login_id or default_login_id)
+                if listing_id else None)
     props = build_appointment_properties(
         row, linked=listing_id is not None, ichijitaiou=ichijitaiou,
         owner_id=owner_id)

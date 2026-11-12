@@ -180,7 +180,7 @@ def test_現在値が読めないときは補完で上書きしない():
     class C:
         def search_listing_aw(self, *a): return "L1"
         def find_existing_appointment(self, *a, **k): return "A1"
-        def get_listing_owner(self, lid): return None
+        def get_deal_owner(self, lid, media, login_id): return None
         def get_appointment_props(self, i, p): return None     # 読めない
         def update_appointment(self, i, p): calls.append(p)
 

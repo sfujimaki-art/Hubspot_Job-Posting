@@ -68,14 +68,22 @@ def test_要否が空なら求人側の値で埋める():
     assert p == {"ichijitaiounoumu": "必要"}
 
 
-def test_担当者が空なら求人側の値で埋める():
-    p = asy._propagate_props(_appt(yingmuri=_today()), [_listing(owner="12345")])
+def test_担当者が空なら取引の担当者で埋める():
+    p = asy._propagate_props(_appt(yingmuri=_today()), [_listing()], "12345")
     assert p == {"hubspot_owner_id": "12345"}
+
+
+def test_担当者は求人の担当者を使わない():
+    """2026-11-12 ユーザー指示: 求人作成時と応募時で担当が違うことがあるため、取引を正とする。"""
+    p = asy._propagate_props(_appt(yingmuri=_today()), [_listing(owner="OLD")], None)
+    assert p == {}
+    p = asy._propagate_props(_appt(yingmuri=_today()), [_listing(owner="OLD")], "NEW")
+    assert p == {"hubspot_owner_id": "NEW"}
 
 
 def test_両方空なら両方埋める():
     p = asy._propagate_props(_appt(yingmuri=_today()),
-                             [_listing(ichi="不要", owner="999")])
+                             [_listing(ichi="不要")], "999")
     assert p == {"ichijitaiounoumu": "不要", "hubspot_owner_id": "999"}
 
 
@@ -85,13 +93,13 @@ def test_両方空なら両方埋める():
 def test_応募側に値があれば上書きしない():
     p = asy._propagate_props(
         _appt(ichi="不要", owner="111", yingmuri=_today()),
-        [_listing(ichi="必要", owner="999")])
+        [_listing(ichi="必要")], "999")
     assert p == {}, "人が入れた値を機械が書き換えてはいけない"
 
 
 def test_片方だけ埋まっている場合は空いている方だけ埋める():
     p = asy._propagate_props(_appt(ichi="必要", yingmuri=_today()),
-                             [_listing(ichi="不要", owner="999")])
+                             [_listing(ichi="不要")], "999")
     assert p == {"hubspot_owner_id": "999"}
 
 
@@ -124,7 +132,7 @@ def test_要否が想定外の値なら入れない():
 # --------------------------------------------------------------------------
 def test_古い応募には要否を付けない():
     p = asy._propagate_props(_appt(yingmuri="2026-01-15"),
-                             [_listing(ichi="必要", owner="999")])
+                             [_listing(ichi="必要")], "999")
     assert "ichijitaiounoumu" not in p, "古い応募をBPOの未対応キューに積まない"
     assert p == {"hubspot_owner_id": "999"}, "担当者は日付に関係なく埋めてよい"
 

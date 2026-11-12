@@ -383,7 +383,8 @@ def _ensure_aw_jobs(bid: str, b_pw: str, missing: list[str], out_dir: Path,
         bid, b_pw, out_dir, headless=True, mode="full",
         # 5分バッチに20分待ちを持ち込まない(既定8分。envで調整可)。
         timeout_min=int(os.environ.get("JAS_SELFHEAL_TIMEOUT_MIN", "8")),
-        storage_state_path=_session_path(bid)))
+        storage_state_path=_session_path(bid),
+        max_age_min=awf.URGENT_EXPORT_MAX_AGE_MIN))
     # run_xlsx は .xlsx 限定のため ZIP から展開する (旧実装はZIP直渡しの潜在バグ)。
     xlsx_path = _extract_xlsx_from_zip(Path(zip_path))
     # login_id=bid で LISTING を作成 (応募linkと同じキーに揃える)。
@@ -634,6 +635,12 @@ def _process_aw_account_raw(
                     #   呼び出し側へ返し「すぐ取りに行く」待ち行列に積ませる。以前はここで
                     #   何も返さず、19:05 の回の求人の無い応募が積まれなかった。
                     result["missing_job_ids"] = list(missing)
+                    # ★2026-11-12: 求人を待つ判定がこちらの分岐に無く、10/26 以降一度も
+                    #   待たずに求人の無い応募を作っていた (本番は allow_acquire に関数を渡し、
+                    #   枠 JAS_SELFHEAL_MAX_ACQUIRE=0 なので必ずここを通る)。
+                    result["held_job_ids"] = sorted(hold_job_ids(
+                        result["missing_job_ids"], hold_since or {},
+                        aw_urgent_queue.tried_ids()))
                 if acquire_now:
                     print(f"  自己修復: {plog.mask_name(company)} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
@@ -1558,7 +1565,7 @@ def relink(dry_run: bool = False, limit: int = 1000,
         if hit is None:            # 曖昧(複数LISTING)は§24で紐付けない
             ambiguous += 1
             continue
-        lid, ichijitaiou, l_owner = hit
+        lid, ichijitaiou, _l_owner = hit
         if not dry_run:
             cli.associate_appointment_to_listing(appt_id, lid)
             props = {"kokyakushiitotenkijoukyou": "未転記"}
@@ -1569,8 +1576,10 @@ def relink(dry_run: bool = False, limit: int = 1000,
             #   入った過去分が大量に含まれる。ここを塞がないと、求人を習得した
             #   瞬間に何ヶ月も前の応募が「必要」でBPOの未対応キューへ流れ込む。
             ai.strip_ichijitaiou_if_stale(props, apply_date)
-            if l_owner:
-                props["hubspot_owner_id"] = l_owner       # 担当者も求人から継承
+            # 担当者は取引から都度読む (2026-11-12 ユーザー指示。求人の担当者は使わない)
+            d_owner = cli.get_deal_owner(lid, "HRハッカー" if is_hr else "AirWork", "")
+            if d_owner:
+                props["hubspot_owner_id"] = d_owner
             # 応募先求人情報11項目も引き継ぐ (AWのlogin_idは対象外appt側に無いため
             # LISTING直読み+HR関連付けのみ。best-effort)
             media = "HRハッカー" if is_hr else "AirWork"
@@ -1601,7 +1610,7 @@ PROPAGATE_DAYS = int(os.environ.get("JAS_PROPAGATE_DAYS", "14"))
 PROPAGATE_LIMIT = int(os.environ.get("JAS_PROPAGATE_LIMIT", "300"))
 
 
-def _propagate_props(appt: dict, listings: list) -> dict:
+def _propagate_props(appt: dict, listings: list, deal_owner: Optional[str] = None) -> dict:
     """応募へ書き込むべき継承項目だけを返す純関数（テスト対象）。
 
     不変条件:
@@ -1617,11 +1626,9 @@ def _propagate_props(appt: dict, listings: list) -> dict:
             props["ichijitaiounoumu"] = v
             ai.strip_ichijitaiou_if_stale(
                 props, str(appt.get("yingmuri") or "")[:10])
-    if not (appt.get("hubspot_owner_id") or "").strip():
-        w = next((x.get("hubspot_owner_id") for x in listings
-                  if (x.get("hubspot_owner_id") or "").strip()), None)
-        if w:
-            props["hubspot_owner_id"] = w
+    # 担当者は求人ではなく取引から (2026-11-12 ユーザー指示)。呼び出し側が取引を読んで渡す
+    if not (appt.get("hubspot_owner_id") or "").strip() and deal_owner:
+        props["hubspot_owner_id"] = deal_owner
     return props
 
 
@@ -1693,12 +1700,18 @@ def propagate_from_listing(dry_run: bool = False, days: int = 0,
                    "inputs": [{"id": x} for x in lids[i:i + 100]]})
         for res in d.get("results", []):
             lp[str(res["id"])] = res.get("properties", {})
-    # 3) 空いている項目だけ埋める
+    # 3) 空いている項目だけ埋める。担当者は紐付く求人の取引 (今の契約) から読む
+    cli = ai.RealHubSpotClient(token)
     n_i = n_o = 0
     for o in targets:
         p = o.get("properties") or {}
-        L = [lp.get(x, {}) for x in (assoc.get(o["id"]) or [])]
-        props = _propagate_props(p, L)
+        my_lids = assoc.get(o["id"]) or []
+        L = [lp.get(x, {}) for x in my_lids]
+        d_owner = None
+        if not (p.get("hubspot_owner_id") or "").strip():
+            d_owner = next((w for w in (cli.get_deal_owner(x, "", "") for x in my_lids)
+                            if w), None)
+        props = _propagate_props(p, L, d_owner)
         if not props:
             continue
         if "ichijitaiounoumu" in props:
