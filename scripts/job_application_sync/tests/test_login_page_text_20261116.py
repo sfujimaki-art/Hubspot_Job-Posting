@@ -71,3 +71,20 @@ def test_PWの再設定を求める画面は専用の分類():
          " / 画面の文字: パスワードを再設定してください")
     cause, action = at.classify_aw_error(e)
     assert "パスワードの再設定" in cause and "顧客管理シート" in action
+
+
+def test_描画前で空なら待って取り直す():
+    class Slow(_Page):
+        def __init__(self):
+            self.n = 0
+
+        async def evaluate(self, js, *a):
+            self.n += 1
+            return "" if self.n == 1 else "一致しません"
+
+        async def wait_for_load_state(self, *a, **k):
+            pass
+
+        async def wait_for_timeout(self, ms):
+            pass
+    assert asyncio.run(awf.page_text(Slow())) == "一致しません"

@@ -299,11 +299,23 @@ def login_text_reason(text: str) -> str:
 
 async def page_text(page, secrets=()) -> str:
     """表示中の画面の文字 (入力欄の値は含まない)。取れなければ空。"""
-    try:
-        t = await page.evaluate("() => (document.body && document.body.innerText) || ''")
-    except Exception:  # noqa: BLE001
-        return ""
-    return mask_page_text(str(t), secrets)[:PAGE_TEXT_MAX]
+    js = "() => (document.body && document.body.innerText) || ''"
+    t = ""
+    # 着いた直後は描画前で空のことがある (2026-11-16 実測: 2 件中 1 件が空)。少し待って取り直す
+    for i in range(3):
+        try:
+            if i:
+                try:
+                    await page.wait_for_load_state("load", timeout=3000)
+                except Exception:  # noqa: BLE001
+                    pass
+                await page.wait_for_timeout(1000)
+            t = str(await page.evaluate(js) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+        if t.strip():
+            break
+    return mask_page_text(t, secrets)[:PAGE_TEXT_MAX]
 
 
 def save_page_text(output_dir: Path, tag: str, text: str) -> Optional[Path]:
