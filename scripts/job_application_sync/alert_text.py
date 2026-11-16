@@ -22,13 +22,21 @@ def classify_aw_error(error: str, blocked_403: bool = False) -> tuple[str, str]:
 
     blocked_403: この PC が AirWork の CloudFront 403 を受けて止まっている最中か。
     """
-    e = str(error or "")
+    # 失敗した画面の文字 (2026-11-16 追加) は分類に使わない。画面の文字の「403」などで誤らないように
+    e = str(error or "").split(" / 画面の文字: ")[0]
     if "403" in e or "Request blocked" in e or blocked_403:
         return ("AirWork がこのアクセスを拒否しました (CloudFront 403)。ID や PW の問題ではありません",
                 "時間を置いて自動でやり直します。続く場合はアクセス元 (Actions/PC) を確認")
+    if "パスワードの再設定を求める画面" in e:
+        return ("AirWork がパスワードの再設定を求めています (AirWork 側で初期化された可能性)",
+                "顧客に新しいパスワードを確認し、顧客管理シートの企業AirWorkの PW を直してください")
+    if "アカウントがロックされている画面" in e:
+        return ("AirWork のアカウントがロックされています",
+                "顧客に AirWork 側でロックを解除してもらってください")
     if "login_failed=true" in e or "login_failed=tru" in e:
         return ("ID か PW が違います (AirRegi がログインを拒否しました)",
-                "顧客管理シートの企業AirWorkのID/PWを確認してください")
+                "顧客管理シートの企業AirWorkのID/PWを確認してください "
+                "(AirWork 側でパスワードが初期化されていることがあります。画面の文字も見てください)")
     if "usage_re_agreement" in e or "利用規約の再同意" in e:
         return ("エアワークの利用規約の再同意が必要です (ID と PW は正しい)",
                 "その社の AirWork にログインして利用規約に同意してください (顧客の代わりに同意してよいかは社内で判断)")

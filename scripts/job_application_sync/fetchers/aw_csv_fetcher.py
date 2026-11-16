@@ -260,6 +260,63 @@ async def _dump_debug(page, output_dir: Path, tag: str) -> None:
         pass
 
 
+# ★2026-11-16 (ユーザー「AirWork 側がランダムでログインパスワードを初期化してくるので、ログイン
+#   できない案件もあると思う。その時の画面のテキスト抽出もしてほしい」):
+#   ログインに失敗した画面の文字を抜き出し、スクリーンショットの横に .txt で残し、
+#   短い抜粋を失敗の理由に添える (Slack・ログで画面を開かずに原因が分かるように)。
+PAGE_TEXT_MAX = 4000
+PAGE_TEXT_MARK = " / 画面の文字: "
+PAGE_TEXT_EXCERPT = 160
+_PW_RESET_WORDS = ("再設定", "初期化", "変更してください", "有効期限", "リセット")
+
+
+def mask_page_text(text: str, secrets=()) -> str:
+    """画面の文字から ID・PW を伏せ、空白をまとめる。"""
+    out = text or ""
+    for v in secrets:
+        if v and len(v) >= 3:
+            out = out.replace(v, "****")
+    return out
+
+
+def compact_text(text: str, n: int = PAGE_TEXT_EXCERPT) -> str:
+    """1 行にまとめた先頭 n 文字 (理由に添える抜粋)。"""
+    one = " ".join((text or "").split())
+    return one[:n] + ("…" if len(one) > n else "")
+
+
+def login_text_reason(text: str) -> str:
+    """画面の文字から分かる原因 (分からなければ空)。"""
+    t = text or ""
+    if "パスワード" in t and any(w in t for w in _PW_RESET_WORDS):
+        return "パスワードの再設定を求める画面です (AirWork 側で初期化された可能性)"
+    if "ロック" in t:
+        return "アカウントがロックされている画面です"
+    if "現在ご利用いただけません" in t:
+        return "画面の表示: 現在ご利用いただけません"
+    return ""
+
+
+async def page_text(page, secrets=()) -> str:
+    """表示中の画面の文字 (入力欄の値は含まない)。取れなければ空。"""
+    try:
+        t = await page.evaluate("() => (document.body && document.body.innerText) || ''")
+    except Exception:  # noqa: BLE001
+        return ""
+    return mask_page_text(str(t), secrets)[:PAGE_TEXT_MAX]
+
+
+def save_page_text(output_dir: Path, tag: str, text: str) -> Optional[Path]:
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = output_dir / f"debug_{tag}_{ts}.txt"
+        path.write_text(text, encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
 CREATE_DONE = "__create_done__"  # mode="create" 完了マーカー (生成トリガーのみ)
 
 # ★求人一覧ファイルの古さの上限 (2026-11-12)。
@@ -407,6 +464,7 @@ async def establish_aw_session(
         await _log_login_diag(page, "form_not_found")
         if output_dir:
             await _dump_debug(page, output_dir, "login_form_not_found")
+            save_page_text(output_dir, "login_form_not_found", await page_text(page, (login_id, password)))
         raise RuntimeError(
             f"AirRegi SSO のID/PWフィールド未検出 (login_id={login_id})"
         )
@@ -415,6 +473,7 @@ async def establish_aw_session(
         await _log_login_diag(page, "submit_not_found")
         if output_dir:
             await _dump_debug(page, output_dir, "login_submit_not_found")
+            save_page_text(output_dir, "login_submit_not_found", await page_text(page, (login_id, password)))
         raise RuntimeError("AirRegi SSO の submit ボタン未検出")
     # 管理画面に着くまで待つ。ID/PW誤り・規約の再同意の画面に着いたら待たずに失敗にする
     # (2026-10-19: 毎晩の 38 社が 1 社 45 秒ずつ待っていた)。
@@ -429,20 +488,23 @@ async def establish_aw_session(
         err = e
     if not _is_authenticated_url(page.url):
         reason = login_fail_reason(page.url)
-        # ★2026-10-23: /interaction で止まる社 (毎回 1 社) は画面に「現在ご利用いただけません」と
-        #   出ていた (スクリーンショットで確認)。その文があれば原因に添える。
-        if _login_fail_tag(page.url) == "interaction":
-            try:
-                if "現在ご利用いただけません" in (await page.content()):
-                    reason += " 画面の表示: 現在ご利用いただけません"
-            except Exception:  # noqa: BLE001
-                pass
+        tag = f"login_failed_{_login_fail_tag(page.url)}"
+        # ★2026-10-23: /interaction で止まる社は画面に「現在ご利用いただけません」と出ていた。
+        # ★2026-11-16: 画面の文字を全部抜き出し、分かる原因 (PW の再設定など) と抜粋を添える。
+        text = await page_text(page, (login_id, password))
+        why = login_text_reason(text)
+        if why and why not in reason:
+            reason += f" / {why}"
         if output_dir:
             # スクリーンショットの名前に原因を入れる (ユーザー「スクリーンショットがほしい」2026-10-23)
-            await _dump_debug(page, output_dir, f"login_failed_{_login_fail_tag(page.url)}")
+            await _dump_debug(page, output_dir, tag)
+            save_page_text(output_dir, tag, "url: " + _safe_url(page.url) + "\n\n" + text)
+        # 画面の文字は最後に置く (alert_text.classify_aw_error はこの前までで分類する。
+        # 画面の文字に「403」等が含まれても分類を誤らないように)
         raise RuntimeError(
             f"ログイン後 dashboards に遷移せず: {reason} "
             f"(login_id={login_id}, last_url={page.url[:80]})"
+            + (f"{PAGE_TEXT_MARK}{compact_text(text)}" if text else "")
         ) from err
 
     # 3) 新セッション保存 (次回から再利用)
