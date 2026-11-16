@@ -11,7 +11,9 @@
 読み、直近の応募が HubSpot にあるかを確かめる。無いものだけを Slack と
 集約シートの「報告_応募取り込み」に出す。
 
-  - 見るのは**昨日までの直近 N 日** (既定 3 日)。今日の分は通常の取り込みの途中でありうる
+  - 見るのは**昨日まで**。最初の日は直近 N 日 (既定 3 日) か、前回その社を確かめた日の続きの
+    早い方 (止めていた期間の分も見る、2026-11-16)。今日の分は通常の取り込みの途中でありうる
+  - 求人の取得を待っている (取り込みの途中の) 応募は知らせず、次の夜に確かめ直す
   - 照合は取り込みの重複判定と同じ (媒体・求人ID・応募日・メール or 電話)。
     人が手入力した応募もメールか電話が合えば「ある」と見なす
   - HubSpot へは書かない。取り込むかどうかは人が決める
@@ -48,11 +50,69 @@ KEEP_DAYS = 30
 _LOCK = threading.Lock()
 
 
-def window(today: Optional[date] = None, days: int = DAYS) -> tuple:
-    """(最初の日, 最後の日) の YYYY-MM-DD。昨日まで days 日分。"""
+CHECKED_PATH = _REPO / "data" / "job_application_sync" / "aw_applicant_checked.json"
+MAX_BACK_DAYS = 14
+
+
+def window(today: Optional[date] = None, days: int = DAYS,
+           prev_to: Optional[str] = None) -> tuple:
+    """(最初の日, 最後の日) の YYYY-MM-DD。昨日まで。
+
+    最初の日は「今日の days 日前」と「前回その社を確かめた最後の日の days 日前」の早い方
+    (ただし MAX_BACK_DAYS 日前より前には戻らない)。
+
+    ★2026-11-16: 以前は常に直近 days 日だけを見ていた。PC や巡回を止めた日・その社の
+      巡回が失敗した日があると、その間の応募が一度も突き合わされないまま窓から外れる。
+      前回の続きから見るので、止めていた期間の分も確かめる。前回の窓の分も見直すのは、
+      前回「取り込みの途中」として見送った応募をもう一度確かめるため。
+    """
     today = today or date.today()
-    return ((today - timedelta(days=days)).isoformat(),
-            (today - timedelta(days=1)).isoformat())
+    frm = today - timedelta(days=days)
+    if prev_to:
+        try:
+            frm = min(frm, date.fromisoformat(prev_to) - timedelta(days=days))
+        except ValueError:
+            pass
+    frm = max(frm, today - timedelta(days=MAX_BACK_DAYS))
+    return frm.isoformat(), (today - timedelta(days=1)).isoformat()
+
+
+def _login_key(login_id: str) -> str:
+    return hashlib.sha256(login_id.lower().encode("utf-8")).hexdigest()[:16]
+
+
+def last_checked_to(login_id: str) -> Optional[str]:
+    try:
+        d = json.loads(CHECKED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    # "__default__": その社の記録がまだ無いときに使う日 (この仕組みを入れた時点で、
+    # 全社を最後に確かめた日。2026-11-16 は 11/12 の夜に確かめた 11/11)
+    return d.get(_login_key(login_id)) or d.get("__default__")
+
+
+def set_checked_to(login_id: str, to: str) -> None:
+    with _LOCK:
+        try:
+            d = json.loads(CHECKED_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            d = {}
+        d[_login_key(login_id)] = to
+        CHECKED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CHECKED_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d), encoding="utf-8")
+        tmp.replace(CHECKED_PATH)
+
+
+def in_progress_job_ids() -> set:
+    """取り込みの途中の求人ID (求人の取得を待っている)。これらの応募は、取り込みが求人を
+    待って止めているだけなので「HubSpot に無い」と知らせない (知らせると手で入れられて
+    二重になる)。次の夜にもう一度確かめる。"""
+    try:
+        from scripts.job_application_sync.fetchers import aw_urgent_queue as uq
+        return uq.pending_job_ids()
+    except Exception:  # noqa: BLE001
+        return set()
 
 
 def applicant_key(login_id: str, row) -> str:
@@ -124,12 +184,18 @@ def check_company(login_id: str, password: str, company: str,
             login_id, password, out_dir, headless=headless,
             storage_state_path=asy._session_path(login_id)))
     except af.NoApplicantsError:
+        set_checked_to(login_id, window()[1])
         return {"checked": 0, "missing": 0, "new": 0, "empty": True}
     rows = ai.load_applicants_csv(str(csv_path))
-    frm, to = window()
+    frm, to = window(prev_to=last_checked_to(login_id))
     checked, missing = find_missing(rows, ai.RealHubSpotClient(token), frm, to)
+    waiting = in_progress_job_ids()
+    deferred = [r for r in missing if (r.media_job_id or "") in waiting]
+    missing = [r for r in missing if (r.media_job_id or "") not in waiting]
     new = record(login_id, company, missing) if missing else 0
-    return {"checked": checked, "missing": len(missing), "new": new}
+    set_checked_to(login_id, to)
+    return {"checked": checked, "missing": len(missing), "new": new,
+            "deferred": len(deferred), "from": frm}
 
 
 def report(dry_run: bool = False, now: Optional[datetime] = None) -> int:

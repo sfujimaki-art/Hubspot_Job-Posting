@@ -112,3 +112,11 @@ def tried_ids(path: Path = None) -> set:
 def pending_companies(path: Path = None) -> set:
     """求人を取りに行く順番を待っている社 (社名)。"""
     return {str(e.get("company") or "") for e in _read(_path(path))["pending"].values()}
+
+
+def pending_job_ids(path: Path = None) -> set:
+    """取りに行く順番を待っている求人ID。応募の取り込みはこれらの求人の応募を、
+    時間で打ち切らずに待つ (2026-11-16: PC を止めていた間に待ちの時間だけが過ぎ、
+    再開直後に求人なしで作るのを防ぐ)。"""
+    return {str(j) for e in _read(_path(path))["pending"].values()
+            for j in (e.get("job_ids") or [])}

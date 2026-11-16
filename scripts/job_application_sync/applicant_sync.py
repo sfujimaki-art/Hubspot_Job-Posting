@@ -495,24 +495,41 @@ def order_aw_groups(cands: list, failed_before) -> list:
     return sorted(cands, key=lambda c: bool(failed_before(c[0])))
 
 
-def hold_job_ids(missing, hold_since: dict, tried: set, now: Optional[float] = None) -> set:
-    """応募を作らずに待つ求人ID。至急の取得がまだ取りに行っておらず、待ち始めてから
-    HOLD_MAX_MIN 分以内のもの。待ち始めの記録が無ければ今から待つ。"""
+def hold_job_ids(missing, hold_since: dict, tried: set, now: Optional[float] = None,
+                 pending: Optional[set] = None) -> set:
+    """応募を作らずに待つ求人ID。至急の取得がまだ取りに行っていないもの。
+
+    - 至急の取得の順番待ち (pending) に入っている求人は、時間で打ち切らずに待つ。
+      取得が済む (成功 / 3 回失敗) と tried に移り、そこで待ちをやめる。
+    - 順番待ちに無い求人 (積めなかった等) は、待ち始めから HOLD_MAX_MIN 分まで待つ。
+      待ち始めの記録が無ければ今から待つ。
+
+    ★2026-11-16: 以前は順番待ちの求人も HOLD_MAX_MIN 分で打ち切っていた。PC を止めると
+      止めていた時間も待ちに数えられ、再開直後に求人なしで応募を作ってしまう。また止めて
+      いた間に増えた求人で順番待ちが長くなると、取りに行く前に打ち切られる。
+    """
     now = time.time() if now is None else now
+    pending = pending or set()
     return {j for j in missing
-            if j not in tried and now - hold_since.get(j, now) < HOLD_MAX_MIN * 60}
+            if j not in tried and (j in pending
+                                   or now - hold_since.get(j, now) < HOLD_MAX_MIN * 60)}
+
+
+def _urgent_pending_job_ids() -> set:
+    try:
+        return aw_urgent_queue.pending_job_ids()
+    except Exception:  # noqa: BLE001 — 読めなければ時間の上限だけで判断する
+        return set()
 
 
 def wait_job_due(entry: dict, urgent_waiting_companies: set,
                  now: Optional[datetime] = None) -> bool:
-    """WAIT_JOB の行を取り直してよいか。至急の取得の待ち行列にその社が無い (取り終えた)、
-    または待ち始めから HOLD_MAX_MIN 分を過ぎたら取り直す。"""
-    now = now or datetime.now()
+    """WAIT_JOB の行を取り直してよいか。至急の取得の待ち行列にその社が無い (取り終えた) なら
+    取り直す。待ち行列にある間は、時間がたっても取り直さない (取り直しても待つだけで、
+    AirWork へのログインが増えるだけ。2026-11-16、PC を止めていた間の待ちの扱い)。"""
     try:
-        since = datetime.fromisoformat(entry.get("wait_since") or "")
+        datetime.fromisoformat(entry.get("wait_since") or "")
     except ValueError:
-        return True
-    if (now - since).total_seconds() >= HOLD_MAX_MIN * 60:
         return True
     return (entry.get("wait_company") or "") not in urgent_waiting_companies
 
@@ -640,7 +657,7 @@ def _process_aw_account_raw(
                     #   枠 JAS_SELFHEAL_MAX_ACQUIRE=0 なので必ずここを通る)。
                     result["held_job_ids"] = sorted(hold_job_ids(
                         result["missing_job_ids"], hold_since or {},
-                        aw_urgent_queue.tried_ids()))
+                        aw_urgent_queue.tried_ids(), pending=_urgent_pending_job_ids()))
                 if acquire_now:
                     print(f"  自己修復: {plog.mask_name(company)} 求人LISTING欠落"
                           f"{len(missing)}件 → 習得(mode=full)開始", flush=True)
@@ -683,7 +700,7 @@ def _process_aw_account_raw(
                 result["missing_job_ids"] = [j for j in missing if j not in known]
                 result["held_job_ids"] = sorted(hold_job_ids(
                     result["missing_job_ids"], hold_since or {},
-                    aw_urgent_queue.tried_ids()))
+                    aw_urgent_queue.tried_ids(), pending=_urgent_pending_job_ids()))
             except Exception as e:  # noqa: BLE001 — 数えられなくても応募の取り込みは続ける
                 print(f"  求人の有無を数えられませんでした: {type(e).__name__}", flush=True)
         # 応募import (存在するLISTINGへ紐付け。無ければ対象外)

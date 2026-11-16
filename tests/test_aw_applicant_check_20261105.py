@@ -64,6 +64,7 @@ def test_zero_applicants_is_not_error(tmp_path, monkeypatch):
         raise af.NoApplicantsError("0件")
     monkeypatch.setattr(af, "fetch_aw_applicants", _fetch)
     monkeypatch.setattr(ck, "STATE_PATH", tmp_path / "s.json")
+    monkeypatch.setattr(ck, "CHECKED_PATH", tmp_path / "c.json")
     out = ck.check_company("id", "pw", "社", tmp_path, "tok")
     assert out == {"checked": 0, "missing": 0, "new": 0, "empty": True}
     assert issubclass(af.NoApplicantsError, RuntimeError)  # 取り込み側の受け方は変わらない

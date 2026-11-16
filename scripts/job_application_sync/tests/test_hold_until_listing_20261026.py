@@ -61,13 +61,15 @@ def test_待つ求人ID_取りに行き終えた求人と待ちすぎた求人�
 
 
 # ---- 台帳の取り直し ---------------------------------------------------------------------
-def test_WAIT_JOBは至急の取得が終わるか待ちすぎたら取り直す():
+def test_WAIT_JOBは至急の取得が終わったら取り直す():
     now = datetime(2026, 10, 26, 15, 0)
     e = {"wait_since": (now - timedelta(minutes=5)).isoformat(), "wait_company": "A社"}
     assert S.wait_job_due(e, {"A社"}, now=now) is False      # まだ取りに行っていない
     assert S.wait_job_due(e, {"B社"}, now=now) is True       # 取り終えた
     old = dict(e, wait_since=(now - timedelta(minutes=S.HOLD_MAX_MIN)).isoformat())
-    assert S.wait_job_due(old, {"A社"}, now=now) is True     # 待ちすぎ
+    # 2026-11-16: 順番待ちの間は時間がたっても取り直さない (取り直しても待つだけ)
+    assert S.wait_job_due(old, {"A社"}, now=now) is False
+    assert S.wait_job_due(old, {"B社"}, now=now) is True
 
 
 def test_待ち始めは最初の1回だけ記録し_試行回数を数えない(tmp_path):
