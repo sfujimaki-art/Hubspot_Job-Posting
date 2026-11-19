@@ -1,0 +1,72 @@
+# 次のOS切り替えで止まらないかの先回り確認 (毎週, 2026-10-26)
+#
+# なぜ: 2026-10-25 に ubuntu-latest が 24.04 → 26.04 に切り替わり、固定している
+#   Playwright 1.50.0 が chromium を入れられず、応募の取り込みが約12時間止まった。
+#   本番は ubuntu-24.04 に固定したが、いつかは上げる必要がある。
+#   ubuntu-latest の上で、本番と同じ版と最新の版の Playwright がブラウザを入れて起動できるかを試す。
+#
+# 本番の処理・HubSpot・媒体には触らない (secret は Slack の通知先だけ)。
+# 定期実行で失敗したときだけ Slack に知らせる。このファイルを変えた PR でも動く (通知はしない)。
+
+name: OS Canary
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"   # 毎週月曜 JST 09:00
+  pull_request:
+    paths:
+      - ".github/workflows/os_canary.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 本番と同じ Playwright 1.50.0
+            playwright: "playwright==1.50.0"
+          - name: 最新の Playwright
+            playwright: "playwright"
+    name: ubuntu-latest / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: OS
+        run: cat /etc/os-release | grep -E '^(PRETTY_NAME|VERSION_ID)='
+      - name: Install Playwright + chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install "${{ matrix.playwright }}"
+          python -m playwright --version
+          python -m playwright install --with-deps chromium chromium-headless-shell
+      - name: Launch chromium
+        run: |
+          python - <<'EOF'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=True)
+              pg = b.new_page()
+              pg.set_content("<p>ok</p>")
+              assert pg.inner_text("p") == "ok"
+              b.close()
+          print("chromium ok")
+          EOF
+
+  notify:
+    needs: install
+    if: always() && github.event_name == 'schedule' && needs.install.result == 'failure'
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          SLACK: ${{ secrets.SLACK_APPLICANT_ALERT_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$SLACK" ] || exit 0
+          MSG="⚠️ ubuntu-latest で Playwright のブラウザを入れられませんでした。応募同期・求人同期の runs-on を ubuntu-latest に戻すと止まります (いまは ubuntu-24.04 に固定)。版の組み合わせを確かめてください: $RUN_URL"
+          curl -sS -X POST -H 'Content-Type: application/json' --data "$(jq -n --arg t "$MSG" '{text:$t}')" "$SLACK" >/dev/null
