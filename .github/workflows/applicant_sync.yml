@@ -48,6 +48,13 @@ concurrency:
 
 jobs:
   sync:
+    # ★応募の取り込み (mode=sync) は 2026-11-19 に専用PCへ移した
+    #   (scripts/job_application_sync/pc_runner.py applicants、タスクスケジューラで 5 分おき)。
+    #   Actions を予備に残すと PC と同時に動いて同じ応募を二重に作りうるので、
+    #   GAS から sync が届いてもここでは動かさない (取り消しではなく「スキップ」と表示)。
+    #   14 日より前の通知の回収も PC で行う (`pc_runner.py applicants -- --hr-cutoff YYYY-MM-DD`)。
+    #   relink / reconcile / ichijitaiou / deal-assoc の手動起動は残す。
+    if: ${{ inputs.mode != 'sync' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

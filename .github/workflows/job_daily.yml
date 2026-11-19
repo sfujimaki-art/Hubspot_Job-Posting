@@ -19,9 +19,10 @@ on:
     # 求人を先回りさせて追い越しの窓を狭める (2026-08-07 ユーザー指示)。
     # ※ GitHubのcronは名目より遅れて着弾する(実測で数時間ずれる日がある)。
     #    完全には防げないので、応募側でも毎回 relink して取りこぼしを拾う。
-    - cron: "0 16 * * *"    # JST 01:00  HR差分
-    - cron: "0 3 * * *"     # JST 12:00  HR差分
-    - cron: "0 11 * * *"    # JST 20:00  HR差分
+    # ★HR の求人の取り込み (JST 1/12/20 時) は 2026-11-19 に専用PCへ移した
+    #   (scripts/job_application_sync/pc_runner.py listings、タスクスケジューラ)。
+    #   GitHub の cron は着く時刻とかかる時間がばらつくため。Actions を予備に残すと
+    #   PC と同時に動いて二重に作りうるので、cron 3 本を外し、手動の phase=hr も動かさない。
     # ★AirWork の定期実行 (AW-collect 01:20/12:20/20:20、応募起点 10:23/14:23/18:23) は
     #   2026-10-16 に止めた。媒体側の対策で GitHub のサーバーからはログインできず、
     #   取得はローカルPCへ切り離したため。手動の phase 指定 (aw-*) は残している。
@@ -57,9 +58,11 @@ jobs:
     # 取引まわり専用の cron / 手動フェーズではこの job を動かさない。
     # GitHub は cron ごとに全 job を評価するため、除外しないと
     # PHASE決定の `*)` フォールバックで hr が誤爆する。
+    # ★phase=hr (GAS の dispatchJobDailyHR を含む) は専用PCへ移したので動かさない (2026-11-19)。
     if: >-
       github.event.schedule != '40 16 * * *' &&
-      inputs.phase != 'deal-hygiene'
+      inputs.phase != 'deal-hygiene' &&
+      inputs.phase != 'hr'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
