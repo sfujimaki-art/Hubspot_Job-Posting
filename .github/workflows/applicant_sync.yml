@@ -54,7 +54,12 @@ jobs:
     #   GAS から sync が届いてもここでは動かさない (取り消しではなく「スキップ」と表示)。
     #   14 日より前の通知の回収も PC で行う (`pc_runner.py applicants -- --hr-cutoff YYYY-MM-DD`)。
     #   relink / reconcile / ichijitaiou / deal-assoc の手動起動は残す。
-    if: ${{ inputs.mode != 'sync' }}
+    # ★戻すとき (手順書「戻し方」): リポの Variables に HR_ON_ACTIONS=1 と
+    #   JAS_HR_SINCE=<戻す日> を入れると sync がまた動く。PR を Revert しないのは、
+    #   Revert すると下の JAS_HR_SINCE の受け渡しまで消えるため。Actions の台帳は
+    #   切り替えの時点で止まっているので、JAS_HR_SINCE が無いと切り替えの日〜戻す日の
+    #   通知 (最大 14 日分) を新規として取り直す。
+    if: ${{ inputs.mode != 'sync' || vars.HR_ON_ACTIONS == '1' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -120,6 +125,8 @@ jobs:
           MEDIA: ${{ inputs.media || 'BOTH' }}
           CUTOFF: ${{ inputs.cutoff || '' }}
           JAS_LEDGER_MERGE_FROM: data/job_application_sync_backfill/applicant_ledger.json
+          # この日より前の通知は読まない (空なら効かない。戻すときに使う。2026-11-19)
+          JAS_HR_SINCE: ${{ vars.JAS_HR_SINCE }}
         run: |
           # 状態(台帳/セッション)は actions/cache で保持 (GCS請求先問題の代替)。
           FLAG=$([ "${{ inputs.dry_run }}" = "true" ] && echo "--dry-run" || echo "--actual")

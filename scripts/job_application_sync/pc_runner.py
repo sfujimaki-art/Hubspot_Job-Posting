@@ -19,12 +19,16 @@
   - 終わったら非公開シートのタブ「PC稼働」に時刻を書く (pc_heartbeat.py)。
     Actions の見張り (pc_heartbeat_watch.yml) がそれを読み、古ければ Slack に送る。
   - 出力は scratchpad/pc_logs/<処理>-<日付>.log に足していく (14 日より古いものは消す)。
+  - 回ごとに結果を「成功 / 飛ばした / 失敗 / 終了 (読めない)」に分けて書く。見張りは成功の時刻だけを見る。
+  - 溜まるファイルを消す: 応募者の CSV (個人情報) は 3 日、求人 CSV・店舗一覧・求人の控えは 14 日
+    (どれも最新の 1 つは残す。最新の求人 CSV は店舗ID補完・持ち主判定が読む)。
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -45,6 +49,7 @@ except ImportError:  # pragma: no cover
 _DATA = _REPO / "data" / "job_application_sync"
 LOG_DIR = _REPO / "scratchpad" / "pc_logs"
 LOG_KEEP_DAYS = 14
+APPLICANT_KEEP_DAYS = 3   # 応募者の CSV (個人情報入り)
 LOCKS = {"applicants": _DATA / "pc_hr_applicants.lock",
          "listings": _DATA / "pc_hr_listings.lock"}
 NAMES = {"applicants": "HR応募", "listings": "HR求人"}
@@ -129,11 +134,62 @@ def _run(log, args: list, timeout_min: float) -> int:
     return rc
 
 
+def _new_text(log, pos: int) -> str:
+    """この回で子の処理がログに足した分。"""
+    log.flush()
+    try:
+        with open(log.name, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(pos)
+            return f.read()
+    except OSError:
+        return ""
+
+
+def classify_applicants(rc: int, text: str) -> tuple:
+    """(結果, 成功か)。applicant_sync.py の出力から分かる範囲で分ける。"""
+    if rc != 0:
+        return f"失敗 (rc={rc})", False
+    if "別インスタンス実行中 -> skip" in text:
+        return "飛ばした (別の回が実行中)", False
+    if "❌ HR:" in text or "⏳ HR:" in text:
+        return "失敗 (HRの取得・ログイン)", False
+    m = re.search(r"\[applicant_sync-done\].*'failed': (\d+)", text)
+    if m and int(m.group(1)) > 0:
+        return f"失敗 (failed={m.group(1)})", False
+    if "✅ HR:" in text:
+        return "成功", True
+    if "[applicant_sync-done]" in text:
+        return "成功 (新しい通知なし)", True
+    return "終了 (結果が読めない)", False
+
+
+def classify_listings(rc: int, st: dict) -> tuple:
+    """(結果, 成功か)。hr_watcher.py の結果 (--status-file) から分ける。"""
+    if rc != 0:
+        return f"失敗 (hr_watcher rc={rc})", False
+    if not st:
+        return "終了 (結果が読めない)", False
+    if st.get("skip_reason") == "incomplete_csv":
+        return "止めた (CSV欠け)", False
+    if st.get("hrhacker_error") or st.get("snapshot_kept_previous"):
+        return "失敗 (取り込み。控えを残した)", False
+    if st.get("aborted"):
+        # 控えが無い初回は HubSpot に書かずに控えだけ作る (hr_watcher の初回の安全装置)
+        return "成功 (初回の控え作り)", True
+    reason = st.get("skip_reason")
+    if reason == "no_diff":
+        return "成功 (差分なし)", True
+    if reason == "skip_aw_flag":
+        return "成功 (取り込み済み)", True
+    return f"終了 ({reason or '理由なし'})", False
+
+
 def applicants(log, dry_run: bool, extra: list) -> tuple:
+    pos = log.tell()
     rc = _run(log, [S + "applicant_sync.py", "--dry-run" if dry_run else "--actual",
                     "--source", "sheet1", "--media", "HR", *extra],
               TIMEOUT_MIN["applicants"])
-    return rc, ("ok" if rc == 0 else f"rc={rc}")
+    return (rc, *classify_applicants(rc, _new_text(log, pos)))
 
 
 def listings(log, dry_run: bool, extra: list) -> tuple:
@@ -148,15 +204,16 @@ def listings(log, dry_run: bool, extra: list) -> tuple:
     t0 = time.time()
     rc = _run(log, [S + "hr_watcher.py", flag, "--skip-aw", "--slack",
                     "--status-file", str(status)], budget)
-    if rc != 0:
-        return rc, f"hr_watcher rc={rc}"
     try:
         st = json.loads(status.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         st = {}
+    result, ok = classify_listings(rc, st)
+    if rc != 0:
+        return rc, result, ok
     if st.get("skip_reason") == "incomplete_csv":
-        _say(log, "CSV欠け: 後続の店舗ID補完・持ち主判定も止めます (正常終了)")
-        return 0, "CSV欠け"
+        _say(log, "CSV欠け: 後続の店舗ID補完・持ち主判定も止めます")
+        return 0, result, ok
     for script in ("backfill_deal_shop_id_via_email.py", "resolve_listing_owner.py"):
         left = budget - (time.time() - t0) / 60
         if left < 1:
@@ -165,8 +222,52 @@ def listings(log, dry_run: bool, extra: list) -> tuple:
         r = _run(log, [S + script, flag], left)
         if r != 0:
             _say(log, f"⚠️ {script} が失敗 (本線は継続・前回の結果を使う)")
-    # 控えが無い初回は、HubSpot に書かずに控えだけ作って止まる (hr_watcher の初回の安全装置)
-    return 0, (st.get("skip_reason") or ("初回の控え作り" if st.get("aborted") else "ok"))
+    return 0, result, ok
+
+
+def _old(p: Path, days: float, now: float) -> bool:
+    try:
+        return p.stat().st_mtime < now - days * 86400
+    except OSError:
+        return False
+
+
+def _unlink(p: Path) -> None:
+    try:
+        p.unlink()
+    except OSError:
+        pass
+
+
+def cleanup(now: float = None) -> None:
+    """PC に溜まるファイルを消す。最新の求人 CSV・店舗一覧・控えは必ず残す。
+    応募者の CSV (個人情報) は 3 日、ほかは 14 日。"""
+    now = time.time() if now is None else now
+    sp = _REPO / "scratchpad"
+    for d in (sp / "applicant_sync_csv", sp / "csv_fetched" / "hr_applicants"):
+        if d.exists():
+            for p in d.rglob("*"):
+                if p.is_file() and _old(p, APPLICANT_KEEP_DAYS, now):
+                    _unlink(p)
+
+    def keep_newest(files: list, newest_of: list) -> None:
+        latest = max(newest_of, key=lambda p: p.name, default=None)
+        for p in files:
+            if p != latest and _old(p, LOG_KEEP_DAYS, now):
+                _unlink(p)
+
+    hr = sp / "csv_fetched" / "hr"
+    if hr.exists():
+        # backfill_deal_shop_id_via_email.py / resolve_listing_owner.py は最新の hr_offers_all_* を読む
+        keep_newest(list(hr.glob("hr_offers_*.csv")), list(hr.glob("hr_offers_all_*.csv")))
+    br = sp / "csv_fetched" / "hr_branches"
+    if br.exists():
+        files = list(br.glob("*.csv"))
+        keep_newest(files, files)
+    snaps = _DATA / "hr_snapshots"
+    if snaps.exists():
+        files = list(snaps.glob("*.json.gz"))
+        keep_newest(files, files)
 
 
 def main(argv=None) -> int:
@@ -183,23 +284,27 @@ def main(argv=None) -> int:
         with try_lock(LOCKS[a.job]) as got:
             if not got:
                 _say(log, "前の回がまだ動いているので、この回は飛ばします")
-                return 0
-            if a.job == "listings":
-                waited = 0.0
-                while waited < WAIT_FOR_APPLICANTS_MIN * 60:
-                    with try_lock(LOCKS["applicants"]) as free:
-                        if free:
-                            break
-                    if waited == 0:
-                        _say(log, "応募の回が動いているので、終わるまで待ちます")
-                    time.sleep(10)
-                    waited += 10
-            fn = applicants if a.job == "applicants" else listings
-            rc, result = fn(log, a.dry_run, extra)
+                rc, result, ok = 0, "飛ばした (前の回が実行中)", False
+            else:
+                cleanup()
+                if a.job == "listings":
+                    waited = 0.0
+                    while waited < WAIT_FOR_APPLICANTS_MIN * 60:
+                        with try_lock(LOCKS["applicants"]) as free:
+                            if free:
+                                break
+                        if waited == 0:
+                            _say(log, "応募の回が動いているので、終わるまで待ちます")
+                        time.sleep(10)
+                        waited += 10
+                fn = applicants if a.job == "applicants" else listings
+                rc, result, ok = fn(log, a.dry_run, extra)
+        _say(log, f"結果: {NAMES[a.job]} {result}")
         if not a.dry_run:
             from scripts.job_application_sync import pc_heartbeat
-            if rc == 0 and pc_heartbeat.beat(NAMES[a.job], result):
-                _say(log, f"稼働の記録: {NAMES[a.job]} {result}")
+            if pc_heartbeat.beat(NAMES[a.job], result, success=ok):
+                _say(log, f"稼働の記録: {NAMES[a.job]} {result}"
+                          f"{' (最後に成功した時刻も更新)' if ok else ''}")
     return rc
 
 

@@ -1,7 +1,8 @@
 ﻿# 専用PC に HR のタスク 2 本を登録する (2026-11-19 決定、手順書 .review/local-pc-cutover-2026-11-19.html)
 #
 #   JAS_HR_applicants : 5 分おき  pc_runner.py applicants (応募の登録)
-#   JAS_HR_listings   : 毎日 01:00 / 12:00 / 20:00  pc_runner.py listings (求人の監視)
+#   JAS_HR_listings   : 毎日 01:01 / 12:01 / 20:01  pc_runner.py listings (求人の監視)
+#                       (応募の 5 分おきの回が先に鍵を取れるよう 1 分ずらす)
 #
 # 前の回がまだ動いていれば次は始めない (MultipleInstances IgnoreNew。pc_runner.py の鍵と二重)。
 # 既定は「無効」で登録する (-Enable を付けたときだけ有効)。切り替えの手順で有効にする。
@@ -36,9 +37,11 @@ function Register-One($name, $arg, $triggers, $limitMin) {
 # 5 分おき (10 年続く繰り返し)
 $every5 = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
   -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
-Register-One "JAS_HR_applicants" "applicants" @($every5) 30
+# 上限 35 分 = 子の処理 25 分 + 記録・余裕
+Register-One "JAS_HR_applicants" "applicants" @($every5) 35
 
-$t1 = New-ScheduledTaskTrigger -Daily -At "01:00"
-$t2 = New-ScheduledTaskTrigger -Daily -At "12:00"
-$t3 = New-ScheduledTaskTrigger -Daily -At "20:00"
-Register-One "JAS_HR_listings" "listings" @($t1, $t2, $t3) 120
+$t1 = New-ScheduledTaskTrigger -Daily -At "01:01"
+$t2 = New-ScheduledTaskTrigger -Daily -At "12:01"
+$t3 = New-ScheduledTaskTrigger -Daily -At "20:01"
+# 上限 150 分 = 応募の回を待つ最大 15 分 + 子の処理 100 分 + 記録・余裕
+Register-One "JAS_HR_listings" "listings" @($t1, $t2, $t3) 150
