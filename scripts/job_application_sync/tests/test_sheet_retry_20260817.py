@@ -94,6 +94,35 @@ def test_通信断も再試行する():
     assert al.sheet_retry(flaky) == "ok"
 
 
+def test_トークン更新中の通信断も再試行する():
+    """2026-11-19 14:20: google-auth はトークン取得中の切断を TransportError
+    (OSError の子ではない) に包み直すため、再試行されずにその回が落ちた."""
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise al.google.auth.exceptions.TransportError(
+                "Connection aborted. RemoteDisconnected")
+        return "ok"
+
+    assert al.sheet_retry(flaky) == "ok"
+    assert calls["n"] == 2
+
+
+def test_認証の誤りは再試行しない():
+    """RefreshError は鍵の失効・権限の誤り。待っても直らない."""
+    calls = {"n": 0}
+
+    def denied():
+        calls["n"] += 1
+        raise al.google.auth.exceptions.RefreshError("invalid_grant")
+
+    with pytest.raises(al.google.auth.exceptions.RefreshError):
+        al.sheet_retry(denied)
+    assert calls["n"] == 1
+
+
 def test_初回で成功すれば1回しか呼ばない():
     """正常時に余計なAPIを叩かない（Sheetsにはレート上限がある）."""
     calls = {"n": 0}

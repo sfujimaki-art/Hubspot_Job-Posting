@@ -19,6 +19,7 @@ import re
 import time
 from typing import Any, Callable, Iterator, Optional
 
+import google.auth.exceptions
 import gspread
 from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -88,8 +89,13 @@ def sheet_retry(fn: "Callable[..., Any]", *a, retries: int = 5, **kw) -> "Any":
             if code and not (code >= 500 or code == 429):
                 raise                      # 設定ミスは握らない
             last = e
-        except (ConnectionError, TimeoutError, OSError) as e:
-            last = e                       # DNS断・コネクション切れ
+        except (ConnectionError, TimeoutError, OSError,
+                google.auth.exceptions.TransportError) as e:
+            # DNS断・コネクション切れ。トークン更新中の切断は google-auth が
+            # TransportError (OSError ではない) に包み直すので明示する
+            # (2026-11-19 14:20 に再試行されず 1 回落ちた)。
+            # RefreshError (鍵・権限の誤り) は待っても直らないので含めない。
+            last = e
         if i < retries:
             print(f"    [sheets retry {i+1}/{retries}] {type(last).__name__}: "
                   f"{delay:.0f}秒待って再試行", flush=True)
