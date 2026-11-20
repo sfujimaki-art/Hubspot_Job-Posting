@@ -692,6 +692,13 @@ def run(dry_run: bool = True, limit_accounts: Optional[int] = None,
             if not hr_cutoff_iso:
                 from datetime import date as _date, timedelta as _td
                 hr_cutoff_iso = (_date.today() - _td(days=14)).isoformat()
+                # ★専用PCへ移した日 (2026-11-19 決定)。PC は Actions の台帳を持たないので、
+                #   この日より前の通知は読まない (Actions で済んだ通知を取り直さない)。
+                #   14日たてば効かなくなる。HR だけの回でしか使わない。
+                since = os.environ.get("JAS_HR_SINCE", "").strip()
+                if (media_filter == "HR" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", since)
+                        and since > hr_cutoff_iso):
+                    hr_cutoff_iso = since
             print(f"[applicant_sync] シート1直読み "
                   f"(cutoff={hr_cutoff_iso}, dry_run={dry_run})", flush=True)
             # media_filter を素通し(BOTH=HR+AW を読む)。AWは後段 aw_groups で処理。
