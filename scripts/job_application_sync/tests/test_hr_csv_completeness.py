@@ -145,3 +145,60 @@ def test_poll_waits_for_new_export_to_finish(monkeypatch):
     assert result == "new-file"
     assert read.await_count == 2
     page.reload.assert_awaited_once()
+
+
+# ---- 2026-11-20: 出力指示が履歴に載らなければ指示し直す ----------------------------
+def test_has_new_export_counts_rows_in_the_same_minute():
+    old = {"kishin": "fictional-14:29", "dl": "old-file", "shuryou": "done"}
+    pending = {"kishin": "fictional-14:29", "dl": None, "shuryou": ""}
+    assert not fetcher.has_new_export([old], [old])
+    assert fetcher.has_new_export([pending, old], [old]), "同じ分でも行が増えれば新しい"
+    assert fetcher.has_new_export([{"kishin": "fictional-new"}, old], [old])
+    assert not fetcher.has_new_export([], [old])
+
+
+def _kick_setup(monkeypatch, reads):
+    import asyncio  # noqa: F401
+    from unittest.mock import AsyncMock
+
+    kick = AsyncMock(return_value="fictional-start")
+    monkeypatch.setattr(fetcher, "_kick_csv_export", kick)
+    monkeypatch.setattr(fetcher, "_read_export_rows", AsyncMock(side_effect=reads))
+    monkeypatch.setattr(fetcher, "_dismiss_onboarding", AsyncMock())
+    monkeypatch.setattr(fetcher.asyncio, "sleep", AsyncMock())
+    return kick, AsyncMock()
+
+
+def test_kick_is_retried_when_history_does_not_change(monkeypatch):
+    import asyncio
+
+    old = {"kishin": "fictional-old", "dl": "old-file", "shuryou": "done"}
+    pending = {"kishin": "fictional-new", "dl": None, "shuryou": ""}
+    # 1 回目: 30 秒 (2 回確認) たっても載らない → 2 回目: 最初の確認で載る
+    kick, page = _kick_setup(monkeypatch, [[old], [old], [pending, old]])
+    got = asyncio.run(fetcher._kick_until_listed(
+        page, is_valid="", previous_exports=[old], attempts=3, confirm_sec=30))
+    assert got == "fictional-start"
+    assert kick.await_count == 2
+
+
+def test_kick_is_not_repeated_when_listed(monkeypatch):
+    import asyncio
+
+    old = {"kishin": "fictional-old", "dl": "old-file", "shuryou": "done"}
+    pending = {"kishin": "fictional-new", "dl": None, "shuryou": ""}
+    kick, page = _kick_setup(monkeypatch, [[pending, old]])
+    asyncio.run(fetcher._kick_until_listed(
+        page, is_valid="", previous_exports=[old], attempts=3, confirm_sec=90))
+    assert kick.await_count == 1
+
+
+def test_kick_gives_up_after_attempts(monkeypatch):
+    import asyncio
+
+    old = {"kishin": "fictional-old", "dl": "old-file", "shuryou": "done"}
+    kick, page = _kick_setup(monkeypatch, [[old]] * 10)
+    with pytest.raises(RuntimeError, match="受け付けられませんでした"):
+        asyncio.run(fetcher._kick_until_listed(
+            page, is_valid="", previous_exports=[old], attempts=2, confirm_sec=15))
+    assert kick.await_count == 2
