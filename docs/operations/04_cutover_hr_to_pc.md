@@ -61,11 +61,11 @@ git checkout feat/hr-on-local-pc
 
 ### 1-2. Python と部品
 
-`C:\jas_dev` と同じ版の Python（Actions では 3.10。`py -0` で入っている版が分かる）。
+AirWork のタスクと同じ版の Python。PC に入っているのは 3.12 だけで、AirWork の `C:\jas\venv` も 3.12.10（2026-11-20 確認。Actions は 3.10。`py -0` で入っている版が分かる）。
 
 ```powershell
 cd C:\jas_hr
-py -3.10 -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -r requirements.txt google-api-python-client
 .venv\Scripts\python -m playwright install chromium
@@ -75,8 +75,8 @@ py -3.10 -m venv .venv
 
 ### 1-3. `C:\jas_hr\.env`
 
-1. `C:\jas_dev\.env` を `C:\jas_hr\.env` に写す。シートの鍵のファイルを `C:\jas_dev\credentials\` に置いている場合は、フォルダごと `C:\jas_hr\credentials\` に写す。
-2. `C:\jas_hr\.env` から `JAS_LEDGER_PATH`・`JAS_SESSION_DIR`・`JAS_LEDGER_MERGE_FROM` の行を消す（残すと AirWork と同じ台帳を使う）。
+1. AirWork の `.env` は `C:\jas\secrets\.env`（`C:\jas_dev` には無い。03 の 3 章）。これを `C:\jas_hr\.env` に写す（`pc_runner.py` はリポ直下の `.env` を読む）。シートの鍵のファイルは `C:\jas\secrets\google_sa.json` で、`GOOGLE_SA_JSON` はこのファイルのパスを指しているので、写した行のままで HR からも読める。
+2. `C:\jas_hr\.env` に `JAS_LEDGER_PATH`・`JAS_SESSION_DIR`・`JAS_LEDGER_MERGE_FROM` の行が無いことを確かめる（AirWork では起動のスクリプトが入れていて、`.env` には無い。2026-11-20 確認。あれば消す。残すと AirWork と同じ台帳を使う）。
 3. 03 の 3 章の表で HR に ○ の名前が全部あるか確かめ、無いものを足す。値は書き写すだけで、画面やチャットに貼らない。`JAS_HR_SINCE` は当日に入れる（4 章）。
 
 `JAS_HR_SINCE` を入れ忘れると、最初の回で直近 14 日分の応募者を全部取り直して重複を確かめる。重複の確認が HubSpot 側の一時的な失敗に当たると同じ応募を作るので、必ず入れる。
