@@ -1,5 +1,7 @@
 # システムアーキテクチャ — 求人/応募 媒体CSV同期 (WBS 1.11.9)
 
+> 2026-07-09 時点の図で古い（キュー用タブ・GCS・AirWork を Actions で動かす前提）。今の構成は [docs/operations/01_map.md](../../operations/01_map.md) と [02_mechanics.md](../../operations/02_mechanics.md)。
+
 2026-07-09 時点。GitHub は下記 Mermaid を自動レンダリングする(オンライン閲覧可)。
 mermaid.live に貼り付けても見られる。
 

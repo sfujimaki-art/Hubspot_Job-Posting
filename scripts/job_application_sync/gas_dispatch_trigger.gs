@@ -1,6 +1,9 @@
 /**
  * 応募連携/求人デイリー 外部トリガー (WBS 1.11.9)
  *
+ * ※ 今登録しているトリガーと切り替えの予定は docs/operations/01_map.md。
+ *    dispatchAwCreate / dispatchAwCollect は 2026-11-20 にトリガーを削除した (使わない)。
+ *
  * GitHub Actions の cron が「新規アカウント × 最短5分間隔」で不発のため、
  * GAS の time-trigger から GitHub API (workflow_dispatch) を叩いて確実に起動する。
  * PC不要・完全外部。queue と同じ GAS 基盤に相乗り可。
