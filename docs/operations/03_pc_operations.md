@@ -1,7 +1,7 @@
 # 専用 PC の運用
 
 対象は AirWork を動かしている専用 PC（Windows）。AirWork（PR #16）は今動いている。HR（PR #23）は切り替えの後に動く（手順は [04_cutover_hr_to_pc.md](04_cutover_hr_to_pc.md)）。
-`未確認` と書いた所は、リポにも Mac 側の記録にも無い事実。PC のセッションが確かめて、この文書に書き足す PR を出す。
+`未確認` と書いた所は、リポに書かれていない事実。PC のセッションが確かめて、この文書に書き足す PR を出す。
 
 ## 1. フォルダ
 
@@ -28,7 +28,7 @@ git pull
 # CLAUDE.md と docs\operations\ を読む
 ```
 
-`C:\jas_hr` を切り替えの準備で `feat/hr-on-local-pc` にした後は、Mac のセッションがそのブランチに main を取り込んでおく（04 の 0 章）ので、同じ文書がそのブランチでも読める。
+`C:\jas_hr` を切り替えの準備で `feat/hr-on-local-pc` にした後は、PC のセッションがそのブランチに main を取り込んでおく（04 の 0 章）ので、同じ文書がそのブランチでも読める。
 
 ## 2. タスク（タスクスケジューラ）
 
@@ -164,7 +164,7 @@ PR #23 の Revert はしない（Actions に `JAS_HR_SINCE` を渡す行まで�
 4. 戻した最初の Applicant Sync の回のログで `シート1直読み (cutoff=戻す日 …)` を確かめる。
 5. 14 日たったら Variables の `JAS_HR_SINCE` は消してよい。PC へまた移すときは `HR_ON_ACTIONS` を消してから 04 の順に進める。
 
-1〜3 は PC と GitHub・GAS にまたがる。PC のセッションは 1 を、Mac のセッションかユーザーが 2・3 を行う。
+1〜3 は PC と GitHub・GAS にまたがる。1〜3 とも PC のセッションが行う（GAS の画面の操作はユーザーに頼んでもよい）。
 
 ### AirWork
 
