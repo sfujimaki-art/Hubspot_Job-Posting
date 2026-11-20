@@ -1,4 +1,6 @@
 # 応募連携 定期バッチ (WBS 1.11.9 スコープ③)
+# ※ 下の説明は古い (キュー・GCS)。今はシート1を直接読み、状態は Actions のキャッシュ。
+#    新しい方は docs/operations/01_map.md・02_mechanics.md。
 # 5分ごとに集約シート(queue)を検知 → アカウント集約 → セッション再利用fetch →
 # HubSpot APPOINTMENT登録。放置ゼロ(失敗はリトライ3回→Slack報告)。
 #
