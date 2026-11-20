@@ -57,9 +57,15 @@ jobs:
     # 取引まわり専用の cron / 手動フェーズではこの job を動かさない。
     # GitHub は cron ごとに全 job を評価するため、除外しないと
     # PHASE決定の `*)` フォールバックで hr が誤爆する。
+    # ★AirWork の段 (aw-create / aw-create-apps / aw-collect) は Actions では動かさない
+    #   (2026-11-20 ユーザー了承)。GitHub のサーバーからは AirWork にログインできず
+    #   (2026-10-16 に定期実行は止めた)、GAS の dispatchAwCreate / dispatchAwCollect から
+    #   毎晩起動されては全社ログイン失敗のまま「成功」と表示されていた。AirWork は専用PCで動いている。
+    #   戻すときはリポの Variables に AW_ON_ACTIONS=1 を入れる。
     if: >-
       github.event.schedule != '40 16 * * *' &&
-      inputs.phase != 'deal-hygiene'
+      inputs.phase != 'deal-hygiene' &&
+      (!startsWith(inputs.phase, 'aw-') || vars.AW_ON_ACTIONS == '1')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
