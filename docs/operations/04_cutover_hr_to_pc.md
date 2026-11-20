@@ -29,9 +29,9 @@ flowchart LR
 
 赤い枠（② と ⑥）の間、応募の登録が止まる（十数分）。③ で待つので、Actions と PC が同時に動く時間はほぼ無い。④ のあとは、GAS から起動されても Actions の HR は「スキップ」で終わる。
 
-担当: 0 章は Mac のセッション、1〜2 章と 4 章の PC の作業は PC のセッション、② の GAS と ④ のマージは Mac のセッションかユーザー。PC のセッションは、Mac 側の作業の完了をユーザーに確かめてから次へ進む。
+担当: すべて PC のセッション（2026-11-20 ユーザー決定）。GAS のトリガーの削除は PC のブラウザで行うか、ユーザーに頼む。
 
-## 0. Mac 側の準備（Mac のセッション）
+## 0. 準備（PC のセッション。開発用のフォルダで行う）
 
 1. `feat/hr-on-local-pc` に main を取り込む。PR #24 と #23 が `job_daily.yml` の同じ `if:` を変えているので、両方の条件を残す:
    ```yaml
@@ -128,7 +128,7 @@ B が空のままだと、見張りはその処理を「一度も成功してい
 
 03 の 6 章どおりか確かめる。
 
-## 2. 直前の確認（当日、Mac のセッションでも PC のセッションでもよい）
+## 2. 直前の確認（当日、PC のセッション）
 
 いちばん新しい Applicant Sync の回の「Applicant sync」の段のログで次の行を探す（01 の「状態の確かめ方」のコマンド）。
 
@@ -143,10 +143,10 @@ B が空のままだと、見張りはその処理を「一度も成功してい
 | 順 | 誰が | 作業 |
 |---|---|---|
 | 1 | PC | `C:\jas_hr\.env` の `JAS_HR_SINCE` を今日の日付にする |
-| 2 | Mac かユーザー | GAS プロジェクト applicant-dispatch を開き、左の時計の「トリガー」で `dispatchApplicantSync` と `dispatchJobDailyHR` の行の「︙」→「トリガーを削除」。ここから Actions の HR の応募は起動されない |
-| 3 | Mac | Actions の画面か `gh run list` で、Applicant Sync と Job Daily に実行中・待機中（Queued / Waiting）の回が無いことを確かめる。あれば終わるまで待つ（たいてい数分） |
-| 4 | Mac | PR #23 をマージする。以後 Actions の HR の求人の cron も無くなり、GAS から起動されても HR は「スキップ」 |
-| 5 | Mac | 3 で待った最後の Applicant Sync の回のログで、`台帳による除外: … → 0件 (… FAILED上限超=0)`、または同じ回に `✅ HR: 応募取込 … 範囲=今日〜今日` があり `❌ HR:` / `⏳ HR:` が無いことを確かめる（残りは今日の通知だけで、PC が拾う）。前日以前の通知が失敗で残っていたら、PC で `pc_runner.py applicants -- --hr-cutoff <取り残された日>` を 1 回流すか、ユーザーに相談する |
+| 2 | PC のセッションかユーザー | GAS プロジェクト applicant-dispatch を開き、左の時計の「トリガー」で `dispatchApplicantSync` と `dispatchJobDailyHR` の行の「︙」→「トリガーを削除」。ここから Actions の HR の応募は起動されない |
+| 3 | PC | Actions の画面か `gh run list` で、Applicant Sync と Job Daily に実行中・待機中（Queued / Waiting）の回が無いことを確かめる。あれば終わるまで待つ（たいてい数分） |
+| 4 | PC | PR #23 をマージする。以後 Actions の HR の求人の cron も無くなり、GAS から起動されても HR は「スキップ」 |
+| 5 | PC | 3 で待った最後の Applicant Sync の回のログで、`台帳による除外: … → 0件 (… FAILED上限超=0)`、または同じ回に `✅ HR: 応募取込 … 範囲=今日〜今日` があり `❌ HR:` / `⏳ HR:` が無いことを確かめる（残りは今日の通知だけで、PC が拾う）。前日以前の通知が失敗で残っていたら、PC で `pc_runner.py applicants -- --hr-cutoff <取り残された日>` を 1 回流すか、ユーザーに相談する |
 | 6 | PC | コードを main にそろえる: `cd C:\jas_hr` → `git checkout main` → `git pull` |
 | 7 | PC | 応募のタスクを有効にして 1 回動かす（下のコマンド）。最初の回はリクロジのタブの過去の行も見直すので少し長い。3〜5 分後にログを見る（03 の 4 章） |
 | 8 | PC | 求人のタスクを有効にして 1 回動かす。1-4 の試しで控えができていれば差分を取り込む本番の回になる。控えが無ければ HubSpot に書かずに控えだけ作って止まる（結果は「成功 (初回の控え作り)」。次の 12:01 か 20:01 から本番） |
@@ -160,7 +160,7 @@ Enable-ScheduledTask -TaskPath "\JAS\" -TaskName JAS_HR_listings
 Start-ScheduledTask  -TaskPath "\JAS\" -TaskName JAS_HR_listings
 ```
 
-終わったら、05 に実施の日時を、01 の「今の状態」を切り替え後の表に合わせて直す PR を出す（Mac のセッション）。
+終わったら、05 に実施の日時を、01 の「今の状態」を切り替え後の表に合わせて直す PR を出す（PC のセッション）。
 
 ## 4. 翌日の確かめ方
 
