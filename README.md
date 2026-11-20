@@ -1,5 +1,7 @@
 # Hubspot_Job-Posting
 
+運用の全体（何が・どこで・いつ動くか、専用 PC、切り替え、決定、論点）は [CLAUDE.md](CLAUDE.md) と [docs/operations/](docs/operations/) にある。この README は個別の手順の控え。
+
 求人連携システムのクラウドIP SSO痎通検証 (会社アカウント・本番分離)。
 
 - .github/workflows/sso_cloudip_test.yml : 手動trigger workflow
