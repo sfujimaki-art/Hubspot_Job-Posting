@@ -42,8 +42,8 @@ flowchart LR
      (!startsWith(inputs.phase, 'aw-') || vars.AW_ON_ACTIONS == '1')
    ```
    push して CI があれば通るのを見る。これで `docs/operations/` も PR #23 のブランチに入る。
-2. PR #19 の扱いを決める（`hr_reconcile.yml` は Actions で HR の応募を取り込み直すので、#23 の方針とぶつかる。06）。決まるまで #19 はマージしない。
-3. 顧客シート用の `CUSTOMER_SHEET_SA_JSON`・`CUSTOMER_SHEET_ALLOW` の用意のしかたをユーザーと決める（06）。用意できるまで切り替えない（無いと顧客シートへの写しが止まる。応募の登録は動く）。
+2. PR #19 の扱い（`hr_reconcile.yml` は Actions で HR の応募を取り込み直すので、#23 の方針とぶつかる）: 2026-11-20 ユーザー決定「タイミングを見て切り替える」（05）。時期はユーザーが決める。それまで #19 はマージしない。切り替えはこれを待たない。
+3. 顧客シート用の `CUSTOMER_SHEET_SA_JSON`・`CUSTOMER_SHEET_ALLOW`: 2026-11-20 ユーザー決定「いったん無視」（05）。用意を待たずに進める。無いまま切り替えると、PC では顧客シートへの写しが止まる（応募の登録は動く）。用意できたら `C:\jas_hr\.env` に足す。
 
 ## 1. PC の準備（前日まで、PC のセッション）
 
