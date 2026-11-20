@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import os
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -162,8 +163,9 @@ async def fetch_hr_csv(
             await page.goto(EXPORT_LIST_URL, wait_until="domcontentloaded")
             previous_exports = await _read_export_rows(page)
 
-            # 3. CSV出力指示
-            kick_iso = await _kick_csv_export(page, is_valid=is_valid)
+            # 3. CSV出力指示 (履歴に載るまで、載らなければ指示し直す)
+            kick_iso = await _kick_until_listed(page, is_valid=is_valid,
+                                                previous_exports=previous_exports)
 
             # 4. 完了ポーリング → DL URL 特定
             dl_url = await _poll_export_list(
@@ -493,6 +495,60 @@ async def _read_export_rows(page) -> list[dict]:
             });
         }"""
     )
+
+
+def has_new_export(rows: list[dict], previous_exports: list[dict]) -> bool:
+    """出力指示前の履歴に無い行があるか (作成中・完了は問わない)。
+
+    作成日時は分までしか出ないので、同じ分に前の行があっても数が増えていれば新しい行とみなす。
+    """
+    before = Counter(r.get("kishin") for r in previous_exports if r.get("kishin"))
+    now = Counter(r.get("kishin") for r in rows if r.get("kishin"))
+    return any(c > before.get(k, 0) for k, c in now.items())
+
+
+async def _kick_until_listed(page, is_valid: str, previous_exports: list[dict],
+                             attempts: Optional[int] = None,
+                             confirm_sec: Optional[int] = None) -> str:
+    """CSV出力を指示し、履歴に新しい行が載るのを確かめる。載らなければ指示し直す。
+
+    ★2026-11-20 (専用PCの試しで実測): 出力指示が HRハッカーに受け付けられず、
+      履歴に行が増えないまま 30 分の上限まで待って失敗した (13:55 の回)。同じ PC で
+      指示し直すと「CSVのダウンロード申請を受け付けました」と出て、すぐ履歴に載った。
+      Actions では生成は 3〜4 分で終わる。指示の直後に履歴を見て、confirm_sec
+      (env HR_CSV_KICK_CONFIRM_SEC、既定 90 秒) 以内に新しい行が無ければ、
+      attempts 回 (env HR_CSV_KICK_ATTEMPTS、既定 3) まで指示し直す。
+      受け付けが遅れて 2 つ作られても、完了待ちはどちらか新しい完了行を使うので害は無い。
+    """
+    if attempts is None:
+        attempts = max(1, int(os.environ.get("HR_CSV_KICK_ATTEMPTS", "3")))
+    if confirm_sec is None:
+        confirm_sec = max(15, int(os.environ.get("HR_CSV_KICK_CONFIRM_SEC", "90")))
+    for n in range(1, attempts + 1):
+        kick_iso = await _kick_csv_export(page, is_valid=is_valid)
+        waited = 0
+        while True:
+            await asyncio.sleep(15)
+            waited += 15
+            try:
+                await page.goto(EXPORT_LIST_URL, wait_until="domcontentloaded",
+                                timeout=30_000)
+            except Exception:  # noqa: BLE001 — 指示直後の遷移と重なったら次の確認で読む
+                pass
+            await _dismiss_onboarding(page)
+            rows = await _read_export_rows(page)
+            if has_new_export(rows, previous_exports):
+                if n > 1:
+                    print(f"[hr_csv] {n} 回目の出力指示で履歴に載りました", flush=True)
+                return kick_iso
+            if waited >= confirm_sec:
+                break
+        print(f"[hr_csv] 出力指示から {waited} 秒たっても履歴に新しい行が無い "
+              f"({n}/{attempts} 回目)" + (" → 指示し直す" if n < attempts else ""),
+              flush=True)
+    raise RuntimeError(
+        f"CSV 出力の指示が HRハッカーに受け付けられませんでした ({attempts} 回指示し、"
+        f"各 {confirm_sec} 秒以内に履歴へ載らなかった。url={EXPORT_LIST_URL})")
 
 
 def is_new_completed_export(row: dict, previous_exports: list[dict]) -> bool:
