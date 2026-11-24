@@ -83,10 +83,12 @@ from dotenv import load_dotenv
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
     from . import end_vanished_listings as _ev
     from . import listing_stage as _stage
+    from . import aw_honbun as _honbun
     from . import private_log as plog
 except ImportError:  # pragma: no cover
     import end_vanished_listings as _ev  # type: ignore
     import listing_stage as _stage  # type: ignore
+    import aw_honbun as _honbun  # type: ignore
     import private_log as plog  # type: ignore
 
 try:
@@ -370,6 +372,7 @@ def load_aw_xlsx(path: str | Path, sheet: str = AW_XLSX_DEFAULT_SHEET,
             )
 
         idx = {h: i for i, h in enumerate(headers)}
+        en_keys = _honbun.header_keys(headers)
         rows: list[dict] = []
         for raw in rows_iter:
             if raw is None:
@@ -390,6 +393,9 @@ def load_aw_xlsx(path: str | Path, sheet: str = AW_XLSX_DEFAULT_SHEET,
                     row[key] = "" if v is None else str(v).strip()
                 else:
                     row[key] = ""
+            # 求人票の本文 (2026-11-24): 12 項目を「列名：値」でつないだ全文
+            row["aw_honbun"] = _honbun.compose_aw_honbun(
+                {k: raw[i] for i, k in enumerate(en_keys) if i < len(raw)}) or ""
             row["airwork_account_login_id"] = login_id
             rows.append(row)
     finally:
@@ -492,6 +498,7 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
         # ステージ保護判定に必要 (2026-08-06): 現ステージが
         # 選考進行中/採用決定なら機械は上書きしない
         "hs_pipeline_stage",
+        _honbun.PROP_AW_HONBUN,   # 前回と同じなら書かない (2026-11-24)
     ]
     headers = _headers()
     for i in range(0, len(media_job_ids), 100):
@@ -677,6 +684,12 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
         if v:
             p[hs_prop] = v
 
+    # 求人票の本文 (2026-11-24): 前回と同じなら書かない (変更履歴を増やさない)
+    honbun = row.get("aw_honbun") or ""
+    if honbun and _honbun.normalize(honbun) != _honbun.normalize(
+            (existing_props or {}).get(_honbun.PROP_AW_HONBUN)):
+        p[_honbun.PROP_AW_HONBUN] = honbun
+
     # login表現の正規化 (2026-07-27): 旧数値client_code格納の既存LISTINGを
     # bid(顧客管理シートのログインID)へ収束させる。deal-assocのlogin→管理メール
     # →Deal突合が効くようになる。login_id非空時のみ・値が異なる時のみ書く。
@@ -725,6 +738,8 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
 
     # 求人詳細 (仕事内容/職種/勤務地/勤務形態/給与形態/勤務時間) を LISTING に格納
     p.update(_aw_listing_detail_props(row))
+    if row.get("aw_honbun"):
+        p[_honbun.PROP_AW_HONBUN] = row["aw_honbun"]
 
     # 求人名 = LISTING 必須プロパティ (Phase 0b HR編で判明)
     p["hs_name"] = row.get("job_name") or f"Air Work求人 {jid}"
