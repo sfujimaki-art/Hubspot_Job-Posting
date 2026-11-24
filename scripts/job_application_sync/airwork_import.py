@@ -84,11 +84,13 @@ try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実�
     from . import end_vanished_listings as _ev
     from . import listing_stage as _stage
     from . import aw_honbun as _honbun
+    from . import aw_changes as _changes
     from . import private_log as plog
 except ImportError:  # pragma: no cover
     import end_vanished_listings as _ev  # type: ignore
     import listing_stage as _stage  # type: ignore
     import aw_honbun as _honbun  # type: ignore
+    import aw_changes as _changes  # type: ignore
     import private_log as plog  # type: ignore
 
 try:
@@ -373,6 +375,9 @@ def load_aw_xlsx(path: str | Path, sheet: str = AW_XLSX_DEFAULT_SHEET,
 
         idx = {h: i for i, h in enumerate(headers)}
         en_keys = _honbun.header_keys(headers)
+        # 全列の変更検知 (2026-11-24): 列ごとの指紋と列名
+        all_cols = _changes.column_keys(headers)
+        col_labels = _changes.labels(all_cols)
         rows: list[dict] = []
         for raw in rows_iter:
             if raw is None:
@@ -396,6 +401,8 @@ def load_aw_xlsx(path: str | Path, sheet: str = AW_XLSX_DEFAULT_SHEET,
             # 求人票の本文 (2026-11-24): 12 項目を「列名：値」でつないだ全文
             row["aw_honbun"] = _honbun.compose_aw_honbun(
                 {k: raw[i] for i, k in enumerate(en_keys) if i < len(raw)}) or ""
+            row["aw_colhash"] = _changes.digest(all_cols, raw)
+            row["aw_col_labels"] = col_labels
             row["airwork_account_login_id"] = login_id
             rows.append(row)
     finally:
@@ -499,6 +506,7 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
         # 選考進行中/採用決定なら機械は上書きしない
         "hs_pipeline_stage",
         _honbun.PROP_AW_HONBUN,   # 前回と同じなら書かない (2026-11-24)
+        _changes.PROP_COL_HASH,   # 全列の指紋: 前回と比べて変わった列を出す (2026-11-24)
     ]
     headers = _headers()
     for i in range(0, len(media_job_ids), 100):
@@ -690,6 +698,9 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
             (existing_props or {}).get(_honbun.PROP_AW_HONBUN)):
         p[_honbun.PROP_AW_HONBUN] = honbun
 
+    # 全列の変更検知 (2026-11-24): 指紋が変わったときだけ、指紋・変わった日時・列名を書く
+    p.update(_changes.change_props(row, existing_props, now_iso))
+
     # login表現の正規化 (2026-07-27): 旧数値client_code格納の既存LISTINGを
     # bid(顧客管理シートのログインID)へ収束させる。deal-assocのlogin→管理メール
     # →Deal突合が効くようになる。login_id非空時のみ・値が異なる時のみ書く。
@@ -740,6 +751,8 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
     p.update(_aw_listing_detail_props(row))
     if row.get("aw_honbun"):
         p[_honbun.PROP_AW_HONBUN] = row["aw_honbun"]
+    if row.get("aw_colhash"):  # 初回の指紋 (変更とは扱わない)
+        p[_changes.PROP_COL_HASH] = row["aw_colhash"]
 
     # 求人名 = LISTING 必須プロパティ (Phase 0b HR編で判明)
     p["hs_name"] = row.get("job_name") or f"Air Work求人 {jid}"
@@ -1001,6 +1014,10 @@ def run(input_path: str, login_id: str, dry_run: bool = True,
 
     print("\n--- 集計 ---")
     print(f"  更新予定: {len(updates)} 件")
+    n_changed = sum(1 for u in updates
+                    if _changes.PROP_CHANGED_AT in u["properties"])
+    summary["content_changed"] = n_changed
+    print(f"  内容が変わった求人 (全列の比較): {n_changed} 件")
     print(f"  新規作成予定 (01/02とも): {len(creates)} 件")
     print(f"  エクスポートから消えた公開中→公開終了予定: {len(ends)} 件")
     if skipped_01_new:
