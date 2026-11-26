@@ -85,12 +85,14 @@ try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実�
     from . import listing_stage as _stage
     from . import aw_honbun as _honbun
     from . import aw_changes as _changes
+    from . import map_address as _addr
     from . import private_log as plog
 except ImportError:  # pragma: no cover
     import end_vanished_listings as _ev  # type: ignore
     import listing_stage as _stage  # type: ignore
     import aw_honbun as _honbun  # type: ignore
     import aw_changes as _changes  # type: ignore
+    import map_address as _addr  # type: ignore
     import private_log as plog  # type: ignore
 
 try:
@@ -507,6 +509,7 @@ def find_hubspot_jobs(media_job_ids: list[str], login_id: str) -> dict[str, dict
         "hs_pipeline_stage",
         _honbun.PROP_AW_HONBUN,   # 前回と同じなら書かない (2026-11-24)
         _changes.PROP_COL_HASH,   # 全列の指紋: 前回と比べて変わった列を出す (2026-11-24)
+        _addr.PROP_JOB_ADDRESS,   # 地図用の住所: 前回と同じなら書かない (2026-11-26)
     ]
     headers = _headers()
     for i in range(0, len(media_job_ids), 100):
@@ -698,6 +701,11 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
             (existing_props or {}).get(_honbun.PROP_AW_HONBUN)):
         p[_honbun.PROP_AW_HONBUN] = honbun
 
+    # 地図用の住所 (2026-11-26): 本文の「勤務地：」から番地まで。今と同じなら書かない
+    addr = _addr.extract(honbun)
+    if _addr.changed(addr, (existing_props or {}).get(_addr.PROP_JOB_ADDRESS)):
+        p[_addr.PROP_JOB_ADDRESS] = addr
+
     # 全列の変更検知 (2026-11-24): 指紋が変わったときだけ、指紋・変わった日時・列名を書く
     p.update(_changes.change_props(row, existing_props, now_iso))
 
@@ -751,6 +759,9 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
     p.update(_aw_listing_detail_props(row))
     if row.get("aw_honbun"):
         p[_honbun.PROP_AW_HONBUN] = row["aw_honbun"]
+    addr = _addr.extract(row.get("aw_honbun"))
+    if addr:  # 地図用の住所 (2026-11-26)
+        p[_addr.PROP_JOB_ADDRESS] = addr
     if row.get("aw_colhash"):  # 初回の指紋 (変更とは扱わない)
         p[_changes.PROP_COL_HASH] = row["aw_colhash"]
 

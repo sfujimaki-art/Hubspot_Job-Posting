@@ -107,7 +107,8 @@ def _oubosaki(monkeypatch, listing):
             return _Resp({"properties": listing})
         return _Resp({"properties": {}})
     monkeypatch.setattr(cli._requests, "get", get)
-    monkeypatch.setattr(cli, "_listing_deal_group", lambda *a: ([], {}))
+    monkeypatch.setattr(cli, "_listing_deal_group", lambda *a: ([], {}), raising=False)
+    monkeypatch.setattr(cli, "_current_deal_group", lambda *a, **k: None, raising=False)
     props = cli.get_oubosaki_props("L1", "HRハッカー", "", "1")
     return props, urls
 
@@ -126,3 +127,18 @@ def test_oubosaki_address_falls_back_and_skips_empty(monkeypatch):
     assert props["oubosaki_kinmuchi_juusho"] == "東京都千代田区"
     props, _ = _oubosaki(monkeypatch, {})
     assert "oubosaki_kinmuchi_juusho" not in props
+
+
+def test_airwork_listing_address():
+    import airwork_import as awi
+    row = {"media_job_id": "1", "original_status": "02",
+           "aw_honbun": "給与：x\n勤務地：〒100-0001 東京都千代田区架空町1-2 架空ビル\nアクセス：駅"}
+    p = awi.build_update_props(row, {}, "2026-11-26", "2026-11-26T00:00:00Z", "f.xlsx")
+    assert p["kinmuchi_juusho"] == "東京都千代田区架空町1-2"
+    p = awi.build_update_props(row, {"kinmuchi_juusho": "東京都千代田区架空町1-2"},
+                               "2026-11-26", "2026-11-26T00:00:00Z", "f.xlsx")
+    assert "kinmuchi_juusho" not in p
+    p = awi.build_create_props({**row, "job_name": "x"}, "2026-11-26", "2026-11-26T00:00:00Z",
+                               "f.xlsx", "login")
+    assert p["kinmuchi_juusho"] == "東京都千代田区架空町1-2"
+    assert not [k for k in p if k.startswith("hrhr_")]
