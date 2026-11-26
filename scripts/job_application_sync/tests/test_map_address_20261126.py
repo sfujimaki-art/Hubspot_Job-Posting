@@ -107,7 +107,8 @@ def _oubosaki(monkeypatch, listing):
             return _Resp({"properties": listing})
         return _Resp({"properties": {}})
     monkeypatch.setattr(cli._requests, "get", get)
-    monkeypatch.setattr(cli, "_listing_deal_group", lambda *a: ([], {}))
+    monkeypatch.setattr(cli, "_listing_deal_group", lambda *a: ([], {}), raising=False)
+    monkeypatch.setattr(cli, "_current_deal_group", lambda *a, **k: None, raising=False)
     props = cli.get_oubosaki_props("L1", "HRハッカー", "", "1")
     return props, urls
 
@@ -126,3 +127,4 @@ def test_oubosaki_address_falls_back_and_skips_empty(monkeypatch):
     assert props["oubosaki_kinmuchi_juusho"] == "東京都千代田区"
     props, _ = _oubosaki(monkeypatch, {})
     assert "oubosaki_kinmuchi_juusho" not in props
+
