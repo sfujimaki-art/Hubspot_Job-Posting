@@ -51,9 +51,11 @@ from dotenv import load_dotenv
 
 try:  # パッケージ実行/スクリプト直実行の両対応 (CIは直実行)
     from . import listing_stage as _stage
+    from . import map_address as _addr
     from . import private_log as plog
 except ImportError:  # pragma: no cover
     import listing_stage as _stage  # type: ignore
+    import map_address as _addr  # type: ignore
     import private_log as plog  # type: ignore
 
 # ============================================================================
@@ -178,13 +180,24 @@ PREFECTURES: frozenset = frozenset((
 BRANCHES_ENCODING = "cp932"
 
 
+class BranchLocations(dict):
+    """{店舗id: (都道府県, 市区町村 or None)} に、地図用の住所 {店舗id: 住所} を添えたもの."""
+
+    def __init__(self, *a, addresses: Optional[dict] = None, **kw):
+        super().__init__(*a, **kw)
+        self.addresses: dict[str, str] = addresses or {}
+
+
 def load_branch_locations(path: str | Path) -> dict[str, tuple[str, Optional[str]]]:
     """店舗一覧CSV (cp932) → {店舗id: (都道府県, 市区町村 or None)}.
+
+    戻り値の .addresses は {店舗id: 番地までの住所} (地図用、2026-11-26)。
 
     都道府県が47都道府県名でない行は捨てる。同じ店舗idで値が食い違う場合はその店舗を捨てる。
     捨てた件数は戻り値の辞書の属性ではなく、公開ログ (件数のみ) に出す。
     """
     found: dict[str, tuple[str, Optional[str]]] = {}
+    addresses: dict[str, str] = {}
     conflicts: set[str] = set()
     skipped_invalid = 0
     with open(path, "r", encoding=BRANCHES_ENCODING, errors="replace", newline="") as f:
@@ -199,11 +212,31 @@ def load_branch_locations(path: str | Path) -> dict[str, tuple[str, Optional[str
             if sid in found and found[sid] != val:
                 conflicts.add(sid)
             found[sid] = val
+            addr = _addr.store_address(pref, r.get("市区町村") or "",
+                                       r.get("町名") or "", r.get("番地") or "")
+            if sid in addresses and addresses[sid] != addr:
+                conflicts.add(sid)
+            if addr:
+                addresses[sid] = addr
     for sid in conflicts:
         found.pop(sid, None)
+        addresses.pop(sid, None)
     plog.public(f"  店舗一覧: {len(found)} 店舗 / 都道府県が不正で除外 {skipped_invalid} 行 / "
-                f"重複で値が食い違い除外 {len(conflicts)} 店舗")
-    return found
+                f"重複で値が食い違い除外 {len(conflicts)} 店舗 / 番地まである店舗 {len(addresses)}")
+    return BranchLocations(found, addresses=addresses)
+
+
+def address_props(row: dict, existing_props: Optional[dict],
+                  branch_locations: Optional[dict]) -> dict:
+    """求人票の地図用の住所 (kinmuchi_juusho) を店舗一覧から. 今の値と同じなら書かない."""
+    addrs = getattr(branch_locations, "addresses", None)
+    if not addrs:
+        return {}
+    sid = _clean(row.get("shop_id"))
+    new = addrs.get(sid) if sid else None
+    if _addr.changed(new, (existing_props or {}).get(_addr.PROP_JOB_ADDRESS)):
+        return {_addr.PROP_JOB_ADDRESS: new}
+    return {}
 
 
 def location_props(row: dict, existing_props: Optional[dict],
@@ -362,6 +395,8 @@ def find_hubspot_jobs(media_job_ids: list[str]) -> dict[str, dict]:
                     PROP_COPY_BODY, PROP_COPY_IMAGES,
                     # 勤務地は空のときだけ書くため、今の値を読む
                     PROP_PREFECTURE, PROP_CITY,
+                    # 地図用の住所も、値が変わったときだけ書く (2026-11-26)
+                    _addr.PROP_JOB_ADDRESS,
                     # ステージ保護判定に必要 (2026-08-06): 現ステージが
                     # 選考進行中/採用決定なら機械は上書きしない
                     "hs_pipeline_stage"]
@@ -465,6 +500,8 @@ def build_update_props(row: dict, existing_props: dict, today_iso: str,
 
     # 勤務地: 空のときだけ店舗一覧の値で補完
     p.update(location_props(row, existing_props, branch_locations))
+    # 地図用の住所 (番地まで): 店舗一覧の値が今と違うときだけ (2026-11-26)
+    p.update(address_props(row, existing_props, branch_locations))
 
     return p
 
@@ -547,6 +584,7 @@ def build_create_props(row: dict, today_iso: str, now_iso: str,
 
     # 勤務地 (店舗一覧で分かるものだけ)
     p.update(location_props(row, None, branch_locations))
+    p.update(address_props(row, None, branch_locations))
 
     return p
 
@@ -690,6 +728,10 @@ def run(csv_path: str, dry_run: bool = True, limit: Optional[int] = None,
             if PROP_PREFECTURE in c["properties"] or PROP_CITY in c["properties"]
         )
         print(f"  勤務地を補完予定: {summary['location_filled']} 件")
+        summary["address_written"] = sum(
+            1 for x in updates + creates
+            if _addr.PROP_JOB_ADDRESS in x["properties"])
+        print(f"  地図用の住所を書く予定: {summary['address_written']} 件")
 
     print(f"\n--- 集計 ---")
     print(f"  更新予定: {len(updates)} 件")
@@ -818,6 +860,7 @@ def run_copy_only(csv_path: str, dry_run: bool = True,
         props = copy_props(row, hit["properties"])
         loc = location_props(row, hit["properties"], branch_locations)
         props.update(loc)
+        props.update(address_props(row, hit["properties"], branch_locations))
         if not props:
             summary["unchanged"] += 1
             continue

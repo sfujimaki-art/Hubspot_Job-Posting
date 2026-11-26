@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol
 
 from scripts.job_application_sync import hr_applicant_fields as hrf
+from scripts.job_application_sync import map_address as _map_address
 
 
 # ---- Association type IDs (Phase 0 実測確定) ------------------------------
@@ -918,6 +919,7 @@ class RealHubSpotClient:
                 f"{self.BASE}/crm/v3/objects/0-420/{listing_id}?properties="
                 "hs_name,shigotonaiyou,zhizhong,qinwude,kinmujikan,"
                 "kinmukeitai,kyuuyokeitai,url_airwork,url_reclogi,id_shop_hrhakkaa,"
+                "kinmuchi_juusho,todoufuken,shikuchouson,"
                 f"{DM.LISTING_OWNER}",
                 headers=self.headers, timeout=20).json().get("properties") or {}
         except Exception:  # noqa: BLE001
@@ -933,6 +935,11 @@ class RealHubSpotClient:
             v = lp.get(src)
             if v:
                 props[dst] = v
+        # 地図用の応募先の住所 (2026-11-26): 求人票の住所と応募先勤務地の長いほう
+        addr = _map_address.pick(_map_address.job_address(lp),
+                                 props.get("oubosaki_kinmuchi"))
+        if addr:
+            props[_map_address.PROP_APPLICANT_JOB_ADDRESS] = addr
         # URL: HR=求人IDから個別URL生成 / AW=LISTINGのurl_airwork
         if media == "HRハッカー" and media_job_id:
             props["oubosaki_kyuujin_url"] = HR_JOB_URL_TMPL.format(media_job_id)
