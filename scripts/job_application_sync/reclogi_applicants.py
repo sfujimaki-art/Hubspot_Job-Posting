@@ -111,7 +111,10 @@ EMPLOYMENT_MAP = {"正社員": "full_time", "契約社員": "contract", "パー�
                   "アルバイト": "part_time", "パート・アルバイト": "part_time",
                   "業務委託": "outsourced"}
 # HR の求人から写す項目 (取引の紐付けと一緒に)
-COPY_FROM_HR = ("hubspot_owner_id", "ichijitaiounoumu_deforuto", "customer_sheet_url")
+# kinmuchi_juusho: 地図用の住所 (番地まで)。リクロジの求人ページには番地が無いので、
+# 元の HRハッカーの求人票の値を写す (2026-11-27 ユーザー決定)
+COPY_FROM_HR = ("hubspot_owner_id", "ichijitaiounoumu_deforuto", "customer_sheet_url",
+                "kinmuchi_juusho")
 _JOB_URL_ID_RE = re.compile(r"reclogi\.jp/job-data/(\d+)")
 
 # ---- 「HubSpot登録」に書く値 --------------------------------------------------
