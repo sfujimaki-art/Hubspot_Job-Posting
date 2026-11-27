@@ -128,3 +128,34 @@ def test_oubosaki_address_falls_back_and_skips_empty(monkeypatch):
     props, _ = _oubosaki(monkeypatch, {})
     assert "oubosaki_kinmuchi_juusho" not in props
 
+
+
+# ---- リクロジの求人票は元の HRハッカーの求人票の住所を写す (2026-11-27) ----
+from scripts.job_application_sync import reclogi_applicants as rl  # noqa: E402
+from scripts.job_application_sync.tests.test_reclogi_applicants_20261020 import FakeClient  # noqa: E402
+from scripts.job_application_sync.tests import test_reclogi_own_listing_20261020 as RO  # noqa: E402
+
+
+def test_reclogi_listing_copies_hr_address():
+    cli = FakeClient(listings_hr={"11694710": "L-HR"}, listing_deals={"L-HR": ["D1"]},
+                     listing_props={"L-HR": {"kinmuchi_juusho": "東京都千代田区架空町1-2-3",
+                                             "qinwude": "東京都千代田区"}})
+    plan = rl.plan_listing_deals(cli, "11694710", "1154643")
+    assert plan["copy"] == {"kinmuchi_juusho": "東京都千代田区架空町1-2-3"}
+    r = rl.prepare_listing(cli, "10756", RO.URL, "11694710", "1154643", dry_run=False,
+                           fetch_page=lambda u: RO.PAGE, make_listing=rl.create_listing)
+    made = cli.created_listings[0]
+    assert r["action"] == "作成" and made["kinmuchi_juusho"] == "東京都千代田区架空町1-2-3"
+    assert not [k for k in made if k.startswith("hrhr_")]
+
+
+def test_reclogi_prepared_listing_gets_address_only_when_empty():
+    cli = RO._hr_cli({"11694710": ["L-P1"]})
+    cli.listing_props["L-HR"] = {"kinmuchi_juusho": "東京都千代田区架空町1-2-3"}
+    RO._prep(cli)
+    assert cli.updated_listings[0]["properties"]["kinmuchi_juusho"] == "東京都千代田区架空町1-2-3"
+    cli = RO._hr_cli({"11694710": ["L-P1"]})
+    cli.listing_props["L-HR"] = {"kinmuchi_juusho": "東京都千代田区架空町1-2-3"}
+    cli.listing_props["L-P1"] = {"kinmuchi_juusho": "人が入れた住所"}
+    RO._prep(cli)
+    assert "kinmuchi_juusho" not in cli.updated_listings[0]["properties"]
